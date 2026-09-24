@@ -35,6 +35,10 @@ _ENV_KEYS = (
     "CALL_BRIDGE_DIRECTORY_URL_TIMEOUT",
     "CALL_BRIDGE_AGENTS_ROOT",
     "CALL_BRIDGE_DIRECTORY",
+    "CALL_BRIDGE_WAKE_WEBHOOK_URL",
+    "CALL_BRIDGE_WAKE_WEBHOOK_AUTH",
+    "CALL_BRIDGE_SWITCHBOARD_WEBHOOK_URL",
+    "CALL_BRIDGE_SWITCHBOARD_WEBHOOK_AUTH",
 )
 
 _MISSING_AGENTS = "/nonexistent/call-bridge-agents-root"
@@ -413,7 +417,9 @@ class DeliverTests(unittest.TestCase):
         result = dispatch_send(self.store, session["session_id"], "local", "hello")
 
         self.assertEqual(result["error"], "error")
-        self.assertEqual(result["detail"], "request failed")
+        self.assertTrue(result["detail"].startswith("request failed. "))
+        self.assertIn("The box link is down", result["detail"])
+        self.assertIn("Retry in about 30 seconds", result["note"])
         self.assertNotIn(_TOKEN, result["detail"])
         self.assertEqual(self.store.session_info(session["session_id"])["message_count"], 0)
         self.assertTrue(self.logs.messages)

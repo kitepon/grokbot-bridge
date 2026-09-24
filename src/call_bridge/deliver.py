@@ -22,6 +22,7 @@ from typing import Any
 
 from .db import CallStore, message_with_reply_request
 from .directory import resolve_member_agent_id
+from .wake import LINK_DOWN_NOTE, notify_link_down
 
 log = logging.getLogger("call_bridge.deliver")
 
@@ -37,6 +38,24 @@ _GATEWAY_STATUSES = frozenset(
 _PASSTHROUGH_ERRORS = frozenset(
     {"target_not_found", "not_member", "unavailable", "empty"}
 )
+# Connection failure or timeout. HTTP statuses such as 401 are not this set.
+_GATEWAY_TRANSPORT_DETAILS = frozenset({"timed out", "request failed"})
+
+
+def gateway_link_down_detail(delivery: dict[str, str]) -> str | None:
+    """Short error when the gateway forward itself is down.
+
+    ``unavailable`` is the gateway's status for a dead forward. A normal
+    delivery status (``target_not_found``, ``not_member``, ``empty``) or an
+    HTTP rejection such as 401 is not a down link.
+    """
+    status = delivery.get("status")
+    if status == "unavailable":
+        return "unavailable"
+    detail = delivery.get("detail") or ""
+    if status == "error" and detail in _GATEWAY_TRANSPORT_DETAILS:
+        return detail
+    return None
 
 
 class _NoRedirect(urllib.request.HTTPErrorProcessor):
@@ -216,7 +235,11 @@ def dispatch_send(
         error = str(resolved.get("error") or "error")
         detail = str(resolved.get("detail") or "")
         status = "target_not_found" if error == "target_not_found" else "error"
-        return _delivery_failure(error, detail, status)
+        failure = _delivery_failure(error, detail, status)
+        note = resolved.get("note")
+        if isinstance(note, str) and note:
+            failure["note"] = note
+        return failure
 
     settings = gateway_settings()
     if isinstance(settings, str):
@@ -239,6 +262,15 @@ def dispatch_send(
     status = delivery["status"]
     if status != "delivered":
         error = status if status in _PASSTHROUGH_ERRORS else "error"
+        down = gateway_link_down_detail(delivery)
+        if down:
+            notify_link_down("gateway", down)
+            return {
+                "error": error,
+                "detail": f"{down}. {LINK_DOWN_NOTE}",
+                "note": LINK_DOWN_NOTE,
+                "delivery": delivery,
+            }
         return {
             "error": error,
             "detail": delivery.get("detail", ""),
