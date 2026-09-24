@@ -1,5 +1,9 @@
 """Phone directory from Grok Bot seat profiles (name / title / description).
 
+Each member built from a seat profile includes ``id``, the directory name
+of that seat. That name is the Grok Bot agent id (``profile.json`` has no
+id field). Remote books pass ``id`` / ``agentId`` through.
+
 Clients call ``call_directory``. This module builds the book on that request.
 A seat profile edit is visible on the next call. There is no periodic sync
 and no post-edit push.
@@ -146,7 +150,10 @@ def build_members_from_profiles(root: Path) -> list[dict[str, Any]]:
         name = (p.get("name") or "").strip()
         if name in _SKIP_NAMES:
             continue
-        entry: dict[str, Any] = {"name": name}
+        # Grok Bot's agent id is the seat directory name. profile.json itself
+        # has name / title / description only; callers (deliverAgentMessage)
+        # need the id on the directory entry.
+        entry: dict[str, Any] = {"name": name, "id": d.name}
         title = (p.get("title") or "").strip()
         role = (p.get("description") or "").strip()
         # Keep profile text as-is (only normalize newlines to spaces for one field).
@@ -424,6 +431,68 @@ def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
     if snap is not None:
         return _note_remote_errors(snap, unix_error, url_error)
     return _unavailable(unix_error, url_error)
+
+
+def _agent_id_of(member: dict[str, Any]) -> str:
+    """Agent id carried on a directory entry.
+
+    Profiles we build set ``id`` to the seat directory name. A remote book
+    may use ``id`` or ``agentId``; both are the Grok Bot agent id.
+    """
+    for key in ("id", "agentId", "agent_id"):
+        value = member.get(key)
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return ""
+
+
+def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
+    """Resolve ``call_open``'s member name to a Grok Bot agent id.
+
+    Uses the live directory (unix, then URL, then local profiles, then
+    ``directory.json``). A snapshot entry with no id cannot be delivered.
+    """
+    name = (member_name or "").strip()
+    book = load_directory()
+    if not book.get("ok"):
+        detail = str(book.get("detail") or book.get("error") or "directory unavailable")
+        return {"ok": False, "error": "error", "detail": f"directory unavailable: {detail}"}
+    members = [m for m in (book.get("members") or []) if isinstance(m, dict)]
+    if not name:
+        return {"ok": False, "error": "target_not_found", "detail": "member name is empty"}
+
+    ids: list[str] = []
+    found_name = False
+    for member in members:
+        if str(member.get("name") or "").strip() != name:
+            continue
+        found_name = True
+        agent_id = _agent_id_of(member)
+        if agent_id and agent_id not in ids:
+            ids.append(agent_id)
+    if len(ids) == 1:
+        return {"ok": True, "id": ids[0]}
+    if len(ids) > 1:
+        return {
+            "ok": False,
+            "error": "target_not_found",
+            "detail": f"multiple agent ids for {name}",
+        }
+    if found_name:
+        return {
+            "ok": False,
+            "error": "target_not_found",
+            "detail": f"directory entry for {name} has no agent id",
+        }
+
+    for member in members:
+        if _agent_id_of(member) == name:
+            return {"ok": True, "id": name}
+    return {
+        "ok": False,
+        "error": "target_not_found",
+        "detail": f"no directory entry for {name}",
+    }
 
 
 def search_directory(query: str | None = None, *, skip_url: bool = False) -> dict[str, Any]:

@@ -14,6 +14,7 @@ services:
     restart: unless-stopped
     env_file: .env
     extra_hosts:
+      # Grok Bot gateway on the host. GROKBOT_GATEWAY_URL=http://host.docker.internal:18766
       - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:18910:18910"

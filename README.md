@@ -14,10 +14,10 @@ A local coding agent (Claude Code, Codex, Cursor, …) asks a Grok Bot “switch
 
 1. **Local** opens a session (`call_open` or `POST /v0/sessions`) → gets `session_id` (`ringing`). The server POSTs a wake envelope to the switchboard webhook (when `CALL_BRIDGE_WAKE_WEBHOOK_URL` is set) so the switchboard can wake the member. The body is session id, member name, local labels, purpose, and the public MCP URL — not message bodies. If the URL is unset, or the POST fails, the session is still returned; the response includes a non-fatal `wake` object (`status`: `ok`, `skipped`, or `error`).
 2. **Grok Bot switchboard** wakes the member with MCP URL + `session_id` only (no body relay).
-3. **Local** and **Grok Bot member** use `call_send` / `call_poll` on the same server (`from_party` / `party` = `local` | `member`). When Local sends a message, the bridge asks the member to reply in that session by default.
+3. **Local** `call_send` delivers the text into the target Grok Bot agent through the host gateway (`POST /api/deliverAgentMessage`). That wakes the bot the same way Grok Bot agents wake each other. The text includes the session id and a one-line hint to reply with call-bridge MCP `call_send` (`from_party=member`). The result includes `delivery.status` (`delivered`, `target_not_found`, `not_member`, `unavailable`, or `error`). If `GROKBOT_GATEWAY_URL` or `GROKBOT_GATEWAY_TOKEN` is unset, or the gateway does not report `delivered`, the call fails and the message is not stored. **Member** `call_send` is unchanged (stored for the local side). `call_open`'s switchboard wake is unchanged.
 4. Either side (or ops) calls `call_hangup`.
 
-`call_send` で `from_party="local"` のときは、同じ `session_id` の通話へ `member` として `call_send` で返答する案内を本文に自動で付ける。案内は保存される本文と送信結果の両方に含まれる。返信不要の通知だけ `reply_required=false` を指定する。`from_party="member"` の本文は変更しない。MCP と REST のどちらでも同じ動作になる。返信依頼はメンバーへ送る指示であり、返答そのものを保証するものではない。
+`call_send` で `from_party="local"` のときは、相手エージェントへ直接届けてから保存する。保存される本文には、同じ `session_id` へ call-bridge MCP の `call_send`（`from_party=member`）で返答する案内が付く。案内は保存される本文と送信結果の両方に含まれる。配送が `delivered` のときだけ保存する。gateway の環境変数が無い、または配送が失敗したときはエラーを返し、保存しない。返信不要の通知だけ `reply_required=false` を指定する。`from_party="member"` の本文は変更せず、gateway にも送らない。MCP と REST のどちらでも同じ動作になる。返信依頼はメンバーへ送る指示であり、返答そのものを保証するものではない。
 
 `call_send` の通常送信の引数例：
 
@@ -73,9 +73,9 @@ call-bridge-setup status
 現在の自動配送対象は Codex 親。Claude Code／Cursor の直接 HTTP 接続と手動 `call_poll` は従来どおり使える。
 
 ```text
-Local agent ──wake──▶ Grok Bot switchboard ──wake──▶ Grok Bot member
-     │                                                      │
-     └──────────── grokbot-bridge MCP (send/poll) ──────────┘
+Local agent ──call_open──▶ Grok Bot switchboard (wake only, unchanged)
+Local agent ──call_send──▶ grokbot-bridge ──deliverAgentMessage──▶ Grok Bot member
+Grok Bot member ──call_send──▶ grokbot-bridge (stored for the local side)
 ```
 
 ## MCP tools
@@ -84,7 +84,7 @@ Local agent ──wake──▶ Grok Bot switchboard ──wake──▶ Grok Bo
 |------|------|
 | `call_directory` | Phone book, built on that call from live seat profiles |
 | `call_open` | Create session (local → member) |
-| `call_send` | Send a message; local messages request a reply by default (`reply_required=false` for notices) |
+| `call_send` | Send a message. Local sends wake the bot via the gateway (`delivery.status`); notices use `reply_required=false` |
 | `call_poll` | Fetch new messages for your party |
 | `call_list` | List / filter sessions |
 | `call_hangup` | End the call |
@@ -96,7 +96,7 @@ Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 
 Clients only call `call_directory` (or `GET /v0/directory`). The server builds the book **on that request** from Grok Bot seat profiles. Changing a seat’s name, title, or description shows up on the **next** call. There is no periodic sync, no Marian routine, and no operator push after a role edit.
 
-Source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag.
+Source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag. Each member built from a profile also includes `id`: the seat directory name, which is the Grok Bot agent id (`profile.json` itself has no id field). Local `call_send` resolves `member_name` to that id and sends it as `toAgentId`. A remote directory passes `id` or `agentId` through. A `directory.json` entry without an id cannot wake the bot.
 
 Lookup order:
 
@@ -194,6 +194,10 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard wake webhook. Empty skips the POST |
 | `CALL_BRIDGE_WAKE_WEBHOOK_AUTH` | _(unset)_ | `Authorization` header value for that POST |
 | `CALL_BRIDGE_PUBLIC_MCP_URL` | `https://call.kitepon.dev/mcp` | MCP URL included in the wake envelope |
+| `GROKBOT_GATEWAY_URL` | _(unset)_ | Grok Bot gateway origin, no path (for example `http://host.docker.internal:18766`). Local `call_send` POSTs `/api/deliverAgentMessage` and does not send an `Origin` header |
+| `GROKBOT_GATEWAY_TOKEN` | _(unset)_ | Bearer token for that POST. Never logged. If either gateway variable is unset, local `call_send` fails instead of only storing |
+
+Compose already sets `extra_hosts: ["host.docker.internal:host-gateway"]` so that hostname resolves inside the container. Recreate the container after changing `.env`. On the Grok Bot box, restart `scripts/directory_live_server.py` from this revision so live directory members include `id`.
 
 `CALL_BRIDGE_SWITCHBOARD_WEBHOOK_URL` and `CALL_BRIDGE_SWITCHBOARD_WEBHOOK_AUTH` are aliases for the wake URL and auth value.
 
