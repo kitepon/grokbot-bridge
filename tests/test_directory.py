@@ -145,8 +145,18 @@ class DirectoryTests(unittest.TestCase):
         self.assertEqual(
             members,
             [
-                {"name": "マリアン", "title": "電話番", "role": "起こすだけ"},
-                {"name": "ラピ", "title": "インフラ統括", "role": "回線を 見る"},
+                {
+                    "name": "マリアン",
+                    "id": "a-marian",
+                    "title": "電話番",
+                    "role": "起こすだけ",
+                },
+                {
+                    "name": "ラピ",
+                    "id": "b-rapi",
+                    "title": "インフラ統括",
+                    "role": "回線を 見る",
+                },
             ],
         )
 
@@ -557,6 +567,7 @@ class DirectoryTests(unittest.TestCase):
         self.assertEqual(first["directory_url"], url)
         self.assertEqual(first["members"][0]["title"], "インフラ統括")
         self.assertEqual(first["members"][0]["role"], "旧説明")
+        self.assertEqual(first["members"][0]["id"], "rapi")
 
         _write_profile(root, "rapi", "ラピ", "インフラ統括・改", "新しい説明")
         second = load_directory()

@@ -21,7 +21,8 @@ class ReplyRequestTest(unittest.TestCase):
 
             self.assertTrue(request["message"].startswith("要件を確認してください\n\n"))
             self.assertIn(f"session_id={session_id}", request["message"])
-            self.assertIn("member として call_send で返事", request["message"])
+            self.assertIn("call-bridge MCP の call_send", request["message"])
+            self.assertIn("from_party=member", request["message"])
             self.assertEqual(notice["message"], "共有だけです")
             self.assertEqual(member["message"], "確認しました")
             received = store.poll_messages(session_id, "member", mark_delivered=False)

@@ -19,6 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .db import CallStore
+from .deliver import dispatch_send
 from .directory import DIRECTORY_HOP_HEADER, search_directory
 from .wake import notify_wake
 
@@ -34,14 +35,14 @@ _INSTRUCTIONS = """
 ## 流れ
 1. ローカルが call_open でセッション作成（status=ringing）。サーバは設定済みならスイッチボード webhook へ wake を POST する（本文は含めない）
 2. 電話番が相手メンバーを起こし、session_id と MCP URL を渡す
-3. 両者 call_send / call_poll で会話
+3. ローカルの call_send は相手エージェントへ gateway の deliverAgentMessage で直接届く（session_id と、call-bridge MCP の call_send で返す一行を含む）。member の call_send は保存のみ
 4. call_hangup で終了
 
 ## ツール
 - call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（UNIX ソケット優先。定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
-- local の call_send は返信依頼を本文に付ける。返信不要の通知だけ reply_required=false を指定する
+- local の call_send は返信依頼を本文に付け、相手エージェントを起こす。返信不要の通知だけ reply_required=false。配送結果は delivery.status
 """
 
 Party = Literal["local", "member"]
@@ -99,11 +100,18 @@ def call_open(
     return _session_view(sess, notify_wake(sess))
 
 
-@mcp.tool(description="セッションへメッセージ送信。local は返信依頼が既定。返信不要なら reply_required=false。")
+@mcp.tool(
+    description=(
+        "セッションへメッセージ送信。local は相手の Grok Bot エージェントへ直接届け、"
+        "返信依頼が既定。返信不要なら reply_required=false。"
+        "結果の delivery.status は delivered / target_not_found / error など。"
+        "gateway 未設定のときは保存せず失敗する。"
+    )
+)
 def call_send(session_id: str, from_party: Party, message: str,
               reply_required: bool = True) -> dict[str, Any]:
     try:
-        return store.send_message(session_id, from_party, message, reply_required)
+        return dispatch_send(store, session_id, from_party, message, reply_required)
     except KeyError as e:
         return {"error": "not_found", "detail": str(e)}
     except (ValueError, RuntimeError) as e:
@@ -175,6 +183,7 @@ def call_info(session_id: str) -> dict[str, Any]:
 @mcp.tool(
     description=(
         "電話帳。呼ぶたびに席プロフィール（name / title / description）を読む。"
+        "各エントリの id は席ディレクトリ名（Grok Bot の agent id）。"
         "優先順は CALL_BRIDGE_DIRECTORY_UNIX、CALL_BRIDGE_DIRECTORY_URL、"
         "ローカル agents の profile.json、最後に directory.json。"
         "ライブ応答は source=agent-profiles と agents_root。"
@@ -188,6 +197,20 @@ def call_directory(query: str | None = None) -> dict[str, Any]:
 
 
 # ---------- HTTP (non-MCP) ----------
+
+
+def _delivery_http_status(error: str) -> int:
+    if error in ("target_not_found", "not_found"):
+        return 404
+    if error == "gateway_not_configured":
+        return 503
+    if error == "unavailable":
+        return 503
+    if error == "empty":
+        return 400
+    if error == "rejected":
+        return 409
+    return 502
 
 
 def _check_bearer(request: Request) -> Response | None:
@@ -279,12 +302,24 @@ async def rest_send(request: Request) -> Response:
             {"ok": False, "error": "reply_required must be boolean"}, status_code=400
         )
     try:
-        result = store.send_message(session_id, from_party, str(message), reply_required)
-        return JSONResponse({"ok": True, **result})
+        result = await asyncio.to_thread(
+            dispatch_send,
+            store,
+            session_id,
+            from_party,
+            str(message),
+            reply_required,
+        )
     except KeyError as e:
         return JSONResponse({"ok": False, "error": "not_found", "detail": str(e)}, status_code=404)
     except (ValueError, RuntimeError) as e:
         return JSONResponse({"ok": False, "error": "rejected", "detail": str(e)}, status_code=409)
+    if result.get("error"):
+        return JSONResponse(
+            {"ok": False, **result},
+            status_code=_delivery_http_status(str(result["error"])),
+        )
+    return JSONResponse({"ok": True, **result})
 
 
 @mcp.custom_route("/v0/sessions/{session_id}/poll", methods=["GET"])

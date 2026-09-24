@@ -17,6 +17,17 @@ def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def message_with_reply_request(session_id: str, message: str, reply_required: bool) -> str:
+    """Local text as stored. Notices stay unchanged; replies name the MCP."""
+    if not reply_required:
+        return message
+    return (
+        f"{message}\n\nこの連絡には返信が必要です。"
+        f"session_id={session_id} "
+        "返信は call-bridge MCP の call_send（from_party=member）で送ってください。"
+    )
+
+
 class CallStore:
     def __init__(self, db_path: str | Path) -> None:
         self.db_path = Path(db_path)
@@ -154,11 +165,8 @@ class CallStore:
                 (session_id,),
             ).fetchone()
             seq = int(row["m"]) + 1
-            if from_party == "local" and reply_required:
-                message += (
-                    "\n\nこの連絡には返信が必要です。"
-                    f"session_id={session_id} の通話に、member として call_send で返事を送ってください。"
-                )
+            if from_party == "local":
+                message = message_with_reply_request(session_id, message, reply_required)
             conn.execute(
                 """
                 INSERT INTO messages (
