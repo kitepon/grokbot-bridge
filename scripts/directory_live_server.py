@@ -21,6 +21,7 @@ from __future__ import annotations
 import hmac
 import json
 import os
+import socketserver
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -84,10 +85,17 @@ class DirectoryHandler(BaseHTTPRequestHandler):
         sys.stderr.write("%s\n" % (fmt % args))
 
 
+class DirectoryHTTPServer(ThreadingHTTPServer):
+    def server_bind(self) -> None:
+        # 起動時の逆引きDNSを待たず、bindしたアドレスをそのまま公開する。
+        socketserver.TCPServer.server_bind(self)
+        self.server_name, self.server_port = self.server_address[:2]
+
+
 def main() -> int:
     host = os.environ.get("CALL_BRIDGE_DIRECTORY_BIND", "127.0.0.1").strip() or "127.0.0.1"
     port = int(os.environ.get("CALL_BRIDGE_DIRECTORY_PORT", "18765"))
-    httpd = ThreadingHTTPServer((host, port), DirectoryHandler)
+    httpd = DirectoryHTTPServer((host, port), DirectoryHandler)
     root = agents_root()
     print(
         json.dumps(

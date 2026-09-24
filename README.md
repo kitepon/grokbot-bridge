@@ -17,6 +17,35 @@ A local coding agent (Claude Code, Codex, Cursor, …) asks a Grok Bot “switch
 3. **Local** and **Grok Bot member** use `call_send` / `call_poll` on the same server (`from_party` / `party` = `local` | `member`).
 4. Either side (or ops) calls `call_hangup`.
 
+### Codex 親への返信自動配送
+
+Codex から通話する端末では、ローカル MCP を登録すると `call_open` が親タスクを識別する。
+ローカル MCP はその通話の返信を裏で取得し、Codex の公式キューへ一通ずつ渡す。
+進行中のターンでは `PostToolUse`／`Stop` hook が同じターンへ差し込み、
+ターン終了後はキューが次のターンとして届ける。親AIは `call_poll` で待たなくてよい。
+GrokBot メンバーは従来どおり公開 MCP に接続する。
+
+既存の `call-bridge` または `grokbot-bridge` を HTTP MCP として登録し、Bearer token の環境変数が利用できる状態で実行する。
+
+```bash
+python -m pip install git+https://github.com/kitepon/grokbot-bridge.git
+call-bridge-setup enable
+# Codex を完全終了して再起動
+call-bridge-setup status
+```
+
+`enable` は既存の URL と token 環境変数名を読み、その MCP 登録をローカル MCP に切り替える。
+また、本製品専用の Codex hook を登録・承認する。他製品の hook は保持する。
+設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
+元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。
+
+返信は `session_id` と `seq` で順番に処理する。配送結果はローカル MCP の `call_info` に
+`parent_delivery` として表示する。送信結果が不明なときは自動再送せず `unknown` と記録する。
+返信本文は bridge に残り、手動で `call_poll` から確認できる。
+ローカル MCP の再起動後は、記録された進行中の通話の受信を再開する。
+
+現在の自動配送対象は Codex 親。Claude Code／Cursor の直接 HTTP 接続と手動 `call_poll` は従来どおり使える。
+
 ```text
 Local agent ──wake──▶ Grok Bot switchboard ──wake──▶ Grok Bot member
      │                                                      │
