@@ -334,9 +334,11 @@ async def call_open(local_id: str, local_label: str, member_name: str,
     return {**result, "parent_delivery": {"state": "watching", "thread_id": thread_id}}
 
 
-@mcp.tool(description="通話へメッセージを送信")
-async def call_send(session_id: str, from_party: Literal["local", "member"], message: str) -> dict[str, Any]:
-    return await _remote_tool("call_send", {"session_id": session_id, "from_party": from_party, "message": message})
+@mcp.tool(description="通話へメッセージを送信。local は返信依頼が既定。返信不要なら reply_required=false")
+async def call_send(session_id: str, from_party: Literal["local", "member"], message: str,
+                    reply_required: bool = True) -> dict[str, Any]:
+    return await _remote_tool("call_send", {"session_id": session_id, "from_party": from_party,
+                                            "message": message, "reply_required": reply_required})
 
 
 @mcp.tool(description="自分宛のメッセージを手動取得。自動配送中の親は通常不要")

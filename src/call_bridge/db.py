@@ -136,7 +136,7 @@ class CallStore:
             return [dict(r) for r in rows]
 
     def send_message(
-        self, session_id: str, from_party: str, message: str
+        self, session_id: str, from_party: str, message: str, reply_required: bool = True
     ) -> dict[str, Any]:
         if from_party not in ("local", "member"):
             raise ValueError("from_party must be 'local' or 'member'")
@@ -154,6 +154,11 @@ class CallStore:
                 (session_id,),
             ).fetchone()
             seq = int(row["m"]) + 1
+            if from_party == "local" and reply_required:
+                message += (
+                    "\n\nこの連絡には返信が必要です。"
+                    f"session_id={session_id} の通話に、member として call_send で返事を送ってください。"
+                )
             conn.execute(
                 """
                 INSERT INTO messages (

@@ -17,6 +17,9 @@ A local coding agent (Claude Code, Codex, Cursor, …) asks a Grok Bot “switch
 3. **Local** and **Grok Bot member** use `call_send` / `call_poll` on the same server (`from_party` / `party` = `local` | `member`).
 4. Either side (or ops) calls `call_hangup`.
 
+`call_send` で `from_party="local"` のときは、同じ通話へ `member` として返答する案内を本文に自動で付ける。
+返信不要の通知は `reply_required=false` を指定する。MCP と REST のどちらでも同じ動作になる。
+
 ### Codex 親への返信自動配送
 
 Codex から通話する端末では、ローカル MCP を登録すると `call_open` が親タスクを識別する。
@@ -59,7 +62,7 @@ Local agent ──wake──▶ Grok Bot switchboard ──wake──▶ Grok Bo
 |------|------|
 | `call_directory` | Phone book, built on that call from live seat profiles |
 | `call_open` | Create session (local → member) |
-| `call_send` | Send a message |
+| `call_send` | Send a message; local messages request a reply by default (`reply_required=false` for notices) |
 | `call_poll` | Fetch new messages for your party |
 | `call_list` | List / filter sessions |
 | `call_hangup` | End the call |

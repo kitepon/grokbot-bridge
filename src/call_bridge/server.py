@@ -41,6 +41,7 @@ _INSTRUCTIONS = """
 - call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（UNIX ソケット優先。定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
+- local の call_send は返信依頼を本文に付ける。返信不要の通知だけ reply_required=false を指定する
 """
 
 Party = Literal["local", "member"]
@@ -98,10 +99,11 @@ def call_open(
     return _session_view(sess, notify_wake(sess))
 
 
-@mcp.tool(description="セッションへメッセージ送信。from_party は 'local' または 'member'。")
-def call_send(session_id: str, from_party: Party, message: str) -> dict[str, Any]:
+@mcp.tool(description="セッションへメッセージ送信。local は返信依頼が既定。返信不要なら reply_required=false。")
+def call_send(session_id: str, from_party: Party, message: str,
+              reply_required: bool = True) -> dict[str, Any]:
     try:
-        return store.send_message(session_id, from_party, message)
+        return store.send_message(session_id, from_party, message, reply_required)
     except KeyError as e:
         return {"error": "not_found", "detail": str(e)}
     except (ValueError, RuntimeError) as e:
@@ -266,13 +268,18 @@ async def rest_send(request: Request) -> Response:
         return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
     from_party = body.get("from_party")
     message = body.get("message")
+    reply_required = body.get("reply_required", True)
     if from_party not in ("local", "member") or not message:
         return JSONResponse(
             {"ok": False, "error": "need from_party (local|member) and message"},
             status_code=400,
         )
+    if not isinstance(reply_required, bool):
+        return JSONResponse(
+            {"ok": False, "error": "reply_required must be boolean"}, status_code=400
+        )
     try:
-        result = store.send_message(session_id, from_party, str(message))
+        result = store.send_message(session_id, from_party, str(message), reply_required)
         return JSONResponse({"ok": True, **result})
     except KeyError as e:
         return JSONResponse({"ok": False, "error": "not_found", "detail": str(e)}, status_code=404)
