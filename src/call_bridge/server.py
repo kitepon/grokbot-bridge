@@ -6,6 +6,7 @@ A switchboard agent wakes the member; conversation bodies go through this MCP, n
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 from pathlib import Path
@@ -19,6 +20,7 @@ from starlette.responses import JSONResponse, Response
 
 from .db import CallStore
 from .directory import search_directory
+from .wake import notify_wake
 
 log = logging.getLogger("call_bridge")
 
@@ -30,7 +32,7 @@ _INSTRUCTIONS = """
 電話番（スイッチボード）エージェントは呼び出し（起こし）のみ。本文は中継しない。
 
 ## 流れ
-1. ローカルが call_open でセッション作成（status=ringing）
+1. ローカルが call_open でセッション作成（status=ringing）。サーバは設定済みならスイッチボード webhook へ wake を POST する（本文は含めない）
 2. 電話番が相手メンバーを起こし、session_id と MCP URL を渡す
 3. 両者 call_send / call_poll で会話
 4. call_hangup で終了
@@ -66,14 +68,8 @@ mcp = FastMCP(
 # ---------- MCP tools ----------
 
 
-@mcp.tool(description="通話セッションを開く（local→member）。status=ringing で開始。session_id を返す。")
-def call_open(
-    local_id: str,
-    local_label: str,
-    member_name: str,
-    purpose: str | None = None,
-) -> dict[str, Any]:
-    sess = store.open_session(local_id, local_label, member_name, purpose)
+def _session_view(sess: dict[str, Any], wake: dict[str, str]) -> dict[str, Any]:
+    """Session fields plus a non-fatal wake result. No message bodies."""
     return {
         "session_id": sess["session_id"],
         "status": sess["status"],
@@ -82,7 +78,24 @@ def call_open(
         "member_name": sess["member_name"],
         "purpose": sess["purpose"],
         "created_at": sess["created_at"],
+        "wake": wake,
     }
+
+
+@mcp.tool(
+    description=(
+        "通話セッションを開く（local→member）。status=ringing で開始。"
+        "設定されていればスイッチボードへ wake 通知（本文なし）を送る。session_id を返す。"
+    )
+)
+def call_open(
+    local_id: str,
+    local_label: str,
+    member_name: str,
+    purpose: str | None = None,
+) -> dict[str, Any]:
+    sess = store.open_session(local_id, local_label, member_name, purpose)
+    return _session_view(sess, notify_wake(sess))
 
 
 @mcp.tool(description="セッションへメッセージ送信。from_party は 'local' または 'member'。")
@@ -230,19 +243,8 @@ async def rest_open_session(request: Request) -> Response:
             status_code=400,
         )
     sess = store.open_session(str(local_id), str(local_label), str(member_name), purpose)
-    return JSONResponse(
-        {
-            "ok": True,
-            "session_id": sess["session_id"],
-            "status": sess["status"],
-            "local_id": sess["local_id"],
-            "local_label": sess["local_label"],
-            "member_name": sess["member_name"],
-            "purpose": sess["purpose"],
-            "created_at": sess["created_at"],
-        },
-        status_code=201,
-    )
+    wake = await asyncio.to_thread(notify_wake, sess)
+    return JSONResponse({"ok": True, **_session_view(sess, wake)}, status_code=201)
 
 
 @mcp.custom_route("/v0/sessions/{session_id}/messages", methods=["POST"])
