@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Build phone directory from Grok Bot agent profiles and optionally push to the bridge host.
+"""Optional helper: write a directory.json fallback snapshot from local profiles.
 
-Source of truth: each seat's profile.json (name, title, description) — unchanged.
-No call-permission flags.
+call_directory does not use this script. Freshness is a live read on each
+request (CALL_BRIDGE_DIRECTORY_UNIX, else CALL_BRIDGE_DIRECTORY_URL, else profile.json on this host). The file
+this writes is only the last-resort snapshot when those sources are unavailable.
+There is no periodic sync and no required post-edit push.
 """
 from __future__ import annotations
 
@@ -16,11 +18,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from call_bridge.directory import build_directory_doc, write_directory_snapshot  # noqa: E402
+from call_bridge.directory import write_directory_snapshot  # noqa: E402
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser()
+    ap = argparse.ArgumentParser(description="Write an optional directory.json fallback snapshot.")
     ap.add_argument(
         "--agents-root",
         default="/home/box/agent-data/agents",
@@ -34,7 +36,10 @@ def main() -> int:
     ap.add_argument(
         "--remote",
         default="",
-        help="scp target, e.g. main-server:/home/kite/call-bridge/directory.json",
+        help=(
+            "optional scp of the fallback snapshot only "
+            "(does not keep the live phone book fresh)"
+        ),
     )
     args = ap.parse_args()
     root = Path(args.agents_root)
@@ -47,6 +52,11 @@ def main() -> int:
             print(f"check ラピ title={m.get('title')!r}", file=sys.stderr)
             break
     if args.remote:
+        print(
+            "note: this copies the fallback snapshot only; "
+            "live directory freshness does not depend on this push",
+            file=sys.stderr,
+        )
         subprocess.check_call(["scp", "-o", "BatchMode=yes", str(out), args.remote])
         print(json.dumps({"ok": True, "synced_to": args.remote}, ensure_ascii=False))
     return 0
