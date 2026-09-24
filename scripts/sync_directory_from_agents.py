@@ -2,7 +2,7 @@
 """Optional helper: write a directory.json fallback snapshot from local profiles.
 
 call_directory does not use this script. Freshness is a live read on each
-request (CALL_BRIDGE_DIRECTORY_URL, or profile.json on this host). The file
+request (CALL_BRIDGE_DIRECTORY_UNIX, else CALL_BRIDGE_DIRECTORY_URL, else profile.json on this host). The file
 this writes is only the last-resort snapshot when those sources are unavailable.
 There is no periodic sync and no required post-edit push.
 """

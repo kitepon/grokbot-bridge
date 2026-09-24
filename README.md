@@ -39,24 +39,25 @@ Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 
 ## Phone directory
 
-Clients only call `call_directory` (or `GET /v0/directory`). The server builds the book **on that request** from Grok Bot seat profiles. A profile edit is visible on the **next** call. There is no periodic sync and no post-edit push.
+Clients only call `call_directory` (or `GET /v0/directory`). The server builds the book **on that request** from Grok Bot seat profiles. Changing a seat’s name, title, or description shows up on the **next** call. There is no periodic sync, no Marian routine, and no operator push after a role edit.
 
 Source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag.
 
 Lookup order:
 
-1. **`CALL_BRIDGE_DIRECTORY_URL`** (preferred in production). call-bridge runs on main-server; the live `profile.json` files stay on the Grok Bot box. On the box, `scripts/directory_live_server.py` serves `GET /v0/directory` from `/home/box/agent-data/agents` (or `CALL_BRIDGE_AGENTS_ROOT`) on every request, bound to `127.0.0.1`. A reverse SSH tunnel makes that port reachable from the container, for example `http://172.17.0.1:18911/v0/directory` or `http://host.docker.internal:18911/v0/directory` (compose maps `host-gateway`). The tunnel must listen on an address the container can route to. A copied `agents/` tree on main-server is not the primary path — it goes stale.
-2. **Local profiles**, when this process is on the box: `CALL_BRIDGE_AGENTS_ROOT` if set and that directory exists, otherwise `/home/box/agent-data/agents` when the env var is unset and the path exists.
-3. **`directory.json`** — last-resort snapshot only, when the URL is unset or unreachable and no local profile tree is available.
+1. **`CALL_BRIDGE_DIRECTORY_UNIX`** (preferred in production). HTTP GET over an `AF_UNIX` socket. The HTTP path is `CALL_BRIDGE_DIRECTORY_UNIX_PATH` (default `/v0/directory`). On main-server the container has the host socat socket mounted at `/run/dirlive.sock`.
+2. **`CALL_BRIDGE_DIRECTORY_URL`** — plain HTTP GET, only if the unix socket is unset or that GET fails.
+3. **Local profiles**, only after every configured remote GET has failed (or none is set): `CALL_BRIDGE_AGENTS_ROOT` if set and that directory exists, otherwise `/home/box/agent-data/agents` when the env var is unset and the path exists. This is for running call-bridge on the Grok Bot box itself. A copied agents tree on main-server is not the primary path.
+4. **`directory.json`** — last-resort snapshot when the remotes failed and no local profile tree is available.
 
-A live read reports `source: agent-profiles` and `agents_root` (URL reads also include `directory_url`). The snapshot reports `source: directory.json` and does not claim to be a live profile read, even if the file was generated from profiles.
+A live read reports `source: agent-profiles` and `agents_root`. A unix read also includes `directory_unix`; a URL read includes `directory_url`. The snapshot reports `source: directory.json` and does not claim to be a live profile read. If a remote was configured and failed before the snapshot was used, the response includes `directory_unix_error` and/or `directory_url_error`.
 
-If the URL is set but the GET fails, the server falls through to the local tree and then the snapshot so the call still returns a book. The snapshot response includes `directory_url_error` in that case.
+Prod wiring (operated outside this repo): the Grok Bot box runs `scripts/directory_live_server.py` on `127.0.0.1:18765`. SSH reverse-forwards that port to main-server (`ssh -R 127.0.0.1:18765:127.0.0.1:18765`). A host `socat` listens on a unix socket and dials `127.0.0.1:18765`. That socket is mounted into the call-bridge container as `/run/dirlive.sock`.
 
 ```bash
 # On the Grok Bot box (profiles live here):
 python scripts/directory_live_server.py
-# {"ok": true, "listen": "http://127.0.0.1:18911/v0/directory", ...}
+# {"ok": true, "listen": "http://127.0.0.1:18765/v0/directory", ...}
 
 # MCP clients — this is the whole interface
 call_directory()
@@ -67,7 +68,7 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
   "http://127.0.0.1:18910/v0/directory?q=ラピ"
 ```
 
-`scripts/sync_directory_from_agents.py` only writes an optional `directory.json` fallback for hosts that cannot reach profiles. It is not how the book stays fresh.
+`scripts/sync_directory_from_agents.py` only writes an optional `directory.json` fallback. It is not how the book stays fresh, and nothing needs to run it after a profile edit.
 
 ## Quick start
 
@@ -128,10 +129,12 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | `CALL_BRIDGE_DB` | `data/calls.db` | SQLite path |
 | `CALL_BRIDGE_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*` | Host header allowlist |
 | `CALL_BRIDGE_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*` | Origin allowlist |
-| `CALL_BRIDGE_DIRECTORY_URL` | _(unset)_ | On each `call_directory`, GET this URL (live profiles). Preferred prod source |
-| `CALL_BRIDGE_DIRECTORY_URL_AUTH` | _(unset)_ | Bearer token for that GET (raw token or `Bearer …`) |
-| `CALL_BRIDGE_DIRECTORY_URL_TIMEOUT` | `2.5` | Seconds for that GET |
-| `CALL_BRIDGE_AGENTS_ROOT` | `/home/box/agent-data/agents` if that directory exists and the env var is unset | Local `profile.json` tree. Used when the URL is unset or unreachable. When set, only that path is used |
+| `CALL_BRIDGE_DIRECTORY_UNIX` | _(unset)_ | On each `call_directory`, HTTP GET over this `AF_UNIX` socket. Preferred prod source (`/run/dirlive.sock`) |
+| `CALL_BRIDGE_DIRECTORY_UNIX_PATH` | `/v0/directory` | HTTP path on that socket |
+| `CALL_BRIDGE_DIRECTORY_URL` | _(unset)_ | HTTP GET used when the unix socket is unset or fails |
+| `CALL_BRIDGE_DIRECTORY_URL_AUTH` | _(unset)_ | Bearer token sent on the unix and URL GETs (raw token or `Bearer …`) |
+| `CALL_BRIDGE_DIRECTORY_URL_TIMEOUT` | `2.5` | Seconds for each remote GET |
+| `CALL_BRIDGE_AGENTS_ROOT` | `/home/box/agent-data/agents` if that directory exists and the env var is unset | Local `profile.json` tree, used only when configured remotes fail (or none are set). When set, only that path is used |
 | `CALL_BRIDGE_DIRECTORY` | `./directory.json` | Last-resort snapshot file |
 | `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard wake webhook. Empty skips the POST |
 | `CALL_BRIDGE_WAKE_WEBHOOK_AUTH` | _(unset)_ | `Authorization` header value for that POST |

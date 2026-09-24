@@ -2,13 +2,17 @@
 """On-demand phone directory for the host that has the live seat profiles.
 
 Run this on the Grok Bot box (where ``/home/box/agent-data/agents/*/profile.json``
-lives). It binds localhost and rebuilds the book on every ``GET /v0/directory``.
-Point call-bridge at it with ``CALL_BRIDGE_DIRECTORY_URL``. No cron and no push.
+lives). Each ``GET /v0/directory`` rebuilds the book from those files.
+Prod binds ``127.0.0.1:18765``. main-server forwards that port with
+``ssh -R 127.0.0.1:18765`` and a host socat unix socket mounted into
+call-bridge as ``/run/dirlive.sock`` (``CALL_BRIDGE_DIRECTORY_UNIX``).
+``CALL_BRIDGE_DIRECTORY_URL`` is only the HTTP fallback.
+No cron, no Marian sync, and no push after a role edit.
 
 Env:
   CALL_BRIDGE_AGENTS_ROOT     profile tree (else ``/home/box/agent-data/agents``)
   CALL_BRIDGE_DIRECTORY_BIND  default ``127.0.0.1``
-  CALL_BRIDGE_DIRECTORY_PORT  default ``18911``
+  CALL_BRIDGE_DIRECTORY_PORT  default ``18765``
   CALL_BRIDGE_DIRECTORY_TOKEN optional bearer required on ``/v0/directory``
 """
 
@@ -82,7 +86,7 @@ class DirectoryHandler(BaseHTTPRequestHandler):
 
 def main() -> int:
     host = os.environ.get("CALL_BRIDGE_DIRECTORY_BIND", "127.0.0.1").strip() or "127.0.0.1"
-    port = int(os.environ.get("CALL_BRIDGE_DIRECTORY_PORT", "18911"))
+    port = int(os.environ.get("CALL_BRIDGE_DIRECTORY_PORT", "18765"))
     httpd = ThreadingHTTPServer((host, port), DirectoryHandler)
     root = agents_root()
     print(

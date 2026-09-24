@@ -1,11 +1,12 @@
-"""On-demand phone directory: URL, local profiles, then directory.json."""
+"""On-demand phone directory: unix socket, URL, local profiles, then directory.json."""
 
 from __future__ import annotations
 
 import json
 import os
-import sys
+import socket
 import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -27,6 +28,8 @@ from call_bridge.directory import (  # noqa: E402
 )
 
 _ENV_KEYS = (
+    "CALL_BRIDGE_DIRECTORY_UNIX",
+    "CALL_BRIDGE_DIRECTORY_UNIX_PATH",
     "CALL_BRIDGE_DIRECTORY_URL",
     "CALL_BRIDGE_DIRECTORY_URL_AUTH",
     "CALL_BRIDGE_DIRECTORY_URL_TIMEOUT",
@@ -39,6 +42,17 @@ _ENV_KEYS = (
 
 _MISSING_AGENTS = "/nonexistent/call-bridge-agents-root"
 _MISSING_SNAPSHOT = "/nonexistent/call-bridge-directory.json"
+
+
+def _load_live_server():
+    import importlib.util
+
+    path = Path(__file__).resolve().parents[1] / "scripts" / "directory_live_server.py"
+    spec = importlib.util.spec_from_file_location("directory_live_server", path)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _write_profile(
@@ -80,13 +94,13 @@ class _PayloadHandler(BaseHTTPRequestHandler):
             "hop": self.headers.get(DIRECTORY_HOP_HEADER),
         }
         body = self.payload
-        self.send_response(self.status_code)
-        if self.location:
-            self.send_header("Location", self.location)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
         try:
+            self.send_response(self.status_code)
+            if self.location:
+                self.send_header("Location", self.location)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
             self.wfile.write(body)
         except BrokenPipeError:
             return
@@ -102,6 +116,7 @@ class DirectoryTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CALL_BRIDGE_AGENTS_ROOT"] = _MISSING_AGENTS
         os.environ["CALL_BRIDGE_DIRECTORY"] = _MISSING_SNAPSHOT
+        self._unix_servers: dict[str, ThreadingHTTPServer] = {}
 
     def tearDown(self) -> None:
         for key, value in self._saved.items():
@@ -182,6 +197,169 @@ class DirectoryTests(unittest.TestCase):
         self.assertEqual(captured["authorization"], "Bearer live-token")
         self.assertEqual(captured["hop"], "1")
         self.assertTrue(captured["path"].startswith("/v0/directory"))
+
+    def test_unix_socket_is_preferred_over_url(self) -> None:
+        root = self._agents()
+        _write_profile(root, "local", "ローカル席", "古い肩書き", "ローカル")
+        self._write_snapshot([{"name": "スナップ", "title": "ファイル", "role": "予備"}])
+        url_server = self._serve(
+            {
+                "source": "agent-profiles",
+                "agents_root": "/via-url",
+                "members": [{"name": "URL席", "title": "URL", "role": "fallback"}],
+            }
+        )
+        sock = self._serve_unix(
+            {
+                "ok": True,
+                "schema": "grokbot.directory.v0",
+                "source": "agent-profiles",
+                "agents_root": "/home/box/agent-data/agents",
+                "members": [{"name": "ラピ", "title": "ソケット", "role": "ライブ"}],
+            }
+        )
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = sock
+        os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._url(url_server)
+        os.environ["CALL_BRIDGE_DIRECTORY_URL_AUTH"] = "live-token"
+
+        book = load_directory()
+
+        self.assertEqual(book["source"], "agent-profiles")
+        self.assertEqual(book["agents_root"], "/home/box/agent-data/agents")
+        self.assertEqual(book["directory_unix"], sock)
+        self.assertNotIn("directory_url", book)
+        self.assertEqual(book["members"][0]["title"], "ソケット")
+        unix_hit = self._unix_servers[sock].captured  # type: ignore[attr-defined]
+        self.assertEqual(unix_hit["path"].split("?", 1)[0], "/v0/directory")
+        self.assertEqual(unix_hit["authorization"], "Bearer live-token")
+        self.assertEqual(unix_hit["hop"], "1")
+        self.assertIsNone(url_server.captured)  # type: ignore[attr-defined]
+
+    def test_unix_custom_http_path(self) -> None:
+        sock = self._serve_unix(
+            {
+                "source": "agent-profiles",
+                "agents_root": "/profiles",
+                "members": [{"name": "ラピ", "title": "t", "role": "r"}],
+            }
+        )
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = sock
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX_PATH"] = "custom/book"
+
+        book = load_directory()
+
+        self.assertEqual(book["directory_unix"], sock)
+        hit = self._unix_servers[sock].captured  # type: ignore[attr-defined]
+        self.assertEqual(hit["path"].split("?", 1)[0], "/custom/book")
+
+    def test_unix_failure_falls_back_to_url_not_local(self) -> None:
+        root = self._agents()
+        _write_profile(root, "local", "ローカル席", "ローカル", "ここ")
+        url_server = self._serve(
+            {
+                "source": "agent-profiles",
+                "agents_root": "/via-url",
+                "members": [{"name": "ラピ", "title": "URL最新", "role": "リモート"}],
+            }
+        )
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self._short_tmp()) / "missing.sock")
+        os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._url(url_server)
+
+        book = load_directory()
+
+        self.assertEqual(book["source"], "agent-profiles")
+        self.assertEqual(book["directory_url"], self._url(url_server))
+        self.assertEqual(book["agents_root"], "/via-url")
+        self.assertEqual(book["members"][0]["title"], "URL最新")
+        self.assertNotIn("directory_unix", book)
+        self.assertNotIn("directory_unix_error", book)
+
+    def test_unix_and_url_failure_uses_local_profiles(self) -> None:
+        root = self._agents()
+        _write_profile(root, "rapi", "ラピ", "ローカル最新", "ここ")
+        self._write_snapshot([{"name": "スナップ", "title": "古い", "role": "ファイル"}])
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self._short_tmp()) / "missing.sock")
+        os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._closed_url()
+
+        book = load_directory()
+
+        self.assertEqual(book["source"], "agent-profiles")
+        self.assertEqual(book["agents_root"], str(root))
+        self.assertEqual(book["members"][0]["title"], "ローカル最新")
+        self.assertNotIn("directory_unix_error", book)
+        self.assertNotIn("directory_url_error", book)
+
+    def test_remote_failures_then_snapshot_records_both_errors(self) -> None:
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self._short_tmp()) / "missing.sock")
+        os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._closed_url()
+        path = self._write_snapshot(
+            [{"name": "スナップ", "title": "古い", "role": "ファイル"}],
+            source="agent-profiles",
+            agents_root="/home/box/agent-data/agents",
+        )
+
+        book = load_directory()
+
+        self.assertEqual(book["source"], "directory.json")
+        self.assertEqual(book["path"], str(path.resolve()))
+        self.assertNotIn("agents_root", book)
+        self.assertEqual(book["directory_unix_error"], "unix socket not found")
+        self.assertEqual(book["directory_url_error"], "request failed")
+        self.assertEqual(book["members"][0]["name"], "スナップ")
+
+    def test_unix_timeout_falls_back_to_url(self) -> None:
+        sock = self._serve_unix({}, delay=2)
+        url_server = self._serve(
+            {
+                "source": "agent-profiles",
+                "agents_root": "/via-url",
+                "members": [{"name": "ラピ", "title": "URL", "role": "間に合った"}],
+            }
+        )
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = sock
+        os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._url(url_server)
+        os.environ["CALL_BRIDGE_DIRECTORY_URL_TIMEOUT"] = "0.3"
+
+        started = time.monotonic()
+        book = load_directory()
+        elapsed = time.monotonic() - started
+
+        self.assertLess(elapsed, 1.5)
+        self.assertEqual(book["directory_url"], self._url(url_server))
+        self.assertEqual(book["members"][0]["title"], "URL")
+        self.assertNotIn("directory_unix", book)
+
+    def test_unix_live_handler_sees_profile_edit_on_next_get(self) -> None:
+        live = _load_live_server()
+        root = self._agents()
+        _write_profile(root, "rapi", "ラピ", "インフラ統括", "旧説明")
+        decoy = self._serve(
+            {
+                "source": "agent-profiles",
+                "agents_root": "/decoy",
+                "members": [{"name": "デコイ", "title": "no", "role": "no"}],
+            }
+        )
+        self._write_snapshot([{"name": "スナップ", "title": "古い", "role": "no"}])
+        os.environ["CALL_BRIDGE_DIRECTORY_TOKEN"] = "box-token"
+        sock = self._serve_unix_handler(live.DirectoryHandler)
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = sock
+        os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._url(decoy)
+        os.environ["CALL_BRIDGE_DIRECTORY_URL_AUTH"] = "box-token"
+
+        first = load_directory()
+        self.assertEqual(first["directory_unix"], sock)
+        self.assertEqual(first["source"], "agent-profiles")
+        self.assertEqual(first["agents_root"], str(root))
+        self.assertEqual(first["members"][0]["title"], "インフラ統括")
+        self.assertEqual(first["members"][0]["role"], "旧説明")
+        self.assertIsNone(decoy.captured)  # type: ignore[attr-defined]
+
+        _write_profile(root, "rapi", "ラピ", "インフラ統括・改", "新しい説明")
+        second = load_directory()
+        self.assertEqual(second["directory_unix"], sock)
+        self.assertEqual(second["members"][0]["title"], "インフラ統括・改")
+        self.assertEqual(second["members"][0]["role"], "新しい説明")
 
     def test_auth_header_keeps_existing_bearer_scheme(self) -> None:
         server = self._serve(
@@ -312,14 +490,24 @@ class DirectoryTests(unittest.TestCase):
         )
         root = self._agents()
         _write_profile(root, "rapi", "ラピ", "近", "近")
+        sock = self._serve_unix(
+            {
+                "source": "agent-profiles",
+                "agents_root": "/unix",
+                "members": [{"name": "ソケット", "title": "遠", "role": "遠"}],
+            }
+        )
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = sock
         os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._url(server)
 
         book = search_directory(skip_url=True)
 
         self.assertEqual(book["members"][0]["name"], "ラピ")
         self.assertIsNone(server.captured)  # type: ignore[attr-defined]
+        self.assertIsNone(self._unix_servers[sock].captured)  # type: ignore[attr-defined]
 
     def test_all_sources_missing(self) -> None:
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self._short_tmp()) / "missing.sock")
         os.environ["CALL_BRIDGE_DIRECTORY_URL"] = self._closed_url()
         with mock.patch(
             "call_bridge.directory._snapshot_paths",
@@ -329,6 +517,7 @@ class DirectoryTests(unittest.TestCase):
         self.assertFalse(book["ok"])
         self.assertEqual(book["error"], "directory_unavailable")
         self.assertEqual(book["members"], [])
+        self.assertEqual(book["directory_unix_error"], "unix socket not found")
         self.assertEqual(book["directory_url_error"], "request failed")
 
     def test_explicit_missing_agents_root_does_not_use_default(self) -> None:
@@ -457,6 +646,54 @@ class DirectoryTests(unittest.TestCase):
         port = sock.getsockname()[1]
         sock.close()
         return f"http://127.0.0.1:{port}/v0/directory"
+
+    def _short_tmp(self) -> Path:
+        import tempfile
+
+        directory = tempfile.mkdtemp(prefix="cb-")
+        self.addCleanup(lambda: __import__("shutil").rmtree(directory, ignore_errors=True))
+        return Path(directory)
+
+    def _serve_unix(
+        self,
+        payload: dict,
+        *,
+        status: int = 200,
+        location: str | None = None,
+        delay: float = 0,
+    ) -> str:
+        handler = type(
+            f"UnixHandler{id(self)}{status}{int(delay * 10)}",
+            (_PayloadHandler,),
+            {
+                "payload": json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+                "status_code": status,
+                "location": location,
+                "delay": delay,
+            },
+        )
+        return self._serve_unix_handler(handler)
+
+    def _serve_unix_handler(self, handler: type[BaseHTTPRequestHandler]) -> str:
+        class UnixHTTPServer(ThreadingHTTPServer):
+            address_family = socket.AF_UNIX
+
+        sock_path = str(self._short_tmp() / "d.sock")
+
+        server = UnixHTTPServer(sock_path, handler)
+        server.captured = None  # type: ignore[attr-defined]
+        self._unix_servers[sock_path] = server
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+
+        def _stop() -> None:
+            server.shutdown()
+            server.server_close()
+            if os.path.exists(sock_path):
+                os.unlink(sock_path)
+
+        self.addCleanup(_stop)
+        return sock_path
 
     def _start_live_server(self, root: Path, *, token: str) -> str:
         import select
