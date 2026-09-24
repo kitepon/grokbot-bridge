@@ -10,6 +10,7 @@ services:
       - "127.0.0.1:18910:18910"
     volumes:
       - ./data:/app/data
+      - ./directory.json:/app/directory.json:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health', timeout=3)"]
       interval: 30s

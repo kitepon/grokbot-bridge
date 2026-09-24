@@ -27,6 +27,7 @@ Local agent ──wake──▶ Grok Bot switchboard ──wake──▶ Grok Bo
 
 | Tool | Role |
 |------|------|
+| `call_directory` | Phone book: names, titles, roles (no permission flags) |
 | `call_open` | Create session (local → member) |
 | `call_send` | Send a message |
 | `call_poll` | Fetch new messages for your party |
@@ -35,6 +36,27 @@ Local agent ──wake──▶ Grok Bot switchboard ──wake──▶ Grok Bo
 | `call_info` | Session details |
 
 Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
+
+## Phone directory
+
+Source of truth is each Grok Bot seat’s **profile** (`name`, `title`, `description`) — used as-is
+(e.g. ラピ → title `インフラ統括`). There is **no** “may call” flag.
+
+When `CALL_BRIDGE_AGENTS_ROOT` (or `/home/box/agent-data/agents`) is readable, `call_directory`
+builds the book **live**. On a remote host, sync the same snapshot with
+`scripts/sync_directory_from_agents.py` so profile edits keep following.
+
+```bash
+# MCP
+call_directory()            # full book
+call_directory(query="インフラ")
+
+# REST
+curl -sS -H "Authorization: Bearer $TOKEN" \
+  "http://127.0.0.1:18910/v0/directory?q=ラピ"
+```
+
+Edit `directory.json` and restart (or rely on the compose bind mount) to update the book.
 
 ## Quick start
 

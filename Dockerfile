@@ -5,6 +5,7 @@ WORKDIR /app
 
 COPY pyproject.toml ./
 COPY src ./src
+COPY directory.json ./directory.json
 RUN pip install --no-cache-dir .
 
 EXPOSE 18910

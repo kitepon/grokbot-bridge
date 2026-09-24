@@ -18,6 +18,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .db import CallStore
+from .directory import search_directory
 
 log = logging.getLogger("call_bridge")
 
@@ -35,7 +36,8 @@ _INSTRUCTIONS = """
 4. call_hangup で終了
 
 ## ツール
-- call_open / call_send / call_poll / call_list / call_hangup / call_info
+- call_directory … 電話帳（名前・役割。呼び出し可否は持たない）
+- call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
 """
 
@@ -154,6 +156,18 @@ def call_info(session_id: str) -> dict[str, Any]:
         return {"error": "not_found", "detail": str(e)}
 
 
+
+@mcp.tool(
+    description=(
+        "電話帳。Grok Bot 各席の profile（name / title / description）をそのまま返す。"
+        "title が肩書き（例: ラピ→インフラ統括）。query で部分一致。"
+        "呼び出し可否フラグは無い。設定変更は席のプロフィール更新に追従する。"
+    )
+)
+def call_directory(query: str | None = None) -> dict[str, Any]:
+    return search_directory(query)
+
+
 # ---------- HTTP (non-MCP) ----------
 
 
@@ -181,6 +195,16 @@ async def health(_request: Request) -> Response:
             "version": "0.1.0",
         }
     )
+
+
+
+@mcp.custom_route("/v0/directory", methods=["GET"])
+async def rest_directory(request: Request) -> Response:
+    denied = _check_bearer(request)
+    if denied is not None:
+        return denied
+    query = request.query_params.get("q") or request.query_params.get("query")
+    return JSONResponse(search_directory(query))
 
 
 @mcp.custom_route("/v0/sessions", methods=["POST"])
