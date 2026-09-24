@@ -17,7 +17,15 @@ A local coding agent (Claude Code, Codex, Cursor, …) asks a Grok Bot “switch
 3. **Local** `call_send` delivers the text into the target Grok Bot agent through the host gateway (`POST /api/deliverAgentMessage`). That wakes the bot the same way Grok Bot agents wake each other. The text includes the session id and a one-line hint to reply with call-bridge MCP `call_send` (`from_party=member`). The result includes `delivery.status` (`delivered`, `target_not_found`, `not_member`, `unavailable`, or `error`). If `GROKBOT_GATEWAY_URL` or `GROKBOT_GATEWAY_TOKEN` is unset, or the gateway does not report `delivered`, the call fails and the message is not stored. **Member** `call_send` is unchanged (stored for the local side). `call_open`'s switchboard wake is unchanged.
 4. Either side (or ops) calls `call_hangup`.
 
-`call_send` で `from_party="local"` のときは、相手エージェントへ直接届けてから保存する。保存される本文には、同じ `session_id` へ call-bridge MCP の `call_send`（`from_party=member`）で返答する案内が付く。案内は保存される本文と送信結果の両方に含まれる。配送が `delivered` のときだけ保存する。gateway の環境変数が無い、または配送が失敗したときはエラーを返し、保存しない。返信不要の通知だけ `reply_required=false` を指定する。`from_party="member"` の本文は変更せず、gateway にも送らない。MCP と REST のどちらでも同じ動作になる。返信依頼はメンバーへ送る指示であり、返答そのものを保証するものではない。
+When a real MCP or REST request finds the directory unix socket unreachable, or the gateway forward down (connection failure, timeout, or gateway status `unavailable`), the server POSTs the same switchboard webhook once:
+
+```json
+{"event":"bridge.link_down","link":"directory","detail":"unix socket not found"}
+```
+
+`link` is `directory` or `gateway`. `detail` is a short error (`unix socket not found`, `timed out`, `request failed`, or `unavailable`). At most one of these wakes is sent per 60 seconds, in-process, with no background poll. `call_open`'s `session.opened` wake is unchanged. The caller is told the box link is down, the operator has been woken to reconnect, and to retry in about 30 seconds. `call_directory` still uses its existing fallback and adds that note. A local `call_send` that hits this returns the failure with that note and does not store the message. Ordinary gateway statuses (`target_not_found`, `not_member`, `empty`, HTTP 401) do not send this event.
+
+`call_send` で `from_party="local"` のときは、相手エージェントへ直接届けてから保存する。保存される本文には、同じ `session_id` へ call-bridge MCP の `call_send`（`from_party=member`）で返答する案内が付く。案内は保存される本文と送信結果の両方に含まれる。配送が `delivered` のときだけ保存する。gateway の環境変数が無い、または配送が失敗したときはエラーを返し、保存しない。ディレクトリの UNIX ソケット、または gateway の転送が落ちているときは、同じスイッチボード webhook へ `bridge.link_down` を最大 60 秒に 1 回送り、呼び出し元には約 30 秒後の再試行を伝える。定期的な死活監視はしない。返信不要の通知だけ `reply_required=false` を指定する。`from_party="member"` の本文は変更せず、gateway にも送らない。MCP と REST のどちらでも同じ動作になる。返信依頼はメンバーへ送る指示であり、返答そのものを保証するものではない。
 
 `call_send` の通常送信の引数例：
 
@@ -100,14 +108,14 @@ Source of truth is each seat’s **profile** (`name`, `title`, `description`) �
 
 Lookup order:
 
-1. **`CALL_BRIDGE_DIRECTORY_UNIX`** (preferred in production). HTTP GET over an `AF_UNIX` socket. The HTTP path is `CALL_BRIDGE_DIRECTORY_UNIX_PATH` (default `/v0/directory`). On main-server the container has the host socat socket mounted at `/run/dirlive.sock`.
+1. **`CALL_BRIDGE_DIRECTORY_UNIX`** (preferred in production). HTTP GET over an `AF_UNIX` socket. The HTTP path is `CALL_BRIDGE_DIRECTORY_UNIX_PATH` (default `/v0/directory`). On main-server the container mounts the socket's parent directory at `/run/dirlive`, and the socket path is `/run/dirlive/dirlive.sock`.
 2. **`CALL_BRIDGE_DIRECTORY_URL`** — plain HTTP GET, only if the unix socket is unset or that GET fails.
 3. **Local profiles**, only after every configured remote GET has failed (or none is set): `CALL_BRIDGE_AGENTS_ROOT` if set and that directory exists, otherwise `/home/box/agent-data/agents` when the env var is unset and the path exists. This is for running call-bridge on the Grok Bot box itself. A copied agents tree on main-server is not the primary path.
 4. **`directory.json`** — last-resort snapshot when the remotes failed and no local profile tree is available.
 
 A live read reports `source: agent-profiles` and `agents_root`. A unix read also includes `directory_unix`; a URL read includes `directory_url`. The snapshot reports `source: directory.json` and does not claim to be a live profile read. If a remote was configured and failed before the snapshot was used, the response includes `directory_unix_error` and/or `directory_url_error`.
 
-Prod wiring (operated outside this repo): the Grok Bot box runs `scripts/directory_live_server.py` on `127.0.0.1:18765`. SSH reverse-forwards that port to main-server (`ssh -R 127.0.0.1:18765:127.0.0.1:18765`). A host `socat` listens on a unix socket and dials `127.0.0.1:18765`. That socket is mounted into the call-bridge container as `/run/dirlive.sock`.
+Prod wiring (operated outside this repo): the Grok Bot box runs `scripts/directory_live_server.py` on `127.0.0.1:18765`. SSH reverse-forwards that port to main-server (`ssh -R 127.0.0.1:18765:127.0.0.1:18765`). A host `socat` listens on a unix socket and dials `127.0.0.1:18765`. Compose mounts that socket's parent directory (`./dirlive:/run/dirlive`) so a recreated socket is visible without recreating the container. Set `CALL_BRIDGE_DIRECTORY_UNIX=/run/dirlive/dirlive.sock`. If `CALL_BRIDGE_DIRECTORY_UNIX_HOST` is set, point it at the directory (the default is `./dirlive`), not at the socket file.
 
 ```bash
 # On the Grok Bot box (profiles live here):
@@ -184,14 +192,14 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | `CALL_BRIDGE_DB` | `data/calls.db` | SQLite path |
 | `CALL_BRIDGE_ALLOWED_HOSTS` | `127.0.0.1:*,localhost:*` | Host header allowlist |
 | `CALL_BRIDGE_ALLOWED_ORIGINS` | `http://127.0.0.1:*,http://localhost:*` | Origin allowlist |
-| `CALL_BRIDGE_DIRECTORY_UNIX` | _(unset)_ | On each `call_directory`, HTTP GET over this `AF_UNIX` socket. Preferred prod source (`/run/dirlive.sock`) |
+| `CALL_BRIDGE_DIRECTORY_UNIX` | _(unset)_ | On each `call_directory`, HTTP GET over this `AF_UNIX` socket. Preferred prod source (`/run/dirlive/dirlive.sock`) |
 | `CALL_BRIDGE_DIRECTORY_UNIX_PATH` | `/v0/directory` | HTTP path on that socket |
 | `CALL_BRIDGE_DIRECTORY_URL` | _(unset)_ | HTTP GET used when the unix socket is unset or fails |
 | `CALL_BRIDGE_DIRECTORY_URL_AUTH` | _(unset)_ | Bearer token sent on the unix and URL GETs (raw token or `Bearer …`) |
 | `CALL_BRIDGE_DIRECTORY_URL_TIMEOUT` | `2.5` | Seconds for each remote GET |
 | `CALL_BRIDGE_AGENTS_ROOT` | `/home/box/agent-data/agents` if that directory exists and the env var is unset | Local `profile.json` tree, used only when configured remotes fail (or none are set). When set, only that path is used |
 | `CALL_BRIDGE_DIRECTORY` | `./directory.json` | Last-resort snapshot file |
-| `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard wake webhook. Empty skips the POST |
+| `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard webhook for `session.opened` and, at most once per 60 seconds, `bridge.link_down`. Empty skips both POSTs |
 | `CALL_BRIDGE_WAKE_WEBHOOK_AUTH` | _(unset)_ | `Authorization` header value for that POST |
 | `CALL_BRIDGE_PUBLIC_MCP_URL` | `https://call.kitepon.dev/mcp` | MCP URL included in the wake envelope |
 | `GROKBOT_GATEWAY_URL` | _(unset)_ | Grok Bot gateway origin, no path (for example `http://host.docker.internal:18766`). Local `call_send` POSTs `/api/deliverAgentMessage` and does not send an `Origin` header |

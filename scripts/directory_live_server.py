@@ -5,7 +5,9 @@ Run this on the Grok Bot box (where ``/home/box/agent-data/agents/*/profile.json
 lives). Each ``GET /v0/directory`` rebuilds the book from those files.
 Prod binds ``127.0.0.1:18765``. main-server forwards that port with
 ``ssh -R 127.0.0.1:18765`` and a host socat unix socket mounted into
-call-bridge as ``/run/dirlive.sock`` (``CALL_BRIDGE_DIRECTORY_UNIX``).
+call-bridge as ``/run/dirlive/dirlive.sock`` (``CALL_BRIDGE_DIRECTORY_UNIX``;
+the parent directory ``/run/dirlive`` is the mount, so a new socket inode
+is visible without recreating the container).
 ``CALL_BRIDGE_DIRECTORY_URL`` is only the HTTP fallback.
 No cron, no Marian sync, and no push after a role edit.
 

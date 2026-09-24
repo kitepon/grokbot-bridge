@@ -2,8 +2,8 @@
 # Prod deploy name on main-server remains call-bridge.
 # Phone book is fetched on every call_directory (no periodic sync, no post-edit push).
 # Prod: box directory-live on 127.0.0.1:18765, SSH -R 127.0.0.1:18765 to this host,
-# socat unix socket mounted below as /run/dirlive.sock.
-# Set CALL_BRIDGE_DIRECTORY_UNIX=/run/dirlive.sock in .env.
+# socat unix socket's parent directory mounted below as /run/dirlive.
+# Set CALL_BRIDGE_DIRECTORY_UNIX=/run/dirlive/dirlive.sock in .env.
 # CALL_BRIDGE_DIRECTORY_URL is the HTTP fallback. directory.json is last resort.
 # Do not mount a copied agents tree; it goes stale.
 services:
@@ -21,9 +21,9 @@ services:
     volumes:
       - ./data:/app/data
       - ./directory.json:/app/directory.json:ro
-      # Host socat socket. If socat unlinks and rebinds, mount the parent
-      # directory instead of this single inode.
-      - ${CALL_BRIDGE_DIRECTORY_UNIX_HOST:-./dirlive.sock}:/run/dirlive.sock
+      # Parent directory of the host socat socket. A recreated socket inode
+      # stays visible without recreating the container.
+      - ${CALL_BRIDGE_DIRECTORY_UNIX_HOST:-./dirlive}:/run/dirlive
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health', timeout=3)"]
       interval: 30s

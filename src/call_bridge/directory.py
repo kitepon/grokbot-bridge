@@ -11,7 +11,8 @@ and no post-edit push.
 Source order:
 1. ``CALL_BRIDGE_DIRECTORY_UNIX`` — HTTP GET over an ``AF_UNIX`` socket
    (path from ``CALL_BRIDGE_DIRECTORY_UNIX_PATH``, default ``/v0/directory``).
-   Preferred when set. Prod mounts the host socat socket at ``/run/dirlive.sock``.
+   Preferred when set. Prod mounts the socket's parent directory at
+   ``/run/dirlive`` and sets this to ``/run/dirlive/dirlive.sock``.
 2. ``CALL_BRIDGE_DIRECTORY_URL`` — HTTP GET, used when the unix socket is unset
    or that GET fails.
 3. Local ``profile.json`` files, only if every configured remote GET failed
@@ -32,6 +33,8 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .wake import LINK_DOWN_NOTE, notify_link_down
+
 log = logging.getLogger("call_bridge.directory")
 
 SCHEMA = "grokbot.directory.v0"
@@ -43,6 +46,19 @@ _MAX_DIRECTORY_BYTES = 1_000_000
 
 # Placeholders / retired seats — not a phone book.
 _SKIP_NAMES = {"", "New Agent", "New Bot", "ゲスト"}
+
+# The unix socket never produced an HTTP response. A status code means the
+# socket accepted the connection, so that path is not a down tunnel.
+_UNIX_LINK_DOWN_DETAILS = frozenset({
+    "unix socket not found",
+    "timed out",
+    "request failed",
+})
+
+
+def is_unix_link_down(detail: str | None) -> bool:
+    """True when the directory unix socket could not be reached."""
+    return detail in _UNIX_LINK_DOWN_DETAILS
 
 
 class DirectoryFetchError(Exception):
@@ -400,6 +416,19 @@ def _unavailable(unix_error: str | None, url_error: str | None) -> dict[str, Any
     return _note_remote_errors(out, unix_error, url_error)
 
 
+def _note_unix_link_down(book: dict[str, Any], detail: str | None) -> dict[str, Any]:
+    """Keep the book this request already built, and say the socket is down.
+
+    The wake is best-effort and rate-limited inside ``notify_link_down``.
+    A URL or file fallback is unchanged apart from this note.
+    """
+    if not detail:
+        return book
+    notify_link_down("directory", detail)
+    book["note"] = LINK_DOWN_NOTE
+    return book
+
+
 def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
     """Build the phone book for this request.
 
@@ -409,28 +438,31 @@ def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
     """
     unix_error: str | None = None
     url_error: str | None = None
+    unix_down: str | None = None
     if not skip_url:
         unix_sock = _directory_unix_socket()
         if unix_sock:
             book, unix_error = _try_remote("unix", lambda: _fetch_directory_unix(unix_sock))
             if book is not None:
                 return book
+            if is_unix_link_down(unix_error):
+                unix_down = unix_error
         url = _directory_url()
         if url:
             book, url_error = _try_remote("URL", lambda: _fetch_directory_url(url))
             if book is not None:
-                return book
+                return _note_unix_link_down(book, unix_down)
 
     # Local profiles and directory.json are a soft fallback after remote failure
     # (or when no remote is configured). A successful remote GET does not reach here.
     local = _load_agents_root()
     if local is not None:
-        return local
+        return _note_unix_link_down(local, unix_down)
 
     snap = _load_snapshot()
     if snap is not None:
-        return _note_remote_errors(snap, unix_error, url_error)
-    return _unavailable(unix_error, url_error)
+        return _note_unix_link_down(_note_remote_errors(snap, unix_error, url_error), unix_down)
+    return _note_unix_link_down(_unavailable(unix_error, url_error), unix_down)
 
 
 def _agent_id_of(member: dict[str, Any]) -> str:
@@ -446,6 +478,17 @@ def _agent_id_of(member: dict[str, Any]) -> str:
     return ""
 
 
+def _resolve_failure(book: dict[str, Any], error: str, detail: str) -> dict[str, Any]:
+    out: dict[str, Any] = {"ok": False, "error": error, "detail": detail}
+    note = book.get("note")
+    if isinstance(note, str) and note and note not in detail:
+        out["note"] = note
+        out["detail"] = f"{detail}. {note}" if detail else note
+    elif isinstance(note, str) and note:
+        out["note"] = note
+    return out
+
+
 def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
     """Resolve ``call_open``'s member name to a Grok Bot agent id.
 
@@ -456,10 +499,10 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
     book = load_directory()
     if not book.get("ok"):
         detail = str(book.get("detail") or book.get("error") or "directory unavailable")
-        return {"ok": False, "error": "error", "detail": f"directory unavailable: {detail}"}
+        return _resolve_failure(book, "error", f"directory unavailable: {detail}")
     members = [m for m in (book.get("members") or []) if isinstance(m, dict)]
     if not name:
-        return {"ok": False, "error": "target_not_found", "detail": "member name is empty"}
+        return _resolve_failure(book, "target_not_found", "member name is empty")
 
     ids: list[str] = []
     found_name = False
@@ -473,26 +516,16 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
     if len(ids) == 1:
         return {"ok": True, "id": ids[0]}
     if len(ids) > 1:
-        return {
-            "ok": False,
-            "error": "target_not_found",
-            "detail": f"multiple agent ids for {name}",
-        }
+        return _resolve_failure(book, "target_not_found", f"multiple agent ids for {name}")
     if found_name:
-        return {
-            "ok": False,
-            "error": "target_not_found",
-            "detail": f"directory entry for {name} has no agent id",
-        }
+        return _resolve_failure(
+            book, "target_not_found", f"directory entry for {name} has no agent id"
+        )
 
     for member in members:
         if _agent_id_of(member) == name:
             return {"ok": True, "id": name}
-    return {
-        "ok": False,
-        "error": "target_not_found",
-        "detail": f"no directory entry for {name}",
-    }
+    return _resolve_failure(book, "target_not_found", f"no directory entry for {name}")
 
 
 def search_directory(query: str | None = None, *, skip_url: bool = False) -> dict[str, Any]:
