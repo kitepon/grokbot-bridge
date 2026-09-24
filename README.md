@@ -35,6 +35,7 @@ call-bridge-setup status
 ```
 
 `enable` は既存の URL と token 環境変数名を読み、その MCP 登録をローカル MCP に切り替える。
+認証値は製品の state directory の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。GitやCodex設定には書かない。`disable` はそのファイルを削除する。
 また、本製品専用の Codex hook を登録・承認する。他製品の hook は保持する。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
 元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。

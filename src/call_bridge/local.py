@@ -51,8 +51,19 @@ def _rest_url(session_id: str) -> str:
 
 
 def _headers() -> dict[str, str]:
-    token_env = _config().get("token_env", "CALL_BRIDGE_TOKEN")
+    config = _config()
+    token_env = config.get("token_env", "CALL_BRIDGE_TOKEN")
     token = os.environ.get(token_env, "").strip()
+    if not token and config.get("enabled") is True:
+        file = state_root() / "auth.json"
+        if file.exists():
+            try:
+                value = json.loads(file.read_text(encoding="utf-8"))
+            except (OSError, ValueError) as error:
+                raise DeliveryError("BRIDGE_TOKEN_INVALID", "ローカル通話認証を読めません") from error
+            if not isinstance(value, dict) or not isinstance(value.get("token"), str):
+                raise DeliveryError("BRIDGE_TOKEN_INVALID", "ローカル通話認証の形式が不正です")
+            token = value["token"].strip()
     if not token:
         raise DeliveryError("BRIDGE_TOKEN_MISSING", f"{token_env} がありません")
     return {"Authorization": f"Bearer {token}"}

@@ -102,6 +102,21 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(second)
         os.close(second)
 
+    async def test_local_mcp_reads_private_token_when_codex_does_not_pass_environment(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {
+            "enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        setup._write_json(root / "auth.json", {"token": "fictional-stored-token"})
+        self.assertEqual((root / "auth.json").stat().st_mode & 0o777, 0o600)
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}):
+            self.assertEqual(local._headers(), {"Authorization": "Bearer fictional-stored-token"})
+        self.assertEqual(local._headers(), {"Authorization": "Bearer test-token"})
+        setup._write_json(root / "config.json", {
+            "enabled": False, "token_env": "CALL_BRIDGE_TOKEN"})
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}):
+            with self.assertRaisesRegex(codex_delivery.DeliveryError, "BRIDGE_TOKEN_MISSING"):
+                local._headers()
+
 
 class HookTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):

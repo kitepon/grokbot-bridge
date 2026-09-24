@@ -196,7 +196,8 @@ async def enable() -> dict[str, str]:
         url, token_env = previous["mcp_url"], previous["token_env"]
     else:
         url, token_env = _remote(existing)
-    if not os.environ.get(token_env):
+    token = os.environ.get(token_env, "").strip()
+    if not token:
         raise DeliveryError("BRIDGE_TOKEN_MISSING", f"{token_env} がありません")
     home = codex_home()
     command = _command()
@@ -204,6 +205,9 @@ async def enable() -> dict[str, str]:
     changed = _merge_hooks(home / "hooks.json", command,
                            previous.get("hook_command") if already_local else None)
     await _verify_hooks(command, approve=True)
+    auth_file = state_root() / "auth.json"
+    auth_file_created = not auth_file.exists()
+    _write_json(auth_file, {"token": token})
     if not already_local:
         try:
             await _replace_mcp(name, {"command": sys.executable, "args": ["-m", "call_bridge.local"]})
@@ -220,7 +224,7 @@ async def enable() -> dict[str, str]:
         "codex_binary": str(Path(codex_binary()).resolve()),
         "hook_command": command,
     })
-    return {"status": "restart_required" if changed or not already_local else "ready", "mcp": name}
+    return {"status": "restart_required" if changed or not already_local or auth_file_created else "ready", "mcp": name}
 
 
 async def status() -> dict[str, str]:
@@ -258,6 +262,7 @@ async def disable() -> dict[str, str]:
         await _replace_mcp(name, {"command": sys.executable, "args": ["-m", "call_bridge.local"]})
         raise
     _write_json(config_file, {**config, "enabled": False})
+    (state_root() / "auth.json").unlink(missing_ok=True)
     return {"status": "restart_required", "mcp": name}
 
 
