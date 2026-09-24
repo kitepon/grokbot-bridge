@@ -1,4 +1,9 @@
 # grokbot-bridge — shared call bridge MCP for Grok Bot (streamable HTTP)
+# Prod deploy name on main-server remains call-bridge.
+# Phone book: set CALL_BRIDGE_DIRECTORY_URL in .env. The container GETs that URL
+# on every call_directory (live profiles on the Grok Bot box, via the reverse
+# tunnel). Do not mount a copied agents tree; it goes stale. directory.json is
+# only the last-resort snapshot.
 services:
   grokbot-bridge:
     build: .
@@ -6,6 +11,8 @@ services:
     container_name: grokbot-bridge
     restart: unless-stopped
     env_file: .env
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       - "127.0.0.1:18910:18910"
     volumes:

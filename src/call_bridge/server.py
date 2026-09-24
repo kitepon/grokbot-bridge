@@ -19,7 +19,7 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
 from .db import CallStore
-from .directory import search_directory
+from .directory import DIRECTORY_HOP_HEADER, search_directory
 from .wake import notify_wake
 
 log = logging.getLogger("call_bridge")
@@ -38,7 +38,7 @@ _INSTRUCTIONS = """
 4. call_hangup で終了
 
 ## ツール
-- call_directory … 電話帳（名前・役割。呼び出し可否は持たない）
+- call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
 """
@@ -172,9 +172,11 @@ def call_info(session_id: str) -> dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "電話帳。Grok Bot 各席の profile（name / title / description）をそのまま返す。"
-        "title が肩書き（例: ラピ→インフラ統括）。query で部分一致。"
-        "呼び出し可否フラグは無い。設定変更は席のプロフィール更新に追従する。"
+        "電話帳。呼ぶたびに席プロフィール（name / title / description）を読む。"
+        "優先順は CALL_BRIDGE_DIRECTORY_URL、ローカル agents の profile.json、"
+        "最後に directory.json。ライブ応答は source=agent-profiles と agents_root。"
+        "directory.json は source=directory.json の予備。query で部分一致。"
+        "呼び出し可否フラグは無い。プロフィール更新は次の呼び出しから反映される。"
     )
 )
 def call_directory(query: str | None = None) -> dict[str, Any]:
@@ -217,7 +219,10 @@ async def rest_directory(request: Request) -> Response:
     if denied is not None:
         return denied
     query = request.query_params.get("q") or request.query_params.get("query")
-    return JSONResponse(search_directory(query))
+    # Hop header: this GET is itself a directory fetch (URL pointed at us). Do not
+    # call CALL_BRIDGE_DIRECTORY_URL again. Wake/webhook behavior is unchanged.
+    skip_url = request.headers.get(DIRECTORY_HOP_HEADER, "").strip() == "1"
+    return JSONResponse(search_directory(query, skip_url=skip_url))
 
 
 @mcp.custom_route("/v0/sessions", methods=["POST"])

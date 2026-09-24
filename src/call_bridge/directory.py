@@ -1,33 +1,102 @@
-"""Phone directory from Grok Bot agent profiles (name / title / description as-is).
+"""Phone directory from Grok Bot seat profiles (name / title / description).
 
-No call-permission flags. Source of truth is each seat's profile settings.
-When CALL_BRIDGE_AGENTS_ROOT (or the default box path) is readable, entries are
-built live on every request. Otherwise falls back to directory.json (kept in
-sync from the same builder).
+Clients call ``call_directory``. This module builds the book on that request.
+There is no periodic sync and no post-edit push.
+
+Source order:
+1. ``CALL_BRIDGE_DIRECTORY_URL`` — HTTP GET (preferred when call-bridge is not
+   on the box that holds the profiles).
+2. Local ``profile.json`` files under ``CALL_BRIDGE_AGENTS_ROOT``, or
+   ``/home/box/agent-data/agents`` when that env var is unset and the path exists.
+3. ``directory.json`` — last-resort snapshot. Its ``source`` / ``agents_root``
+   fields are not treated as a live read.
 """
 
 from __future__ import annotations
 
 import json
+import logging
 import os
+import urllib.request
 from pathlib import Path
 from typing import Any
 
+log = logging.getLogger("call_bridge.directory")
+
 SCHEMA = "grokbot.directory.v0"
+DEFAULT_AGENTS_ROOT = Path("/home/box/agent-data/agents")
+DIRECTORY_URL_TIMEOUT_SECONDS = 2.5
+DIRECTORY_HOP_HEADER = "X-Call-Bridge-Directory-Hop"
+_MAX_DIRECTORY_BYTES = 1_000_000
 
 # Placeholders / retired seats — not a phone book.
 _SKIP_NAMES = {"", "New Agent", "New Bot", "ゲスト"}
 
 
+class DirectoryFetchError(Exception):
+    """The directory URL did not return a usable book. ``detail`` is safe to surface."""
+
+    def __init__(self, detail: str) -> None:
+        super().__init__(detail)
+        self.detail = detail
+
+
+class _NoRedirect(urllib.request.HTTPErrorProcessor):
+    """Return 3xx/4xx/5xx as responses so Authorization is not replayed on a redirect."""
+
+    def http_response(self, request, response):  # noqa: ARG002
+        return response
+
+    https_response = http_response
+
+
+def _directory_url() -> str:
+    return os.environ.get("CALL_BRIDGE_DIRECTORY_URL", "").strip()
+
+
+def _directory_url_timeout() -> float:
+    raw = os.environ.get("CALL_BRIDGE_DIRECTORY_URL_TIMEOUT", "").strip()
+    if not raw:
+        return DIRECTORY_URL_TIMEOUT_SECONDS
+    try:
+        value = float(raw)
+    except ValueError:
+        return DIRECTORY_URL_TIMEOUT_SECONDS
+    if value <= 0:
+        return DIRECTORY_URL_TIMEOUT_SECONDS
+    return value
+
+
+def _authorization_value(raw: str) -> str:
+    """Bearer token, or an Authorization header value that already includes the scheme."""
+    value = raw.strip()
+    if not value:
+        return ""
+    if value.lower().startswith("bearer "):
+        return value
+    return f"Bearer {value}"
+
+
+def _short(text: str, limit: int = 180) -> str:
+    compact = " ".join(str(text).split())
+    if len(compact) <= limit:
+        return compact
+    return compact[: limit - 1] + "…"
+
+
 def agents_root() -> Path | None:
+    """Local profile tree, if one is configured and present.
+
+    When ``CALL_BRIDGE_AGENTS_ROOT`` is set, only that path is used. The default
+    box path is not a second guess — a copied tree on another host must not
+    silently win over an explicit (but missing) configuration.
+    """
     env = os.environ.get("CALL_BRIDGE_AGENTS_ROOT", "").strip()
-    candidates = []
     if env:
-        candidates.append(Path(env))
-    candidates.append(Path("/home/box/agent-data/agents"))
-    for p in candidates:
-        if p.is_dir():
-            return p
+        path = Path(env)
+        return path if path.is_dir() else None
+    if DEFAULT_AGENTS_ROOT.is_dir():
+        return DEFAULT_AGENTS_ROOT
     return None
 
 
@@ -52,6 +121,8 @@ def build_members_from_profiles(root: Path) -> list[dict[str, Any]]:
         try:
             p = json.loads(pj.read_text(encoding="utf-8"))
         except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(p, dict):
             continue
         name = (p.get("name") or "").strip()
         if name in _SKIP_NAMES:
@@ -93,45 +164,164 @@ def write_directory_snapshot(path: Path, root: Path | None = None) -> dict[str, 
     return doc
 
 
-def load_directory() -> dict[str, Any]:
+def _fetch_directory_url(url: str) -> dict[str, Any]:
+    headers = {
+        "Accept": "application/json",
+        DIRECTORY_HOP_HEADER: "1",
+    }
+    auth = _authorization_value(os.environ.get("CALL_BRIDGE_DIRECTORY_URL_AUTH", ""))
+    if auth:
+        headers["Authorization"] = auth
+    request = urllib.request.Request(url, headers=headers, method="GET")
+    opener = urllib.request.build_opener(_NoRedirect)
+    try:
+        with opener.open(request, timeout=_directory_url_timeout()) as resp:
+            code = int(getattr(resp, "status", 0) or resp.getcode())
+            if code < 200 or code >= 300:
+                raise DirectoryFetchError(f"http {code}")
+            raw = resp.read(_MAX_DIRECTORY_BYTES + 1)
+    except DirectoryFetchError:
+        raise
+    except Exception as exc:
+        reason = getattr(exc, "reason", exc)
+        timed_out = isinstance(reason, TimeoutError) or isinstance(exc, TimeoutError)
+        if timed_out:
+            raise DirectoryFetchError("timed out") from exc
+        raise DirectoryFetchError("request failed") from exc
+
+    if len(raw) > _MAX_DIRECTORY_BYTES:
+        raise DirectoryFetchError("directory response too large")
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise DirectoryFetchError("invalid directory json") from exc
+    return _book_from_url_payload(url, data)
+
+
+def _book_from_url_payload(url: str, data: Any) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        raise DirectoryFetchError("invalid directory json")
+    if data.get("ok") is False:
+        err = data.get("error") or "directory unavailable"
+        raise DirectoryFetchError(_short(str(err)))
+    members = data.get("members")
+    if not isinstance(members, list) or any(not isinstance(item, dict) for item in members):
+        raise DirectoryFetchError("invalid directory json")
+
+    source = data.get("source")
+    if not isinstance(source, str) or not source.strip():
+        source = "directory-url"
+    else:
+        source = source.strip()
+
+    out: dict[str, Any] = {
+        "ok": True,
+        "schema": data.get("schema") if isinstance(data.get("schema"), str) else SCHEMA,
+        "source": source,
+        "directory_url": url,
+        "count": len(members),
+        "members": members,
+    }
+    agents = data.get("agents_root")
+    if isinstance(agents, str) and agents.strip():
+        out["agents_root"] = agents.strip()
+    return out
+
+
+def _load_agents_root() -> dict[str, Any] | None:
     root = agents_root()
-    if root is not None:
-        members = build_members_from_profiles(root)
+    if root is None:
+        return None
+    members = build_members_from_profiles(root)
+    return {
+        "ok": True,
+        "schema": SCHEMA,
+        "source": "agent-profiles",
+        "agents_root": str(root),
+        "count": len(members),
+        "members": members,
+    }
+
+
+def _load_snapshot() -> dict[str, Any] | None:
+    for path in _snapshot_paths():
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        members = data.get("members")
+        if members is None:
+            members = []
+        if not isinstance(members, list):
+            continue
+        # Never reuse a snapshot's source or agents_root. Those fields mean a
+        # live profile read, and a saved file is not one.
         return {
             "ok": True,
-            "schema": SCHEMA,
-            "source": "agent-profiles",
-            "agents_root": str(root),
+            "path": str(path.resolve()),
+            "schema": data.get("schema") if isinstance(data.get("schema"), str) else SCHEMA,
+            "source": "directory.json",
             "count": len(members),
             "members": members,
         }
+    return None
 
-    for path in _snapshot_paths():
-        if path.is_file():
-            data = json.loads(path.read_text(encoding="utf-8"))
-            members = data.get("members") or []
-            return {
-                "ok": True,
-                "path": str(path.resolve()),
-                "schema": data.get("schema") or SCHEMA,
-                "source": data.get("source") or "directory.json",
-                "count": len(members),
-                "members": members,
-            }
-    return {
+
+def _unavailable(url_error: str | None) -> dict[str, Any]:
+    out: dict[str, Any] = {
         "ok": False,
         "error": "directory_unavailable",
         "detail": (
-            "No agent profiles and no directory.json. "
-            "Set CALL_BRIDGE_AGENTS_ROOT or sync directory.json from profiles."
+            "No live directory and no directory.json. "
+            "Set CALL_BRIDGE_DIRECTORY_URL to the on-demand profile server, "
+            "or CALL_BRIDGE_AGENTS_ROOT when profiles are on this host."
         ),
         "count": 0,
         "members": [],
     }
+    if url_error:
+        out["directory_url_error"] = url_error
+    return out
 
 
-def search_directory(query: str | None = None) -> dict[str, Any]:
-    base = load_directory()
+def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
+    """Build the phone book for this request.
+
+    ``skip_url`` is set when this process is already answering a directory GET
+    that arrived with ``DIRECTORY_HOP_HEADER``, so a URL pointed at this same
+    service cannot loop.
+    """
+    url_error: str | None = None
+    if not skip_url:
+        url = _directory_url()
+        if url:
+            try:
+                return _fetch_directory_url(url)
+            except DirectoryFetchError as exc:
+                url_error = exc.detail
+                log.warning("directory URL unavailable: %s", url_error)
+            except Exception as exc:
+                url_error = "request failed"
+                log.warning("directory URL unavailable: %s", _short(f"{type(exc).__name__}: {exc}"))
+
+    local = _load_agents_root()
+    if local is not None:
+        return local
+
+    snap = _load_snapshot()
+    if snap is not None:
+        if url_error:
+            snap["directory_url_error"] = url_error
+        return snap
+    return _unavailable(url_error)
+
+
+def search_directory(query: str | None = None, *, skip_url: bool = False) -> dict[str, Any]:
+    base = load_directory(skip_url=skip_url)
     if not base.get("ok"):
         return base
     q = (query or "").strip().lower()
