@@ -14,7 +14,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 from call_bridge.codex_delivery import CodexRPC, submit_reply
-from call_bridge.setup import _command, _merge_hooks, _verify_hooks, _write_json
+from call_bridge.setup import _command, _merge_hooks, _replace_mcp, _verify_hooks, _write_json
 
 
 class ModelHandler(BaseHTTPRequestHandler):
@@ -55,6 +55,33 @@ class ModelHandler(BaseHTTPRequestHandler):
 
 @unittest.skipUnless(os.environ.get("CALL_BRIDGE_TEST_CODEX_BINARY"), "公式 Codex binary の指定時だけ実行")
 class OfficialCodexTest(unittest.IsolatedAsyncioTestCase):
+    async def test_mcp_switch_preserves_other_server_settings(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "codex"
+            home.mkdir()
+            config = home / "config.toml"
+            config.write_text('''[mcp_servers.other]
+command = "echo"
+args = ["hello"]
+enabled = false
+required = true
+
+[mcp_servers.call-bridge]
+url = "https://example.com/mcp"
+bearer_token_env_var = "TEST_TOKEN"
+''', encoding="utf-8")
+            with patch.dict(os.environ, {"CODEX_HOME": str(home),
+                                      "CODEX_CLI_PATH": os.environ["CALL_BRIDGE_TEST_CODEX_BINARY"]}):
+                await _replace_mcp("call-bridge", {"command": "python", "args": ["-m", "call_bridge.local"]})
+            import tomllib
+            servers = tomllib.loads(config.read_text(encoding="utf-8"))["mcp_servers"]
+            self.assertEqual(servers["other"], {
+                "command": "echo", "args": ["hello"], "enabled": False, "required": True,
+            })
+            self.assertEqual(servers["call-bridge"], {
+                "command": "python", "args": ["-m", "call_bridge.local"],
+            })
+
     async def test_active_parent_receives_reply_once_in_same_turn(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root)

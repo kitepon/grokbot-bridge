@@ -168,6 +168,21 @@ def _remote(existing: dict[str, Any]) -> tuple[str, str]:
     return url, token_env
 
 
+async def _replace_mcp(name: str, registration: dict[str, Any]) -> None:
+    """対象MCPだけを公式の設定APIで置き換える。"""
+    home = codex_home()
+    async with CodexRPC(home) as rpc:
+        for value in (None, registration):
+            await rpc.request("config/batchWrite", {
+                "edits": [{
+                    "keyPath": f"mcp_servers.{name}",
+                    "value": value,
+                    "mergeStrategy": "replace",
+                }],
+                "filePath": str(home / "config.toml"),
+            })
+
+
 async def enable() -> dict[str, str]:
     name, existing = _find_existing()
     config_file = state_root() / "config.json"
@@ -189,6 +204,15 @@ async def enable() -> dict[str, str]:
     changed = _merge_hooks(home / "hooks.json", command,
                            previous.get("hook_command") if already_local else None)
     await _verify_hooks(command, approve=True)
+    if not already_local:
+        try:
+            await _replace_mcp(name, {"command": sys.executable, "args": ["-m", "call_bridge.local"]})
+        except Exception:
+            await _replace_mcp(name, {"url": url, "bearer_token_env_var": token_env})
+            raise
+    actual = _existing(name)
+    if actual["transport"].get("type") != "stdio":
+        raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "ローカル MCP への切替を確認できません")
     _write_json(state_root() / "config.json", {
         "enabled": True,
         "mcp_name": name,
@@ -196,16 +220,6 @@ async def enable() -> dict[str, str]:
         "codex_binary": str(Path(codex_binary()).resolve()),
         "hook_command": command,
     })
-    if not already_local:
-        _codex_mcp("remove", name)
-        try:
-            _codex_mcp("add", name, "--", sys.executable, "-m", "call_bridge.local")
-        except Exception:
-            _codex_mcp("add", name, "--url", url, "--bearer-token-env-var", token_env)
-            raise
-    actual = _existing(name)
-    if actual["transport"].get("type") != "stdio":
-        raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "ローカル MCP への切替を確認できません")
     return {"status": "restart_required" if changed or not already_local else "ready", "mcp": name}
 
 
@@ -237,12 +251,11 @@ async def disable() -> dict[str, str]:
     home = codex_home()
     _backup_codex_config(home)
     _merge_hooks(home / "hooks.json", None, config["hook_command"])
-    _codex_mcp("remove", name)
     try:
-        _codex_mcp("add", name, "--url", config["mcp_url"],
-                   "--bearer-token-env-var", config["token_env"])
+        await _replace_mcp(name, {"url": config["mcp_url"],
+                                  "bearer_token_env_var": config["token_env"]})
     except Exception:
-        _codex_mcp("add", name, "--", sys.executable, "-m", "call_bridge.local")
+        await _replace_mcp(name, {"command": sys.executable, "args": ["-m", "call_bridge.local"]})
         raise
     _write_json(config_file, {**config, "enabled": False})
     return {"status": "restart_required", "mcp": name}
