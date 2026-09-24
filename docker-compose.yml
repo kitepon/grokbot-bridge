@@ -1,0 +1,18 @@
+# grokbot-bridge — shared call bridge MCP for Grok Bot (streamable HTTP)
+services:
+  grokbot-bridge:
+    build: .
+    image: grokbot-bridge:latest
+    container_name: grokbot-bridge
+    restart: unless-stopped
+    env_file: .env
+    ports:
+      - "127.0.0.1:18910:18910"
+    volumes:
+      - ./data:/app/data
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health', timeout=3)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
