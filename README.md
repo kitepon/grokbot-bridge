@@ -14,21 +14,38 @@ A local coding agent (Claude Code, Codex, Cursor, …) asks a Grok Bot “switch
 
 1. **Local** opens a session (`call_open` or `POST /v0/sessions`) → gets `session_id` (`ringing`). The server POSTs a wake envelope to the switchboard webhook (when `CALL_BRIDGE_WAKE_WEBHOOK_URL` is set) so the switchboard can wake the member. The body is session id, member name, local labels, purpose, and the public MCP URL — not message bodies. If the URL is unset, or the POST fails, the session is still returned; the response includes a non-fatal `wake` object (`status`: `ok`, `skipped`, or `error`).
 2. **Grok Bot switchboard** wakes the member with MCP URL + `session_id` only (no body relay).
-3. **Local** and **Grok Bot member** use `call_send` / `call_poll` on the same server (`from_party` / `party` = `local` | `member`).
+3. **Local** and **Grok Bot member** use `call_send` / `call_poll` on the same server (`from_party` / `party` = `local` | `member`). When Local sends a message, the bridge asks the member to reply in that session by default.
 4. Either side (or ops) calls `call_hangup`.
 
-`call_send` で `from_party="local"` のときは、同じ通話へ `member` として返答する案内を本文に自動で付ける。
-返信不要の通知は `reply_required=false` を指定する。MCP と REST のどちらでも同じ動作になる。
+`call_send` で `from_party="local"` のときは、同じ `session_id` の通話へ `member` として `call_send` で返答する案内を本文に自動で付ける。案内は保存される本文と送信結果の両方に含まれる。返信不要の通知だけ `reply_required=false` を指定する。`from_party="member"` の本文は変更しない。MCP と REST のどちらでも同じ動作になる。返信依頼はメンバーへ送る指示であり、返答そのものを保証するものではない。
+
+`call_send` の通常送信の引数例：
+
+```json
+{"session_id":"...","from_party":"local","message":"状況を教えてください"}
+```
+
+返信不要の通知の引数例：
+
+```json
+{"session_id":"...","from_party":"local","message":"共有のみです","reply_required":false}
+```
+
+REST の `POST /v0/sessions/{session_id}/messages` でも本文に
+`{"from_party":"local","message":"共有のみです","reply_required":false}` を渡せる。
 
 ### Codex 親への返信自動配送
 
 Codex から通話する端末では、ローカル MCP を登録すると `call_open` が親タスクを識別する。
-ローカル MCP はその通話の返信を裏で取得し、Codex の公式キューへ一通ずつ渡す。
-進行中のターンでは `PostToolUse`／`Stop` hook が同じターンへ差し込み、
-ターン終了後はキューが次のターンとして届ける。親AIは `call_poll` で待たなくてよい。
-GrokBot メンバーは従来どおり公開 MCP に接続する。
+ローカル MCP が通話の返信を裏で取得し、Codex の公式キューへ一通ずつ渡す。
+親AI自身が `call_poll` を繰り返す必要はない。親のターンが進行中なら
+`PostToolUse`／`Stop` hook が返信を同じターンへ差し込み、ターン終了後なら
+キューが次のターンとして届ける。GrokBot メンバーは従来どおり公開 MCP に接続し、
+返信には `from_party="member"` を使う。
 
-既存の `call-bridge` または `grokbot-bridge` を HTTP MCP として登録し、Bearer token の環境変数が利用できる状態で実行する。
+対象は通常の Codex 親タスク。native sub-agent への自動配送は未対応。
+有効化する端末には、まず `call-bridge` または `grokbot-bridge` を HTTP MCP として登録する（下の Codex の登録例を参照）。
+`call-bridge-setup enable` を実行するシェルで、その登録の Bearer token 環境変数を利用可能にしておく。
 
 ```bash
 python -m pip install git+https://github.com/kitepon/grokbot-bridge.git
@@ -38,10 +55,15 @@ call-bridge-setup status
 ```
 
 `enable` は既存の URL と token 環境変数名を読み、その MCP 登録をローカル MCP に切り替える。
-認証値は製品の state directory の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。GitやCodex設定には書かない。`disable` はそのファイルを削除する。
+認証値は製品の state directory（既定は `~/.grokbot-bridge`）の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。Git や Codex 設定には書かない。`disable` はそのファイルを削除する。
 また、本製品専用の Codex hook を登録・承認する。他製品の hook は保持する。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
 元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。
+
+`BRIDGE_TOKEN_MISSING` が出た場合は、既存の HTTP MCP 登録に指定した環境変数を
+`enable` を実行するシェルへ渡し、`call-bridge-setup enable` を再実行する。
+シェルに値があっても、起動済みの Codex MCP プロセスがその値を継承するとは限らない。
+`enable` 後は Codex を完全終了して再起動する。`status` は登録と hook の状態を確認する。
 
 返信は `session_id` と `seq` で順番に処理する。配送結果はローカル MCP の `call_info` に
 `parent_delivery` として表示する。送信結果が不明なときは自動再送せず `unknown` と記録する。
@@ -114,7 +136,7 @@ curl -sS http://127.0.0.1:18910/health
 ```
 
 MCP endpoint: `http://127.0.0.1:18910/mcp`  
-Auth: `Authorization: Bearer <CALL_BRIDGE_TOKEN>` on `/mcp` and `/v0/*` (`/health` is open).
+Auth: `Authorization: Bearer <CALL_BRIDGE_TOKEN>` on `/mcp` and `/v0/*` (`/health` is open). Without a token, `/mcp` and `/v0/*` are also open; use this only for local development.
 
 ### Client examples
 
@@ -156,7 +178,7 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 
 | Env | Default | Meaning |
 |-----|---------|---------|
-| `CALL_BRIDGE_TOKEN` | _(required)_ | Bearer token |
+| `CALL_BRIDGE_TOKEN` | _(unset)_ | Bearer token. Set it for production; if unset, MCP and REST are open for local development |
 | `CALL_BRIDGE_HOST` | `0.0.0.0` | Bind host |
 | `CALL_BRIDGE_PORT` | `18910` | Bind port |
 | `CALL_BRIDGE_DB` | `data/calls.db` | SQLite path |
@@ -177,7 +199,7 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 
 ## Stack
 
-- Python 3.12 / FastMCP streamable HTTP (`mcp>=1.2,<2`)
+- Python 3.12 in Docker (package requires Python 3.11+) / FastMCP streamable HTTP (`mcp>=1.2,<2`)
 - SQLite for sessions + messages
 - Docker Compose for deploy
 
