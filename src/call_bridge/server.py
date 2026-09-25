@@ -1,7 +1,9 @@
 """grokbot-bridge MCP server — shared phone-call bridge for Grok Bot.
 
 Streamable HTTP (FastMCP). Local agents and Grok Bot members both connect as MCP clients.
-A switchboard agent wakes the member; conversation bodies go through this MCP, not the switchboard.
+A switchboard agent wakes the member. Local call_send posts session.message
+(with the text) to that webhook so Marian can relay it into the member's main chat.
+Member sends stay on this MCP.
 """
 
 from __future__ import annotations
@@ -30,19 +32,20 @@ _INSTRUCTIONS = """
 
 共有の通話直通 MCP（Grok Bot 向け）。ローカル開発エージェントと Grok Bot メンバーが
 同じサーバに MCP クライアントとして接続し、メッセージをやり取りする。
-電話番（スイッチボード）エージェントは呼び出し（起こし）のみ。本文は中継しない。
+電話番（スイッチボード）の session.opened には本文を含めない。
+local の call_send だけ session.message で本文を渡し、Marian がメンバーの本チャットへ中継する。
 
 ## 流れ
-1. ローカルが call_open でセッション作成（status=ringing）。サーバは設定済みならスイッチボード webhook へ wake を POST する（本文は含めない）
+1. ローカルが call_open でセッション作成（status=ringing）。サーバは設定済みならスイッチボード webhook へ session.opened を POST する（本文は含めない）
 2. 電話番が相手メンバーを起こし、session_id と MCP URL を渡す
-3. ローカルの call_send は相手エージェントへ gateway の deliverAgentMessage で直接届く（session_id と、call-bridge MCP の call_send で返す一行を含む）。member の call_send は保存のみ
+3. ローカルの call_send は同じ webhook へ session.message（本文、member_agent_id、reply_required）を POST する。HTTP 2xx のときだけ保存する。member の call_send は保存のみ
 4. call_hangup で終了
 
 ## ツール
 - call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（UNIX ソケット優先。定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
-- local の call_send は返信依頼を本文に付け、相手エージェントを起こす。返信不要の通知だけ reply_required=false。配送結果は delivery.status
+- local の call_send は webhook が 2xx のとき delivery.status=delivered。webhook 未設定や失敗では保存しない。返信不要の通知だけ reply_required=false
 """
 
 Party = Literal["local", "member"]
@@ -102,10 +105,11 @@ def call_open(
 
 @mcp.tool(
     description=(
-        "セッションへメッセージ送信。local は相手の Grok Bot エージェントへ直接届け、"
-        "返信依頼が既定。返信不要なら reply_required=false。"
-        "結果の delivery.status は delivered / target_not_found / error など。"
-        "gateway 未設定のときは保存せず失敗する。"
+        "セッションへメッセージ送信。local はスイッチボード webhook へ "
+        "session.message（本文と member_agent_id）を送り、Marian がメンバーの本チャットへ中継する。"
+        "返信不要なら reply_required=false。"
+        "結果の delivery.status は delivered または error。"
+        "webhook 未設定のときは保存せず失敗する。member の送信は保存のみ。"
     )
 )
 def call_send(session_id: str, from_party: Party, message: str,
@@ -202,7 +206,7 @@ def call_directory(query: str | None = None) -> dict[str, Any]:
 def _delivery_http_status(error: str) -> int:
     if error in ("target_not_found", "not_found"):
         return 404
-    if error == "gateway_not_configured":
+    if error == "webhook_not_configured":
         return 503
     if error == "unavailable":
         return 503

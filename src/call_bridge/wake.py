@@ -1,8 +1,11 @@
-"""Wake the switchboard when a call session opens.
+"""Wake the switchboard (Marian).
 
-The switchboard (Marian) is wake-only. This POST is a versioned envelope with
-enough to ring the member: session id, names, purpose, and the public MCP URL.
-Conversation message bodies are never included.
+``session.opened`` (from ``call_open``) is a versioned envelope with no message
+body. ``session.message`` (from a local ``call_send``) uses the same webhook
+and the same auth, and this event includes the caller's text so Marian can
+relay it into the member's main chat. ``bridge.link_down`` uses that webhook
+too, with no message body, when a request finds the directory unix socket down.
+Webhook secrets are never part of any payload.
 """
 
 from __future__ import annotations
@@ -20,6 +23,7 @@ log = logging.getLogger("call_bridge.wake")
 
 WAKE_SCHEMA = "grokbot.call.v0"
 WAKE_EVENT = "session.opened"
+MESSAGE_EVENT = "session.message"
 DEFAULT_PUBLIC_MCP_URL = "https://call.kitepon.dev/mcp"
 WAKE_TIMEOUT_SECONDS = 8
 
@@ -58,7 +62,7 @@ def public_mcp_url() -> str:
 
 
 def build_wake_payload(session: dict[str, Any]) -> dict[str, Any]:
-    """Stable envelope. Allowlisted keys only — never message bodies."""
+    """Stable ``session.opened`` envelope. Allowlisted keys only — no message body."""
     return {
         "schema": WAKE_SCHEMA,
         "event": WAKE_EVENT,
@@ -70,6 +74,32 @@ def build_wake_payload(session: dict[str, Any]) -> dict[str, Any]:
         "purpose": session.get("purpose"),
         "mcp_url": public_mcp_url(),
         "created_at": session.get("created_at"),
+    }
+
+
+def build_message_payload(
+    session: dict[str, Any],
+    *,
+    member_agent_id: str,
+    message: str,
+    reply_required: bool,
+) -> dict[str, Any]:
+    """Stable ``session.message`` envelope. Includes the caller's text.
+
+    ``message`` is the text the local party passed to ``call_send``, not the
+    stored copy with the reply-request suffix. ``reply_required`` is separate.
+    """
+    return {
+        "schema": WAKE_SCHEMA,
+        "event": MESSAGE_EVENT,
+        "session_id": session.get("session_id"),
+        "member_name": session.get("member_name"),
+        "member_agent_id": member_agent_id,
+        "local_id": session.get("local_id"),
+        "local_label": session.get("local_label"),
+        "message": message,
+        "reply_required": reply_required,
+        "mcp_url": public_mcp_url(),
     }
 
 
@@ -141,10 +171,11 @@ def _log_notify(result: dict[str, str], ok_fmt: str, err_fmt: str, *args: object
 
 
 def notify_wake(session: dict[str, Any]) -> dict[str, str]:
-    """POST the wake envelope. Never raises.
+    """POST the ``session.opened`` envelope. Never raises.
 
     Returns ``{"status": "ok"|"skipped"|"error", "detail": "..."}``.
     Opening a call must not fail because this notification failed.
+    The payload has no message body.
     """
     session_id = session.get("session_id")
     url = _first_env(_URL_ENV)
@@ -157,6 +188,41 @@ def notify_wake(session: dict[str, Any]) -> dict[str, str]:
         result,
         "wake notify ok session_id=%s %s",
         "wake notify failed session_id=%s: %s",
+        session_id,
+    )
+
+
+def notify_message(
+    session: dict[str, Any],
+    *,
+    member_agent_id: str,
+    message: str,
+    reply_required: bool,
+) -> dict[str, str]:
+    """POST ``session.message``, including the caller text. Never raises.
+
+    A missing webhook URL is an error. Local ``call_send`` must not store the
+    message or report it delivered when this is not ``ok``.
+    A failed POST is not a box-link failure and does not send ``bridge.link_down``.
+    Returns ``{"status": "ok"|"error", "detail": "..."}``.
+    """
+    session_id = session.get("session_id")
+    url = _first_env(_URL_ENV)
+    if not url:
+        log.error("message notify failed session_id=%s: webhook url unset", session_id)
+        return {"status": "error", "detail": "webhook url unset"}
+
+    payload = build_message_payload(
+        session,
+        member_agent_id=member_agent_id,
+        message=message,
+        reply_required=reply_required,
+    )
+    result = _post_json(payload)
+    return _log_notify(
+        result,
+        "message notify ok session_id=%s %s",
+        "message notify failed session_id=%s: %s",
         session_id,
     )
 

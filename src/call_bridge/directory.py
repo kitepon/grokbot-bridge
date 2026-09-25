@@ -167,8 +167,8 @@ def build_members_from_profiles(root: Path) -> list[dict[str, Any]]:
         if name in _SKIP_NAMES:
             continue
         # Grok Bot's agent id is the seat directory name. profile.json itself
-        # has name / title / description only; callers (deliverAgentMessage)
-        # need the id on the directory entry.
+        # has name / title / description only; local call_send needs the id
+        # on the directory entry for the session.message relay.
         entry: dict[str, Any] = {"name": name, "id": d.name}
         title = (p.get("title") or "").strip()
         role = (p.get("description") or "").strip()

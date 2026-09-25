@@ -79,24 +79,6 @@ class _CaptureHandler(BaseHTTPRequestHandler):
         return
 
 
-class _GatewayHandler(BaseHTTPRequestHandler):
-    status_code = 200
-    payload: dict | None = None
-
-    def do_POST(self) -> None:  # noqa: N802
-        length = int(self.headers.get("Content-Length", "0"))
-        self.rfile.read(length)
-        raw = b"" if self.payload is None else json.dumps(self.payload).encode("utf-8")
-        self.send_response(self.status_code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(raw)))
-        self.end_headers()
-        self.wfile.write(raw)
-
-    def log_message(self, fmt: str, *args: object) -> None:
-        return
-
-
 class _UnixHandler(BaseHTTPRequestHandler):
     status_code = 200
     payload = b"{}"
@@ -359,7 +341,7 @@ class LinkDownTests(unittest.TestCase):
         self.assertNotIn("note", book)
         self.assertEqual(webhook.requests, [])  # type: ignore[attr-defined]
 
-    def test_gateway_connection_failure_wakes_and_does_not_store(self) -> None:
+    def test_closed_gateway_is_not_used_and_does_not_emit_link_down(self) -> None:
         webhook = self._webhook(204)
         os.environ["CALL_BRIDGE_WAKE_WEBHOOK_URL"] = self._url(webhook)
         os.environ["CALL_BRIDGE_WAKE_WEBHOOK_AUTH"] = _WAKE_AUTH
@@ -371,75 +353,39 @@ class LinkDownTests(unittest.TestCase):
 
         result = dispatch_send(store, session["session_id"], "local", "hello")
 
-        self.assertEqual(result["error"], "error")
-        self.assertEqual(result["note"], LINK_DOWN_NOTE)
-        self.assertIn("request failed", result["detail"])
-        self.assertIn("Retry in about 30 seconds", result["detail"])
-        self.assertEqual(result["delivery"]["status"], "error")
-        self.assertEqual(result["delivery"]["detail"], "request failed")
-        self.assertEqual(store.session_info(session["session_id"])["message_count"], 0)
+        self.assertEqual(result["delivery"]["status"], "delivered")
+        self.assertNotIn("note", result)
+        self.assertEqual(store.session_info(session["session_id"])["message_count"], 1)
+        self.assertEqual(len(webhook.requests), 1)  # type: ignore[attr-defined]
         body = json.loads(webhook.requests[0]["body"].decode("utf-8"))  # type: ignore[attr-defined]
-        self.assertEqual(
-            body,
-            {"event": "bridge.link_down", "link": "gateway", "detail": "request failed"},
-        )
+        self.assertEqual(body["event"], "session.message")
+        self.assertEqual(body["message"], "hello")
+        self.assertEqual(body["member_agent_id"], "rapi-agent")
         posted = webhook.requests[0]["body"].decode("utf-8")  # type: ignore[attr-defined]
         self.assertNotIn(_GATEWAY_TOKEN, posted)
-        self.assertNotIn(_GATEWAY_TOKEN, result["detail"])
+        self.assertNotIn("wake-secret-do-not-log", posted)
         self.assertNotIn(_GATEWAY_TOKEN, "\n".join(self.logs.messages))
 
-    def test_gateway_timeout_and_unavailable_wake_but_normal_statuses_do_not(self) -> None:
-        webhook = self._webhook(204)
+    def test_message_webhook_failure_does_not_emit_link_down(self) -> None:
+        webhook = self._webhook(502)
         os.environ["CALL_BRIDGE_WAKE_WEBHOOK_URL"] = self._url(webhook)
         self._profiles({"rapi-agent": "ラピ"})
         store = CallStore(Path(self.temp.name) / "calls.sqlite")
         session = store.open_session("local-1", "Cursor", "ラピ")
-        os.environ["GROKBOT_GATEWAY_URL"] = "http://127.0.0.1:9"
-        os.environ["GROKBOT_GATEWAY_TOKEN"] = _GATEWAY_TOKEN
 
-        with mock.patch(
-            "call_bridge.deliver.deliver_agent_message",
-            return_value={"status": "error", "detail": "timed out"},
-        ):
-            timed = dispatch_send(store, session["session_id"], "local", "hello")
-        self.assertEqual(timed["error"], "error")
-        self.assertEqual(timed["note"], LINK_DOWN_NOTE)
-        self.assertEqual(store.session_info(session["session_id"])["message_count"], 0)
-        self.assertEqual(
-            json.loads(webhook.requests[0]["body"].decode("utf-8"))["detail"],  # type: ignore[attr-defined]
-            "timed out",
-        )
-
-        reset_link_down_limiter()
-        gateway = self._gateway({"status": "unavailable"})
-        os.environ["GROKBOT_GATEWAY_URL"] = self._origin(gateway)
-        unavailable = dispatch_send(store, session["session_id"], "local", "hello")
-        self.assertEqual(unavailable["error"], "unavailable")
-        self.assertEqual(unavailable["delivery"]["status"], "unavailable")
-        self.assertEqual(unavailable["note"], LINK_DOWN_NOTE)
-        self.assertIn("unavailable", unavailable["detail"])
-        self.assertEqual(store.session_info(session["session_id"])["message_count"], 0)
-        self.assertEqual(
-            json.loads(webhook.requests[1]["body"].decode("utf-8"))["link"],  # type: ignore[attr-defined]
-            "gateway",
-        )
-
-        before = len(webhook.requests)  # type: ignore[attr-defined]
-        for status, code in (
-            ({"status": "target_not_found"}, 200),
-            ({"status": "not_member"}, 200),
-            ({"status": "empty"}, 200),
-            (None, 401),
-        ):
-            reset_link_down_limiter()
-            gateway = self._gateway(status, status_code=code)
-            os.environ["GROKBOT_GATEWAY_URL"] = self._origin(gateway)
+        with mock.patch("call_bridge.wake.notify_link_down") as down:
             result = dispatch_send(store, session["session_id"], "local", "hello")
-            self.assertNotIn("note", result)
-            self.assertEqual(store.session_info(session["session_id"])["message_count"], 0)
-        self.assertEqual(len(webhook.requests), before)  # type: ignore[attr-defined]
 
-    def test_member_send_and_missing_gateway_config_do_not_wake(self) -> None:
+        down.assert_not_called()
+        self.assertEqual(result["error"], "error")
+        self.assertEqual(result["detail"], "http 502")
+        self.assertNotIn("note", result)
+        self.assertEqual(store.session_info(session["session_id"])["message_count"], 0)
+        self.assertEqual(len(webhook.requests), 1)  # type: ignore[attr-defined]
+        body = json.loads(webhook.requests[0]["body"].decode("utf-8"))  # type: ignore[attr-defined]
+        self.assertEqual(body["event"], "session.message")
+
+    def test_member_send_and_unset_webhook_do_not_emit_link_down(self) -> None:
         webhook = self._webhook(204)
         os.environ["CALL_BRIDGE_WAKE_WEBHOOK_URL"] = self._url(webhook)
         self._profiles({"rapi-agent": "ラピ"})
@@ -447,11 +393,12 @@ class LinkDownTests(unittest.TestCase):
         session = store.open_session("local-1", "Cursor", "ラピ")
 
         member = dispatch_send(store, session["session_id"], "member", "確認しました")
+        os.environ.pop("CALL_BRIDGE_WAKE_WEBHOOK_URL", None)
         missing = dispatch_send(store, session["session_id"], "local", "hello")
 
         self.assertEqual(member["message"], "確認しました")
         self.assertNotIn("note", member)
-        self.assertEqual(missing["error"], "gateway_not_configured")
+        self.assertEqual(missing["error"], "webhook_not_configured")
         self.assertNotIn("note", missing)
         self.assertEqual(webhook.requests, [])  # type: ignore[attr-defined]
         self.assertEqual(store.session_info(session["session_id"])["message_count"], 1)
@@ -461,9 +408,6 @@ class LinkDownTests(unittest.TestCase):
         os.environ["CALL_BRIDGE_WAKE_WEBHOOK_URL"] = self._url(webhook)
         os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self.temp.name) / "missing.sock")
         self._profiles({"rapi-agent": "ラピ"})
-        gateway = self._gateway({"status": "delivered"})
-        os.environ["GROKBOT_GATEWAY_URL"] = self._origin(gateway)
-        os.environ["GROKBOT_GATEWAY_TOKEN"] = _GATEWAY_TOKEN
         store = CallStore(Path(self.temp.name) / "calls.sqlite")
         session = store.open_session("local-1", "Cursor", "ラピ")
 
@@ -472,9 +416,15 @@ class LinkDownTests(unittest.TestCase):
         self.assertEqual(result["delivery"]["status"], "delivered")
         self.assertNotIn("note", result)
         self.assertEqual(store.session_info(session["session_id"])["message_count"], 1)
-        self.assertEqual(len(webhook.requests), 1)  # type: ignore[attr-defined]
-        body = json.loads(webhook.requests[0]["body"].decode("utf-8"))  # type: ignore[attr-defined]
-        self.assertEqual(body["link"], "directory")
+        self.assertEqual(len(webhook.requests), 2)  # type: ignore[attr-defined]
+        first = json.loads(webhook.requests[0]["body"].decode("utf-8"))  # type: ignore[attr-defined]
+        second = json.loads(webhook.requests[1]["body"].decode("utf-8"))  # type: ignore[attr-defined]
+        self.assertEqual(first["event"], "bridge.link_down")
+        self.assertEqual(first["link"], "directory")
+        self.assertEqual(first["detail"], "unix socket not found")
+        self.assertEqual(second["event"], "session.message")
+        self.assertEqual(second["message"], "hello")
+        self.assertEqual(second["member_agent_id"], "rapi-agent")
 
     def _profiles(self, seats: dict[str, str]) -> None:
         root = Path(self.temp.name) / "agents"
@@ -500,19 +450,6 @@ class LinkDownTests(unittest.TestCase):
         )
         server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         server.requests = []  # type: ignore[attr-defined]
-        thread = threading.Thread(target=server.serve_forever, daemon=True)
-        thread.start()
-        self.addCleanup(server.shutdown)
-        self.addCleanup(server.server_close)
-        return server
-
-    def _gateway(self, payload: dict | None, *, status_code: int = 200) -> ThreadingHTTPServer:
-        handler = type(
-            f"Gw{status_code}{id(payload)}",
-            (_GatewayHandler,),
-            {"status_code": status_code, "payload": payload},
-        )
-        server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         self.addCleanup(server.shutdown)
@@ -549,11 +486,6 @@ class LinkDownTests(unittest.TestCase):
     def _url(server: ThreadingHTTPServer) -> str:
         host, port = server.server_address[:2]
         return f"http://{host}:{port}/wake"
-
-    @staticmethod
-    def _origin(server: ThreadingHTTPServer) -> str:
-        host, port = server.server_address[:2]
-        return f"http://{host}:{port}"
 
     @staticmethod
     def _closed_origin() -> str:
