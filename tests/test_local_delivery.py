@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import httpx
+import psutil
 
 from call_bridge import codex_delivery, local, setup
 
@@ -117,6 +118,19 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
             with self.assertRaisesRegex(codex_delivery.DeliveryError, "BRIDGE_TOKEN_MISSING"):
                 local._headers()
 
+    async def test_call_info_exposes_uncertain_hook_delivery(self):
+        store = local.LocalStore(Path(self.temp.name))
+        session_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
+        store.add(session_id, thread_id, Path(self.temp.name), "ラピ")
+        delivery_id, _ = store.reserve(session_id, 1)
+        store.submitted(session_id, 1)
+        claim = Path(self.temp.name) / "codex-inputs" / thread_id / "claims" / f"{delivery_id}.json"
+        codex_delivery._write_json(claim, {"state": "unknown", "text": "GrokBot の返事"})
+        status = store.status(session_id)
+        self.assertEqual(status["deliveries"][0]["state"], "unknown")
+        self.assertEqual(status["deliveries"][0]["error"], "CODEX_HOOK_DELIVERY_UNCONFIRMED")
+        self.assertEqual(status["after_seq"], 1)
+
 
 class HookTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
@@ -165,6 +179,105 @@ class HookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(output["hookSpecificOutput"]["additionalContext"], body)
         self.assertEqual(len(claims), 1)
         self.assertFalse(source.exists())
+
+    async def test_idle_queue_consumption_cleans_settled_owner(self):
+        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
+        pending = codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json"
+        settled = pending.parent.parent / "settled" / pending.name
+        codex_delivery._write_json_once(pending, {"delivery_id": delivery_id})
+        codex_delivery._write_json(settled, {"delivery_id": delivery_id})
+
+        class EmptyRPC:
+            def __init__(self, *_args, **_kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): pass
+            async def request(self, _method, _params): return {"data": [], "nextCursor": None}
+
+        with patch.object(codex_delivery, "CodexRPC", EmptyRPC):
+            output, claims = await codex_delivery.claim_hook_replies({
+                "session_id": thread_id, "turn_id": "turn-1", "hook_event_name": "PostToolUse",
+            })
+        self.assertEqual((output, claims), ({}, []))
+        self.assertFalse(pending.exists())
+        self.assertFalse(settled.exists())
+
+    async def test_interrupted_queue_claim_is_unknown_and_keeps_body(self):
+        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
+        body = "GrokBot の返事"
+        source = codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json"
+        codex_delivery._write_json_once(source, {
+            "thread_id": thread_id, "delivery_id": delivery_id,
+            "text_sha256": hashlib.sha256(body.encode()).hexdigest(),
+        })
+
+        class FailingRPC:
+            def __init__(self, *_args, **_kwargs): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *_args): pass
+            async def request(self, method, _params):
+                if method == "thread/queue/list":
+                    return {"data": [{"id": "queued", "clientUserMessageId": delivery_id,
+                                      "input": [{"type": "text", "text": body}]}], "nextCursor": None}
+                raise codex_delivery.DeliveryError("CODEX_REQUEST_TIMEOUT", "削除結果が不明")
+
+        with patch.object(codex_delivery, "CodexRPC", FailingRPC):
+            with self.assertRaisesRegex(codex_delivery.DeliveryError, "CODEX_REQUEST_TIMEOUT"):
+                await codex_delivery.claim_hook_replies({
+                    "session_id": thread_id, "turn_id": "turn-1", "hook_event_name": "Stop",
+                })
+        claim = source.parent.parent / "claims" / source.name
+        self.assertEqual(json.loads(claim.read_text())["text"], body)
+        self.assertEqual(codex_delivery.hook_delivery_state(thread_id, delivery_id), "unknown")
+
+    async def test_interrupted_hook_process_is_reported_unknown(self):
+        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
+        claim = codex_delivery._pending_dir(thread_id).parent / "claims" / f"{delivery_id}.json"
+        process = psutil.Process()
+        codex_delivery._write_json(claim, {
+            "state": "deleting", "pid": process.pid, "create_time": process.create_time(),
+            "text": "GrokBot の返事",
+        })
+        self.assertEqual(codex_delivery.hook_delivery_state(thread_id, delivery_id), "sending")
+        codex_delivery._write_json(claim, {
+            "state": "deleting", "pid": process.pid, "create_time": process.create_time() - 1,
+            "text": "GrokBot の返事",
+        })
+        self.assertEqual(codex_delivery.hook_delivery_state(thread_id, delivery_id), "unknown")
+
+
+class ProcessTest(unittest.IsolatedAsyncioTestCase):
+    async def test_preexisting_codex_process_requires_restart(self):
+        current = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
+        config = {"stale_processes": [current]}
+        self.assertTrue(codex_delivery.restart_required(config))
+        with self.assertRaisesRegex(codex_delivery.DeliveryError, "CODEX_STEER_RESTART_REQUIRED"):
+            codex_delivery.assert_parent_current(config)
+        self.assertFalse(codex_delivery.restart_required({
+            "stale_processes": [{**current, "create_time": current["create_time"] - 1}],
+        }))
+
+    async def test_setup_migrates_old_config_to_restart_check(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / "state"
+            state.mkdir()
+            old = {"enabled": True, "mcp_name": "call-bridge", "mcp_url": "https://example.com/mcp",
+                   "token_env": "CALL_BRIDGE_TOKEN", "hook_command": "hook"}
+            setup._write_json(state / "config.json", old)
+            current = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
+            transport = {"transport": {"type": "stdio", "args": ["-m", "call_bridge.local"]}}
+            with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "CODEX_HOME": root,
+                                      "CALL_BRIDGE_TOKEN": "test-token"}), \
+                 patch.object(setup, "_find_existing", return_value=("call-bridge", transport)), \
+                 patch.object(setup, "_existing", return_value=transport), \
+                 patch.object(setup, "_command", return_value="hook"), \
+                 patch.object(setup, "codex_binary", return_value="/bin/echo"), \
+                 patch.object(setup, "codex_processes", return_value=[current]), \
+                 patch.object(setup, "_backup_codex_config"), \
+                 patch.object(setup, "_merge_hooks", return_value=False), \
+                 patch.object(setup, "_verify_hooks", new_callable=AsyncMock):
+                self.assertEqual((await setup.enable())["status"], "restart_required")
+                self.assertEqual((await setup.status())["status"], "restart_required")
+            self.assertEqual(json.loads((state / "config.json").read_text())["stale_processes"], [current])
 
 
 class SetupTest(unittest.TestCase):

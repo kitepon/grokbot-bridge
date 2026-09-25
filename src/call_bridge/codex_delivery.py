@@ -8,9 +8,12 @@ import json
 import os
 import shutil
 import sys
+import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
+
+import psutil
 
 
 class DeliveryError(RuntimeError):
@@ -37,6 +40,79 @@ def codex_binary() -> str:
     if not binary:
         raise DeliveryError("CODEX_UNAVAILABLE", "Codex CLI が見つかりません")
     return binary
+
+
+def codex_processes() -> list[dict[str, int | float]]:
+    """Codex 本体の PID と生成時刻を保存し、PID 再利用と区別する。"""
+    processes = []
+    try:
+        for process in psutil.process_iter(["name", "exe", "create_time"], ad_value=None):
+            name = (process.info["name"] or "").lower()
+            executable = Path(process.info["exe"] or "").name.lower()
+            if name not in ("codex", "codex.exe") and executable not in ("codex", "codex.exe"):
+                continue
+            created = process.info["create_time"]
+            if not isinstance(created, (int, float)):
+                raise DeliveryError("CODEX_PROCESS_UNAVAILABLE", "Codex の生成時刻を確認できません")
+            processes.append({"pid": process.pid, "create_time": created})
+    except psutil.Error as exc:
+        raise DeliveryError("CODEX_PROCESS_UNAVAILABLE", "Codex のプロセスを確認できません") from exc
+    return processes
+
+
+def _stale_processes(config: dict[str, Any]) -> list[dict[str, int | float]]:
+    rows = config.get("stale_processes", [])
+    if not isinstance(rows, list) or any(
+        not isinstance(row, dict) or type(row.get("pid")) is not int or
+        not isinstance(row.get("create_time"), (int, float)) for row in rows
+    ):
+        raise DeliveryError("CODEX_PROCESS_STATE_INVALID", "Codex の再起動記録が不正です")
+    return rows
+
+
+def _process_matches(process: psutil.Process, stale: list[dict[str, int | float]]) -> bool:
+    return any(row["pid"] == process.pid and row["create_time"] == process.create_time()
+               for row in stale if row["pid"] == process.pid)
+
+
+def _process_alive(row: dict[str, int | float]) -> bool:
+    try:
+        return _process_matches(psutil.Process(row["pid"]), [row])
+    except psutil.NoSuchProcess:
+        return False
+    except psutil.Error as exc:
+        raise DeliveryError("CODEX_PROCESS_UNAVAILABLE", "プロセスの生成時刻を確認できません") from exc
+
+
+def restart_required(config: dict[str, Any]) -> bool:
+    return any(_process_alive(row) for row in _stale_processes(config))
+
+
+def assert_parent_current(config: dict[str, Any]) -> None:
+    stale = _stale_processes(config)
+    if not stale:
+        return
+    try:
+        process = psutil.Process()
+        if any(_process_matches(parent, stale) for parent in [process, *process.parents()]):
+            raise DeliveryError("CODEX_STEER_RESTART_REQUIRED", "親 Codex を完全終了して再起動してください")
+    except psutil.Error as exc:
+        raise DeliveryError("CODEX_PROCESS_UNAVAILABLE", "親 Codex のプロセスを確認できません") from exc
+
+
+def owned_hooks(response: dict[str, Any], command: str, home: Path) -> list[dict[str, Any]]:
+    data = response.get("data")
+    if (not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict) or
+            data[0].get("errors") or not isinstance(data[0].get("hooks"), list)):
+        raise DeliveryError("CODEX_HOOK_LIST_INVALID", "Codex の hook 一覧を認識できません")
+    source = str((home / "hooks.json").resolve())
+    rows = data[0]["hooks"]
+    ours = [row for row in rows if isinstance(row, dict) and row.get("command") == command and
+            row.get("sourcePath") == source]
+    if (len(ours) != 2 or {row.get("eventName") for row in ours} != {"postToolUse", "stop"} or
+            any(row.get("async") or row.get("handlerType") != "command" for row in ours)):
+        raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "登録した同期 hook が Codex から見えません")
+    return ours
 
 
 class CodexRPC:
@@ -130,14 +206,15 @@ async def verify_parent(thread_id: str, home: Path) -> None:
         config = json.loads(config_file.read_text(encoding="utf-8"))
         if config.get("enabled") is False:
             raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "自動配送が無効です")
+        if config.get("codex_home") and Path(config["codex_home"]).resolve() != home:
+            raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "配送先と hook の Codex 環境が一致しません")
+        assert_parent_current(config)
         command = config.get("hook_command")
         if not isinstance(command, str):
             raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook の設定がありません")
         hooks = await rpc.request("hooks/list", {"cwds": [thread.get("cwd") or str(home)]})
-        data = hooks.get("data")
-        rows = data[0].get("hooks") if isinstance(data, list) and len(data) == 1 and isinstance(data[0], dict) else None
-        ours = [row for row in rows if isinstance(row, dict) and row.get("command") == command] if isinstance(rows, list) else []
-        if len(ours) != 2 or any(not row.get("enabled") or row.get("trustStatus") not in ("trusted", "managed") for row in ours):
+        ours = owned_hooks(hooks, command, home)
+        if any(not row.get("enabled") or row.get("trustStatus") not in ("trusted", "managed") for row in ours):
             raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook が有効ではありません")
 
 
@@ -154,6 +231,45 @@ def _write_json_once(path: Path, value: dict[str, Any]) -> None:
         handle.write("\n")
 
 
+def _write_json(path: Path, value: dict[str, Any]) -> None:
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
+    try:
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(value, handle, ensure_ascii=False)
+            handle.write("\n")
+        os.replace(temporary, path)
+    finally:
+        if os.path.exists(temporary):
+            os.unlink(temporary)
+
+
+def _set_claim_state(path: Path, state: str) -> None:
+    _write_json(path, {**json.loads(path.read_text(encoding="utf-8")), "state": state})
+
+
+def hook_delivery_state(thread_id: str, delivery_id: str) -> str | None:
+    claim = state_root() / "codex-inputs" / thread_id / "claims" / f"{delivery_id}.json"
+    try:
+        value = json.loads(claim.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return None
+    except (OSError, ValueError) as exc:
+        raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook の配送記録を読めません") from exc
+    state = value.get("state")
+    if state == "unknown":
+        return "unknown"
+    if state == "deleting":
+        if type(value.get("pid")) is not int or not isinstance(value.get("create_time"), (int, float)):
+            raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook のプロセス記録が不正です")
+        return "sending" if _process_alive(value) else "unknown"
+    if state in ("emitted", "not_in_queue") or state is None:
+        return None
+    raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook の配送状態が不正です")
+
+
 async def submit_reply(thread_id: str, home: Path, delivery_id: str, text: str) -> str:
     pending = _pending_dir(thread_id) / f"{delivery_id}.json"
     try:
@@ -167,12 +283,18 @@ async def submit_reply(thread_id: str, home: Path, delivery_id: str, text: str) 
                             outcome_unknown=True) from exc
     except OSError as exc:
         raise DeliveryError("DELIVERY_STATE_WRITE_FAILED", "配送記録を保存できません") from exc
-    async with CodexRPC(home) as rpc:
-        result = await rpc.request("thread/queue/add", {
-            "threadId": thread_id,
-            "clientUserMessageId": delivery_id,
-            "input": [{"type": "text", "text": text, "text_elements": []}],
-        })
+    try:
+        async with CodexRPC(home) as rpc:
+            result = await rpc.request("thread/queue/add", {
+                "threadId": thread_id,
+                "clientUserMessageId": delivery_id,
+                "input": [{"type": "text", "text": text, "text_elements": []}],
+            })
+    finally:
+        settled = pending.parent.parent / "settled" / pending.name
+        _write_json(settled, {"delivery_id": delivery_id})
+        if not pending.exists():
+            settled.unlink(missing_ok=True)
     item = result.get("queuedSubmission")
     if not isinstance(item, dict) or not isinstance(item.get("id"), str):
         raise DeliveryError("CODEX_QUEUE_RECEIPT_INVALID", "キュー受付IDを確認できません", outcome_unknown=True)
@@ -199,6 +321,11 @@ async def _queued(rpc: CodexRPC, thread_id: str) -> list[dict[str, Any]]:
 
 
 async def claim_hook_replies(event: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
+    config_file = state_root() / "config.json"
+    if config_file.exists():
+        config = json.loads(config_file.read_text(encoding="utf-8"))
+        if config.get("codex_home") and Path(config["codex_home"]).resolve() != codex_home():
+            raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "配送先と hook の Codex 環境が一致しません")
     thread_id = event.get("session_id")
     turn_id = event.get("turn_id")
     kind = event.get("hook_event_name")
@@ -218,7 +345,15 @@ async def claim_hook_replies(event: dict[str, Any]) -> tuple[dict[str, Any], lis
     texts: list[str] = []
     try:
         async with CodexRPC(codex_home(), timeout=5) as rpc:
-            for item in await _queued(rpc, thread_id):
+            entries = await _queued(rpc, thread_id)
+            queued_ids = {item.get("clientUserMessageId") for item in entries}
+            settled_dir = pending_dir.parent / "settled"
+            for source in pending_dir.glob("*.json"):
+                settled = settled_dir / source.name
+                if source.stem not in queued_ids and settled.is_file():
+                    source.unlink(missing_ok=True)
+                    settled.unlink(missing_ok=True)
+            for item in entries:
                 delivery_id = item.get("clientUserMessageId")
                 if not isinstance(delivery_id, str):
                     continue
@@ -249,17 +384,23 @@ async def claim_hook_replies(event: dict[str, Any]) -> tuple[dict[str, Any], lis
                 except FileNotFoundError:
                     continue
                 claimed.append(claim)
+                settled = settled_dir / source.name
+                settled.unlink(missing_ok=True)
+                identity = psutil.Process()
+                _write_json(claim, {**owner, "text": text, "state": "deleting",
+                                    "turn_id": turn_id, "queued_submission_id": item.get("id"),
+                                    "pid": identity.pid, "create_time": identity.create_time()})
                 result = await rpc.request("thread/queue/delete", {
                     "threadId": thread_id, "queuedSubmissionId": item.get("id"),
                 })
                 if result.get("deleted") is True:
                     texts.append(text)
                 else:
-                    claim.write_text(json.dumps({**owner, "state": "not_in_queue"}), encoding="utf-8")
+                    _set_claim_state(claim, "not_in_queue")
                     claimed.pop()
     except Exception:
         for claim in claimed:
-            claim.write_text(json.dumps({"state": "unknown"}), encoding="utf-8")
+            _set_claim_state(claim, "unknown")
         raise
     if not texts:
         return {}, claimed
@@ -277,10 +418,10 @@ def hook_main() -> None:
         sys.stdout.write(json.dumps(output, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         for path in claimed:
-            path.write_text(json.dumps({"state": "emitted"}), encoding="utf-8")
+            _set_claim_state(path, "emitted")
     except Exception as exc:
         for path in claimed:
-            path.write_text(json.dumps({"state": "unknown"}), encoding="utf-8")
+            _set_claim_state(path, "unknown")
         print(f"CALL_BRIDGE_HOOK_FAILED: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 

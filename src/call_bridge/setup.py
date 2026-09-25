@@ -15,7 +15,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .codex_delivery import CodexRPC, DeliveryError, codex_binary, codex_home, state_root
+from .codex_delivery import (CodexRPC, DeliveryError, codex_binary, codex_home,
+                             codex_processes, owned_hooks, restart_required, state_root)
 
 _NAMES = ("call-bridge", "grokbot-bridge")
 
@@ -102,16 +103,7 @@ async def _verify_hooks(command: str, approve: bool) -> None:
     async with CodexRPC(home) as rpc:
         async def owned() -> list[dict[str, Any]]:
             result = await rpc.request("hooks/list", {"cwds": [str(home)]})
-            data = result.get("data")
-            if not isinstance(data, list) or len(data) != 1 or not isinstance(data[0], dict):
-                raise DeliveryError("CODEX_HOOK_LIST_INVALID", "Codex の hook 一覧を認識できません")
-            rows = data[0].get("hooks")
-            if not isinstance(rows, list):
-                raise DeliveryError("CODEX_HOOK_LIST_INVALID", "Codex の hook 一覧を認識できません")
-            ours = [row for row in rows if isinstance(row, dict) and row.get("command") == command]
-            if len(ours) != 2 or {row.get("eventName") for row in ours} != {"postToolUse", "stop"}:
-                raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "登録した hook が Codex から見えません")
-            return ours
+            return owned_hooks(result, command, home)
 
         rows = await owned()
         if approve:
@@ -185,6 +177,7 @@ async def _replace_mcp(name: str, registration: dict[str, Any]) -> None:
 
 async def enable() -> dict[str, str]:
     name, existing = _find_existing()
+    running_before = codex_processes()
     config_file = state_root() / "config.json"
     already_local = existing["transport"].get("type") == "stdio"
     if already_local:
@@ -193,6 +186,8 @@ async def enable() -> dict[str, str]:
         if not config_file.exists():
             raise DeliveryError("CODEX_MCP_CONFIG_UNSUPPORTED", "ローカル MCP の所有設定がありません")
         previous = json.loads(config_file.read_text(encoding="utf-8"))
+        if previous.get("codex_home") and Path(previous["codex_home"]).resolve() != codex_home():
+            raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "設定済みの Codex 環境が異なります")
         url, token_env = previous["mcp_url"], previous["token_env"]
     else:
         url, token_env = _remote(existing)
@@ -206,7 +201,6 @@ async def enable() -> dict[str, str]:
                            previous.get("hook_command") if already_local else None)
     await _verify_hooks(command, approve=True)
     auth_file = state_root() / "auth.json"
-    auth_file_created = not auth_file.exists()
     _write_json(auth_file, {"token": token})
     if not already_local:
         try:
@@ -217,14 +211,18 @@ async def enable() -> dict[str, str]:
     actual = _existing(name)
     if actual["transport"].get("type") != "stdio":
         raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "ローカル MCP への切替を確認できません")
-    _write_json(state_root() / "config.json", {
+    next_config = {
         "enabled": True,
         "mcp_name": name,
         "mcp_url": url, "token_env": token_env,
+        "codex_home": str(home),
         "codex_binary": str(Path(codex_binary()).resolve()),
         "hook_command": command,
-    })
-    return {"status": "restart_required" if changed or not already_local or auth_file_created else "ready", "mcp": name}
+        "stale_processes": (running_before if changed or not already_local or
+                            "stale_processes" not in previous else previous["stale_processes"]),
+    }
+    _write_json(state_root() / "config.json", next_config)
+    return {"status": "restart_required" if restart_required(next_config) else "ready", "mcp": name}
 
 
 async def status() -> dict[str, str]:
@@ -234,12 +232,15 @@ async def status() -> dict[str, str]:
     config = json.loads(config_file.read_text(encoding="utf-8"))
     if config.get("enabled") is False:
         return {"status": "disabled"}
+    if config.get("codex_home") and Path(config["codex_home"]).resolve() != codex_home():
+        raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "設定済みの Codex 環境が異なります")
     await _verify_hooks(config["hook_command"], approve=False)
     name = config["mcp_name"]
     existing = _existing(name)
     if existing["transport"].get("type") != "stdio":
         raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "Codex はローカル MCP を使っていません")
-    return {"status": "ready", "mcp": name, "remote": config["mcp_url"]}
+    return {"status": "restart_required" if restart_required(config) else "ready",
+            "mcp": name, "remote": config["mcp_url"]}
 
 
 async def disable() -> dict[str, str]:

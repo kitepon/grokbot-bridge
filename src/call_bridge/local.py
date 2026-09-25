@@ -19,7 +19,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import Context, FastMCP
 
-from .codex_delivery import DeliveryError, codex_home, state_root, submit_reply, verify_parent
+from .codex_delivery import (DeliveryError, codex_home, hook_delivery_state,
+                             state_root, submit_reply, verify_parent)
 
 log = logging.getLogger("call_bridge.local")
 _DELIVERY_NAMESPACE = uuid.UUID("ddf85db7-8d27-4c57-8ba5-9ad498cd64c9")
@@ -176,8 +177,15 @@ class LocalStore:
         with self.connect() as db:
             rows = db.execute("SELECT seq, delivery_id, state, error FROM deliveries WHERE session_id = ? ORDER BY seq",
                               (session_id,)).fetchall()
+        deliveries = [dict(row) for row in rows]
+        for delivery in deliveries:
+            if delivery["state"] == "submitted":
+                hook_state = hook_delivery_state(subscription["thread_id"], delivery["delivery_id"])
+                if hook_state:
+                    delivery["state"] = hook_state
+                    delivery["error"] = "CODEX_HOOK_DELIVERY_UNCONFIRMED" if hook_state == "unknown" else None
         return {"state": subscription["state"], "after_seq": subscription["after_seq"],
-                "last_error": subscription["last_error"], "deliveries": [dict(row) for row in rows]}
+                "last_error": subscription["last_error"], "deliveries": deliveries}
 
 
 class Watchers:

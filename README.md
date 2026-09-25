@@ -72,9 +72,16 @@ call-bridge-setup status
 `enable` を実行するシェルへ渡し、`call-bridge-setup enable` を再実行する。
 シェルに値があっても、起動済みの Codex MCP プロセスがその値を継承するとは限らない。
 `enable` 後は Codex を完全終了して再起動する。`status` は登録と hook の状態を確認する。
+`enable` は導入前から動く Codex の PID と生成時刻を記録し、そのプロセスが残る間は
+`restart_required` を返す。`call_open` も同じ親プロセスへの配送を拒否する。
+完全終了・再起動後に `call-bridge-setup status` の `ready` を確認する。
 
 返信は `session_id` と `seq` で順番に処理する。配送結果はローカル MCP の `call_info` に
 `parent_delivery` として表示する。送信結果が不明なときは自動再送せず `unknown` と記録する。
+`submitted` は公式キューの受付を示し、親 AI の読了を示さない。hook がキューから
+取り出し中なら `sending`、取り出しの中断や出力失敗なら `unknown` と
+`CODEX_HOOK_DELIVERY_UNCONFIRMED` を表示する。hook が受け取らず待機中の Codex が
+先に処理した入力の所有記録は、次の hook 実行時に整理する。
 返信本文は bridge に残り、手動で `call_poll` から確認できる。
 ローカル MCP の再起動後は、記録された進行中の通話の受信を再開する。
 
