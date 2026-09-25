@@ -1,6 +1,6 @@
 [project]
 name = "grokbot-bridge"
-version = "0.1.0"
+version = "0.1.1"
 description = "Shared phone-call bridge MCP for Grok Bot — wake a teammate, then talk direct over the same endpoint."
 readme = "README.md"
 requires-python = ">=3.11"
