@@ -90,6 +90,7 @@ call-bridge-setup status
 ```
 
 `enable` は既存の URL と token 環境変数名を読み、その MCP 登録をローカル MCP に切り替える。
+Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ保存し、MCP の PATH が狭い環境でも返信配送用 App Server を起動する。CLI や Node を移動した後は `enable` を再実行する。
 認証値は製品の state directory（既定は `~/.grokbot-bridge`）の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。Git や Codex 設定には書かない。`disable` はそのファイルを削除する。
 また、本製品専用の Codex hook を登録・承認する。他製品の hook は保持する。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。

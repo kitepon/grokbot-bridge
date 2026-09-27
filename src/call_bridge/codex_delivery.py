@@ -53,6 +53,19 @@ def _same_pid_namespace(pid: int) -> bool:
         raise DeliveryError("CODEX_PROCESS_UNAVAILABLE", "Codex の PID 名前空間を確認できません") from exc
 
 
+def codex_command() -> list[str]:
+    """Launch a Node based Codex even when the MCP child has a minimal PATH."""
+    binary = codex_binary()
+    if Path(binary).suffix.lower() != ".js":
+        return [binary]
+    config_file = state_root() / "config.json"
+    config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+    node = config.get("node_binary") or shutil.which("node")
+    if not isinstance(node, str) or not Path(node).is_file():
+        raise DeliveryError("CODEX_RUNTIME_UNAVAILABLE", "Codex の Node 実行ファイルが見つかりません")
+    return [node, binary]
+
+
 def codex_processes() -> list[dict[str, int | float]]:
     """Codex 本体の PID と生成時刻を保存し、PID 再利用と区別する。"""
     processes = []
@@ -141,7 +154,7 @@ class CodexRPC:
     async def __aenter__(self) -> CodexRPC:
         try:
             self.process = await asyncio.create_subprocess_exec(
-                codex_binary(), "app-server", "--listen", "stdio://",
+                *codex_command(), "app-server", "--listen", "stdio://",
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,

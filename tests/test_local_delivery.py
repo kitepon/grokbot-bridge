@@ -327,6 +327,20 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
 
 
 class SetupTest(unittest.TestCase):
+    def test_node_codex_uses_recorded_runtime_with_minimal_path(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / "state"
+            state.mkdir()
+            script = Path(root) / "codex.js"
+            script.write_text("", encoding="utf-8")
+            node = Path(root) / "node"
+            node.write_text("", encoding="utf-8")
+            setup._write_json(state / "config.json", {
+                "codex_binary": str(script), "node_binary": str(node),
+            })
+            with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "PATH": root}, clear=True):
+                self.assertEqual(codex_delivery.codex_command(), [str(node), str(script)])
+
     def test_hook_merge_preserves_other_products(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"CALL_BRIDGE_STATE": temp}):

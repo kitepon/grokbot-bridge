@@ -7,6 +7,7 @@ import asyncio
 import json
 import os
 import shlex
+import shutil
 import subprocess
 import sys
 import tarfile
@@ -15,7 +16,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .codex_delivery import (CodexRPC, DeliveryError, codex_binary, codex_home,
+from .codex_delivery import (CodexRPC, DeliveryError, codex_binary, codex_command, codex_home,
                              codex_processes, owned_hooks, restart_required, state_root)
 
 _NAMES = ("call-bridge", "grokbot-bridge")
@@ -129,7 +130,7 @@ async def _verify_hooks(command: str, approve: bool) -> None:
 
 
 def _codex_mcp(*args: str) -> str:
-    result = subprocess.run([codex_binary(), "mcp", *args], capture_output=True, text=True)
+    result = subprocess.run([*codex_command(), "mcp", *args], capture_output=True, text=True)
     if result.returncode:
         raise DeliveryError("CODEX_MCP_CONFIG_FAILED", result.stderr.strip() or "Codex MCP 設定に失敗しました")
     return result.stdout
@@ -211,12 +212,17 @@ async def enable() -> dict[str, str]:
     actual = _existing(name)
     if actual["transport"].get("type") != "stdio":
         raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "ローカル MCP への切替を確認できません")
+    binary_path = Path(codex_binary()).resolve()
+    node_path = shutil.which("node") if binary_path.suffix.lower() == ".js" else None
+    if binary_path.suffix.lower() == ".js" and not node_path:
+        raise DeliveryError("CODEX_RUNTIME_UNAVAILABLE", "Codex の Node 実行ファイルが見つかりません")
     next_config = {
         "enabled": True,
         "mcp_name": name,
         "mcp_url": url, "token_env": token_env,
         "codex_home": str(home),
-        "codex_binary": str(Path(codex_binary()).resolve()),
+        "codex_binary": str(binary_path),
+        "node_binary": str(Path(node_path).resolve()) if node_path else None,
         "hook_command": command,
         "stale_processes": (running_before if changed or not already_local or
                             "stale_processes" not in previous else previous["stale_processes"]),
