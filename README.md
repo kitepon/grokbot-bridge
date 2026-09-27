@@ -75,7 +75,7 @@ Codex から通話する端末では、ローカル MCP を登録すると `call
 ローカル MCP が通話の返信を裏で取得し、Codex 親へ一通ずつ渡す。
 親AI自身が `call_poll` を繰り返す必要はない。継続型の親ではCodexの公式キューを使い、進行中なら
 `PostToolUse`／`Stop` hook が返信を同じターンへ差し込み、ターン終了後なら
-キューが次のターンとして届ける。短命な `codex exec` の親では、CLI終了中にキューの次ターンが中断される競合を避けるため、公式 `thread/inject_items` で保存済み会話へ返信を追加する。次に親を再開した時にモデルへ渡る。GrokBot メンバーは従来どおり公開 MCP に接続し、
+キューが次のターンとして届ける。短命な `codex exec` の親では、MCP子プロセスの終了後も動く受信プロセスを通話ごとに起動する。元のCodexが会話の書き込み権を持つ間は返信を`waiting`で保持し、解放後に公式 `thread/inject_items` で保存済み会話へ一度だけ追加する。次に親を再開した時にモデルへ渡る。GrokBot メンバーは従来どおり公開 MCP に接続し、
 返信には `from_party="member"` を使う。
 
 対象は通常の Codex 親タスク。native sub-agent への自動配送は未対応。
@@ -106,7 +106,7 @@ Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ�
 
 返信は `session_id` と `seq` で順番に処理する。配送結果はローカル MCP の `call_info` に
 `parent_delivery` として表示する。送信結果が不明なときは自動再送せず `unknown` と記録する。
-`submitted` は公式キューの受付、`injected` は `codex exec` の保存済み会話への追加を示し、どちらも親 AI の読了を示さない。hook がキューから
+`waiting` は短命な親の書き込み権待ち、`submitted` は公式キューの受付、`injected` は `codex exec` の保存済み会話への追加を示し、いずれも親 AI の読了を示さない。hook がキューから
 取り出し中なら `sending`、取り出しの中断や出力失敗なら `unknown` と
 `CODEX_HOOK_DELIVERY_UNCONFIRMED` を表示する。hook が受け取らず待機中の Codex が
 先に処理した入力の所有記録は、次の hook 実行時に整理する。

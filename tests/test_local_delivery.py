@@ -81,6 +81,21 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([row["state"] for row in store.status(session_id)["deliveries"]],
                          ["injected", "injected"])
 
+    async def test_busy_exec_writer_defers_same_reply_until_next_poll(self):
+        store = local.LocalStore(Path(self.temp.name))
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), Path(self.temp.name), "ラピ")
+        send = AsyncMock(side_effect=["deferred", "injected", "injected"])
+        with patch.object(local.httpx, "AsyncClient", return_value=FakeHTTP()), \
+             patch.object(local, "submit_reply", send), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(send.await_count, 3)
+        self.assertEqual(send.await_args_list[0].args[2], send.await_args_list[1].args[2])
+        self.assertEqual(store.status(session_id)["after_seq"], 4)
+        self.assertEqual([row["state"] for row in store.status(session_id)["deliveries"]],
+                         ["injected", "injected"])
+
     async def test_uncertain_queue_result_stops_without_resending(self):
         store = local.LocalStore(Path(self.temp.name))
         session_id = str(uuid.uuid4())
@@ -113,7 +128,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
              patch.object(local, "_remote_tool", new_callable=AsyncMock,
                           return_value={"session_id": session_id, "status": "ringing"}) as remote, \
              patch.object(local.store, "add") as add, \
-             patch.object(local.watchers, "start") as start:
+             patch.object(local, "_start_watch") as start:
             result = await local.call_open(
                 "caller", "発信者", "bot-1", "相談", "bellteam", "grokbot", ctx=object())
 
@@ -121,9 +136,24 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
             "local_id": "caller", "local_label": "発信者", "member_name": "bot-1",
             "purpose": "相談", "member_system": "bellteam", "local_system": "grokbot",
         })
-        add.assert_called_once_with(session_id, thread_id, Path(self.temp.name), "bot-1")
+        add.assert_called_once_with(session_id, thread_id, Path(self.temp.name), "bot-1", "queue")
         start.assert_called_once_with(session_id)
         self.assertEqual(result["parent_delivery"]["state"], "watching")
+
+    async def test_exec_call_open_starts_independent_watcher(self):
+        session_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
+        store = local.LocalStore(Path(self.temp.name))
+        with patch.object(local, "_parent", return_value=(thread_id, Path(self.temp.name))), \
+             patch.object(local, "verify_parent", new_callable=AsyncMock, return_value="exec"), \
+             patch.object(local, "_remote_tool", new_callable=AsyncMock,
+                          return_value={"session_id": session_id}), \
+             patch.object(local, "store", store), \
+             patch.object(local, "_launch_exec_watcher") as launch, \
+             patch.object(local.watchers, "start") as in_process:
+            await local.call_open("caller", "発信者", "bot-1", ctx=object())
+        self.assertEqual(store.subscription(session_id)["delivery_mode"], "exec")
+        launch.assert_called_once_with(session_id)
+        in_process.assert_not_called()
 
     async def test_call_open_keeps_grokbot_and_local_defaults(self):
         session_id = str(uuid.uuid4())
@@ -132,7 +162,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
              patch.object(local, "_remote_tool", new_callable=AsyncMock,
                           return_value={"session_id": session_id}) as remote, \
              patch.object(local.store, "add"), \
-             patch.object(local.watchers, "start"):
+             patch.object(local, "_start_watch"):
             await local.call_open("caller", "発信者", "ラピ", ctx=object())
 
         self.assertEqual(remote.await_args.args[1]["member_system"], "grokbot")
@@ -217,6 +247,33 @@ class HookTest(unittest.IsolatedAsyncioTestCase):
                          ["thread/read", "thread/resume", "thread/inject_items"])
         self.assertEqual(calls[2][1]["items"][0]["content"][0]["text"], "返信本文")
         self.assertFalse((codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json").exists())
+
+    async def test_busy_exec_writer_defers_before_any_injection_attempt(self):
+        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
+
+        class FakeRPC:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                pass
+
+            async def request(self, method, _params):
+                if method == "thread/read":
+                    return {"thread": {"id": thread_id, "source": "exec"}}
+                if method == "thread/resume":
+                    raise codex_delivery.DeliveryError(
+                        "CODEX_REQUEST_REJECTED", "thread already has an active writer")
+                raise AssertionError("injection must not run while the parent is the writer")
+
+        with patch.object(codex_delivery, "CodexRPC", FakeRPC):
+            self.assertEqual(await codex_delivery.submit_reply(
+                thread_id, Path(self.temp.name), delivery_id, "返信本文"), "deferred")
+        marker = Path(self.temp.name) / "codex-inputs" / thread_id / "injections" / f"{delivery_id}.json"
+        self.assertFalse(marker.exists())
 
     async def test_hook_claims_only_its_own_queued_reply(self):
         thread_id = str(uuid.uuid4())

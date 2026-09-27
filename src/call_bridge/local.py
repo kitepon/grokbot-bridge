@@ -7,6 +7,7 @@ import json
 import logging
 import os
 import sqlite3
+import subprocess
 import sys
 import uuid
 from contextlib import asynccontextmanager
@@ -112,7 +113,7 @@ class LocalStore:
                     session_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL,
                     codex_home TEXT NOT NULL, member_name TEXT NOT NULL,
                     after_seq INTEGER NOT NULL DEFAULT 0, state TEXT NOT NULL DEFAULT 'active',
-                    last_error TEXT
+                    last_error TEXT, delivery_mode TEXT NOT NULL DEFAULT 'queue'
                 );
                 CREATE TABLE IF NOT EXISTS deliveries (
                     session_id TEXT NOT NULL, seq INTEGER NOT NULL,
@@ -120,16 +121,22 @@ class LocalStore:
                     error TEXT, PRIMARY KEY (session_id, seq)
                 );
             """)
+            columns = {row[1] for row in db.execute("PRAGMA table_info(subscriptions)")}
+            if "delivery_mode" not in columns:
+                db.execute("ALTER TABLE subscriptions ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'queue'")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
         return db
 
-    def add(self, session_id: str, thread_id: str, home: Path, member_name: str) -> None:
+    def add(self, session_id: str, thread_id: str, home: Path, member_name: str,
+            delivery_mode: str = "queue") -> None:
+        if delivery_mode not in ("queue", "exec"):
+            raise ValueError(delivery_mode)
         with self.connect() as db:
-            db.execute("INSERT INTO subscriptions(session_id, thread_id, codex_home, member_name) VALUES(?,?,?,?)",
-                       (session_id, thread_id, str(home), member_name))
+            db.execute("INSERT INTO subscriptions(session_id, thread_id, codex_home, member_name, delivery_mode) VALUES(?,?,?,?,?)",
+                       (session_id, thread_id, str(home), member_name, delivery_mode))
 
     def active(self) -> list[str]:
         with self.connect() as db:
@@ -161,6 +168,11 @@ class LocalStore:
                        (state, session_id, seq))
             db.execute("UPDATE subscriptions SET after_seq = ?, last_error = NULL WHERE session_id = ?",
                        (seq, session_id))
+
+    def defer(self, session_id: str, seq: int) -> None:
+        with self.connect() as db:
+            db.execute("UPDATE deliveries SET state = 'waiting', error = NULL WHERE session_id = ? AND seq = ?",
+                       (session_id, seq))
 
     def stop(self, session_id: str, state: str, error: str | None = None, seq: int | None = None) -> None:
         with self.connect() as db:
@@ -264,7 +276,7 @@ class Watchers:
                     delivery_id, state = self.store.reserve(session_id, seq)
                     if state in ("submitted", "injected"):
                         self.store.submitted(session_id, seq, state)
-                    elif state != "new":
+                    elif state not in ("new", "waiting"):
                         self.store.stop(session_id, "unknown", "DELIVERY_PREVIOUSLY_STARTED", seq)
                         return
                     else:
@@ -278,6 +290,9 @@ class Watchers:
                             self.store.stop(session_id, state, str(exc), seq)
                             log.error("reply delivery %s for %s seq=%s: %s", state, session_id, seq, exc)
                             return
+                        if receipt == "deferred":
+                            self.store.defer(session_id, seq)
+                            break
                         self.store.submitted(session_id, seq,
                                              "injected" if receipt == "injected" else "submitted")
                     subscription["after_seq"] = seq
@@ -291,10 +306,36 @@ store = LocalStore(state_root())
 watchers = Watchers(store)
 
 
+def _launch_exec_watcher(session_id: str) -> None:
+    directory = state_root() / "workers"
+    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    log_path = directory / f"{session_id}.log"
+    options: dict[str, Any] = {"stdin": subprocess.DEVNULL,
+                               "env": {**os.environ, "CALL_BRIDGE_STATE": str(state_root())}}
+    if os.name == "nt":
+        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+    else:
+        options["start_new_session"] = True
+    try:
+        with open(log_path, "ab") as log_file:
+            subprocess.Popen([sys.executable, "-m", "call_bridge.exec_watcher", session_id],
+                             stdout=log_file, stderr=log_file, **options)
+    except OSError as exc:
+        raise DeliveryError("LOCAL_WATCHER_UNAVAILABLE", "通話の受信プロセスを起動できません") from exc
+
+
+def _start_watch(session_id: str) -> None:
+    subscription = store.subscription(session_id)
+    if subscription["delivery_mode"] == "exec":
+        _launch_exec_watcher(session_id)
+    else:
+        watchers.start(session_id)
+
+
 @asynccontextmanager
 async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
     for session_id in store.active():
-        watchers.start(session_id)
+        _start_watch(session_id)
     try:
         yield
     finally:
@@ -331,7 +372,7 @@ async def call_open(local_id: str, local_label: str, member_name: str,
     if ctx is None:
         raise DeliveryError("PARENT_UNAVAILABLE", "親タスクを確認できません")
     thread_id, home = _parent(ctx)
-    await verify_parent(thread_id, home)
+    source = await verify_parent(thread_id, home)
     result = await _remote_tool("call_open", {
         "local_id": local_id, "local_label": local_label,
         "member_name": member_name, "purpose": purpose,
@@ -344,8 +385,9 @@ async def call_open(local_id: str, local_label: str, member_name: str,
         uuid.UUID(session_id)
     except ValueError as exc:
         raise DeliveryError("BRIDGE_RESPONSE_INVALID", "通話IDが不正です") from exc
-    store.add(session_id, thread_id, home, member_name)
-    watchers.start(session_id)
+    store.add(session_id, thread_id, home, member_name,
+              "exec" if source == "exec" else "queue")
+    _start_watch(session_id)
     return {**result, "parent_delivery": {"state": "watching", "thread_id": thread_id}}
 
 

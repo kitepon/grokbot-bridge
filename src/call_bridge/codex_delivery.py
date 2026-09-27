@@ -214,7 +214,7 @@ class CodexRPC:
                                 outcome_unknown=outcome_unknown) from exc
 
 
-async def verify_parent(thread_id: str, home: Path) -> None:
+async def verify_parent(thread_id: str, home: Path) -> str | None:
     try:
         uuid.UUID(thread_id)
     except ValueError as exc:
@@ -244,6 +244,7 @@ async def verify_parent(thread_id: str, home: Path) -> None:
         ours = owned_hooks(hooks, command, home)
         if any(not row.get("enabled") or row.get("trustStatus") not in ("trusted", "managed") for row in ours):
             raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook が有効ではありません")
+        return source if isinstance(source, str) else None
 
 
 def _pending_dir(thread_id: str) -> Path:
@@ -305,7 +306,12 @@ async def submit_reply(thread_id: str, home: Path, delivery_id: str, text: str) 
         if not isinstance(thread, dict) or thread.get("id") != thread_id:
             raise DeliveryError("CODEX_PARENT_UNAVAILABLE", "同じ Codex 環境に親タスクがありません")
         if thread.get("source") == "exec":
-            await rpc.request("thread/resume", {"threadId": thread_id})
+            try:
+                await rpc.request("thread/resume", {"threadId": thread_id})
+            except DeliveryError as exc:
+                if exc.code == "CODEX_REQUEST_REJECTED" and "already has an active writer" in str(exc):
+                    return "deferred"
+                raise
             marker = state_root() / "codex-inputs" / thread_id / "injections" / f"{delivery_id}.json"
             try:
                 _write_json_once(marker, {"thread_id": thread_id, "delivery_id": delivery_id,
