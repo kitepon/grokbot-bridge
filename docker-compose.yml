@@ -24,6 +24,8 @@ services:
       # Parent directory of the host socat socket. A recreated socket inode
       # stays visible without recreating the container.
       - ${CALL_BRIDGE_DIRECTORY_UNIX_HOST:-./dirlive}:/run/dirlive
+      # BellTeam creates this socket in its Bot integration directory.
+      - ${CALL_BRIDGE_BELLTEAM_SOCKET_HOST:-./bellteam}:/run/bellteam
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health', timeout=3)"]
       interval: 30s

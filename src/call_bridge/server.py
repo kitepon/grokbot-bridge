@@ -22,7 +22,7 @@ from starlette.responses import JSONResponse, Response
 
 from .db import CallStore
 from .deliver import dispatch_send
-from .directory import DIRECTORY_HOP_HEADER, search_directory
+from .directory import DIRECTORY_HOP_HEADER, resolve_bellteam_member, resolve_member_agent_id, search_directory
 from .wake import notify_wake
 
 log = logging.getLogger("call_bridge")
@@ -30,22 +30,24 @@ log = logging.getLogger("call_bridge")
 _INSTRUCTIONS = """
 # grokbot-bridge
 
-共有の通話直通 MCP（Grok Bot 向け）。ローカル開発エージェントと Grok Bot メンバーが
-同じサーバに MCP クライアントとして接続し、メッセージをやり取りする。
-電話番（スイッチボード）の session.opened には本文を含めない。
-local の call_send だけ session.message で本文を渡し、Marian がメンバーの本チャットへ中継する。
+共有の通話MCP。電話帳はGrokBotとBellTeamをsystemとidで区別する。
+BellTeam宛てはcall_openのmember_system="bellteam"、member_nameには名前かBot IDを指定する。
+BellTeamのBotが発信する時はlocal_system="bellteam"、local_idには自身のBot IDを指定する。
+同名が複数あればBot IDを使う。local/memberは通話内の発信者/受信者を表す。
+GrokBot宛てのsession.openedには本文を含めず、localのcall_sendをMarianが中継する。
+BellTeam宛てはcall_sendがBellTeamへ直接届ける。マリアンは通らない。
 
 ## 流れ
-1. ローカルが call_open でセッション作成（status=ringing）。サーバは設定済みならスイッチボード webhook へ session.opened を POST する（本文は含めない）
-2. 電話番が相手メンバーを起こし、session_id と MCP URL を渡す
-3. ローカルの call_send は同じ webhook へ session.message（本文、member_agent_id、reply_required）を POST する。HTTP 2xx のときだけ保存する。member の call_send は保存のみ
+1. localがcall_openでセッション作成（status=ringing）。GrokBot宛てだけスイッチボードへsession.openedをPOSTする（本文なし）
+2. GrokBot宛ては電話番が相手を起こす。BellTeam宛ては最初のcall_sendで着信する
+3. localのcall_sendは宛先の所属に応じて配送し、受付後に保存する。memberのcall_sendは保存し、BellTeam発信者へは返信を直接配送する
 4. call_hangup で終了
 
 ## ツール
 - call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（UNIX ソケット優先。定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
-- local の call_send は webhook が 2xx のとき delivery.status=delivered。webhook 未設定や失敗では保存しない。返信不要の通知だけ reply_required=false
+- local の call_send は配送先の受付成功時だけ保存する。delivery.status=deliveredは受付を表し、相手の読了を表さない。返信不要の通知だけ reply_required=false
 """
 
 Party = Literal["local", "member"]
@@ -81,6 +83,9 @@ def _session_view(sess: dict[str, Any], wake: dict[str, str]) -> dict[str, Any]:
         "local_id": sess["local_id"],
         "local_label": sess["local_label"],
         "member_name": sess["member_name"],
+        "member_system": sess.get("member_system", "grokbot"),
+        "member_id": sess.get("member_id"),
+        "local_system": sess.get("local_system", "local"),
         "purpose": sess["purpose"],
         "created_at": sess["created_at"],
         "wake": wake,
@@ -89,8 +94,9 @@ def _session_view(sess: dict[str, Any], wake: dict[str, str]) -> dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "通話セッションを開く（local→member）。status=ringing で開始。"
-        "設定されていればスイッチボードへ wake 通知（本文なし）を送る。session_id を返す。"
+        "通話セッションを開く（local→member）。BellTeam宛てはmember_system=bellteam、"
+        "BellTeam Bot発信はlocal_system=bellteamと自身のBot IDをlocal_idに指定する。"
+        "GrokBot宛てだけスイッチボードへ本文なしのwakeを送る。session_idを返す。"
     )
 )
 def call_open(
@@ -98,18 +104,35 @@ def call_open(
     local_label: str,
     member_name: str,
     purpose: str | None = None,
+    member_system: str = "grokbot",
+    local_system: str = "local",
 ) -> dict[str, Any]:
-    sess = store.open_session(local_id, local_label, member_name, purpose)
-    return _session_view(sess, notify_wake(sess))
+    if member_system not in ("grokbot", "bellteam") or local_system not in ("local", "grokbot", "bellteam"):
+        return {"error": "rejected", "detail": "invalid member_system or local_system"}
+    member_id = None
+    if member_system == "bellteam":
+        resolved = resolve_bellteam_member(member_name)
+        if not resolved.get("ok"):
+            return resolved
+        member_id = resolved["id"]
+        member_name = resolved["name"]
+    else:
+        resolved = resolve_member_agent_id(member_name)
+        if not resolved.get("ok"):
+            return resolved
+        member_id = resolved["id"]
+        member_name = resolved.get("name") or member_name
+    sess = store.open_session(local_id, local_label, member_name, purpose, member_system, member_id, local_system)
+    wake = notify_wake(sess) if member_system == "grokbot" else {"status": "skipped", "detail": "BellTeam direct delivery on call_send"}
+    return _session_view(sess, wake)
 
 
 @mcp.tool(
     description=(
-        "セッションへメッセージ送信。local はスイッチボード webhook へ "
-        "session.message（本文と member_agent_id）を送り、Marian がメンバーの本チャットへ中継する。"
+        "セッションへメッセージ送信。localはGrokBot宛てならマリアンへ、BellTeam宛てなら直接配送する。"
         "返信不要なら reply_required=false。"
         "結果の delivery.status は delivered または error。"
-        "webhook 未設定のときは保存せず失敗する。member の送信は保存のみ。"
+        "配送失敗時はlocalの本文を保存しない。memberの返信は保存し、BellTeam発信者へは直接届ける。"
     )
 )
 def call_send(session_id: str, from_party: Party, message: str,
@@ -186,12 +209,11 @@ def call_info(session_id: str) -> dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "電話帳。呼ぶたびに席プロフィール（name / title / description）を読む。"
-        "各エントリの id は席ディレクトリ名（Grok Bot の agent id）。"
+        "電話帳。GrokBotのプロフィールとBellTeamのBot一覧を要求ごとに読む。"
+        "各項目のsystemとidで所属と既存Bot IDを区別する。"
         "優先順は CALL_BRIDGE_DIRECTORY_UNIX、CALL_BRIDGE_DIRECTORY_URL、"
         "ローカル agents の profile.json、最後に directory.json。"
-        "ライブ応答は source=agent-profiles と agents_root。"
-        "directory.json は source=directory.json の予備。query で部分一致。"
+        "GrokBotのdirectory.jsonは予備。片方の取得失敗時も他方を返す。queryで部分一致。"
         "呼び出し可否フラグは無い。プロフィール更新は次の呼び出しから反映される。"
         "定期同期や編集後の push は不要。"
     )
@@ -238,7 +260,7 @@ async def health(_request: Request) -> Response:
             "ok": True,
             "service": "call-bridge",
             "status": "up",
-            "version": "0.1.0",
+            "version": "0.1.2",
         }
     )
 
@@ -269,6 +291,8 @@ async def rest_open_session(request: Request) -> Response:
     local_label = body.get("local_label") or (body.get("guest") or {}).get("label")
     member_name = body.get("member_name") or (body.get("to") or {}).get("name")
     purpose = body.get("purpose")
+    member_system = body.get("member_system", "grokbot")
+    local_system = body.get("local_system", "local")
     if not local_id or not local_label or not member_name:
         return JSONResponse(
             {
@@ -278,9 +302,10 @@ async def rest_open_session(request: Request) -> Response:
             },
             status_code=400,
         )
-    sess = store.open_session(str(local_id), str(local_label), str(member_name), purpose)
-    wake = await asyncio.to_thread(notify_wake, sess)
-    return JSONResponse({"ok": True, **_session_view(sess, wake)}, status_code=201)
+    result = await asyncio.to_thread(call_open, str(local_id), str(local_label), str(member_name), purpose, member_system, local_system)
+    if result.get("error"):
+        return JSONResponse({"ok": False, **result}, status_code=_delivery_http_status(str(result["error"])))
+    return JSONResponse({"ok": True, **result}, status_code=201)
 
 
 @mcp.custom_route("/v0/sessions/{session_id}/messages", methods=["POST"])

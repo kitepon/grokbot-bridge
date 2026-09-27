@@ -58,6 +58,9 @@ class CallStore:
                     local_id TEXT NOT NULL,
                     local_label TEXT NOT NULL,
                     member_name TEXT NOT NULL,
+                    member_system TEXT NOT NULL DEFAULT 'grokbot',
+                    member_id TEXT,
+                    local_system TEXT NOT NULL DEFAULT 'local',
                     purpose TEXT,
                     status TEXT NOT NULL,
                     created_at TEXT NOT NULL,
@@ -84,6 +87,13 @@ class CallStore:
                 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
                 """
             )
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
+            if "member_system" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN member_system TEXT NOT NULL DEFAULT 'grokbot'")
+            if "member_id" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN member_id TEXT")
+            if "local_system" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN local_system TEXT NOT NULL DEFAULT 'local'")
 
     def open_session(
         self,
@@ -91,6 +101,9 @@ class CallStore:
         local_label: str,
         member_name: str,
         purpose: str | None = None,
+        member_system: str = "grokbot",
+        member_id: str | None = None,
+        local_system: str = "local",
     ) -> dict[str, Any]:
         session_id = str(uuid.uuid4())
         now = _utcnow()
@@ -98,11 +111,11 @@ class CallStore:
             conn.execute(
                 """
                 INSERT INTO sessions (
-                    session_id, local_id, local_label, member_name, purpose,
+                    session_id, local_id, local_label, member_name, member_system, member_id, local_system, purpose,
                     status, created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, 'ringing', ?, ?)
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ringing', ?, ?)
                 """,
-                (session_id, local_id, local_label, member_name, purpose, now, now),
+                (session_id, local_id, local_label, member_name, member_system, member_id, local_system, purpose, now, now),
             )
         return self.get_session(session_id)  # type: ignore[return-value]
 

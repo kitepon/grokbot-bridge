@@ -18,6 +18,7 @@ from typing import Any
 
 from .db import CallStore
 from .directory import resolve_member_agent_id
+from .bellteam import BellTeamError, send_delivery
 from .wake import notify_message
 
 log = logging.getLogger("call_bridge.deliver")
@@ -47,7 +48,23 @@ def dispatch_send(
     if from_party not in ("local", "member"):
         raise ValueError("from_party must be 'local' or 'member'")
     if from_party != "local":
-        return store.send_message(session_id, from_party, message, reply_required)
+        stored = store.send_message(session_id, from_party, message, reply_required)
+        sess = store.get_session(session_id)
+        if sess and sess.get("local_system") == "bellteam":
+            try:
+                send_delivery({
+                    "schema": "call-bridge.delivery.v1", "event": "session.reply",
+                    "session_id": session_id, "seq": stored["seq"],
+                    "target_id": sess["local_id"],
+                    "source_system": sess.get("member_system") or "grokbot",
+                    "source_id": sess.get("member_id") or sess["member_name"],
+                    "source_label": sess["member_name"],
+                    "message": message, "reply_required": reply_required,
+                })
+                stored["delivery"] = {"status": "delivered", "detail": "BellTeam accepted"}
+            except BellTeamError as exc:
+                stored["delivery"] = {"status": "error", "detail": str(exc)}
+        return stored
 
     sess = store.get_session(session_id)
     if sess is None:
@@ -55,7 +72,25 @@ def dispatch_send(
     if sess["status"] == "hungup":
         raise RuntimeError("session already hung up")
 
-    resolved = resolve_member_agent_id(str(sess.get("member_name") or ""))
+    if sess.get("member_system") == "bellteam":
+        member_id = sess.get("member_id")
+        if not member_id:
+            return _delivery_failure("target_not_found", "BellTeam member id missing", "target_not_found")
+        try:
+            send_delivery({
+                "schema": "call-bridge.delivery.v1", "event": "session.message",
+                "session_id": session_id, "target_id": member_id,
+                "source_system": sess.get("local_system") or "local",
+                "source_id": sess["local_id"], "source_label": sess["local_label"],
+                "message": message, "reply_required": reply_required,
+            })
+        except BellTeamError as exc:
+            return _delivery_failure("error", str(exc), "error")
+        stored = store.send_message(session_id, "local", message, reply_required)
+        stored["delivery"] = {"status": "delivered", "detail": "BellTeam accepted"}
+        return stored
+
+    resolved = {"ok": True, "id": sess["member_id"]} if sess.get("member_id") else resolve_member_agent_id(str(sess.get("member_name") or ""))
     if not resolved.get("ok"):
         error = str(resolved.get("error") or "error")
         detail = str(resolved.get("detail") or "")

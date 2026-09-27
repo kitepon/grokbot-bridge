@@ -1,8 +1,22 @@
 # grokbot-bridge
 
+## BellTeamとの直通
+
+電話帳はGrokBotのプロフィールとBellTeamのBot一覧を要求ごとに合わせて返す。各項目の`system`と`id`で宛先を区別する。BellTeam側のUNIXソケットを`CALL_BRIDGE_BELLTEAM_UNIX`に設定し、その親ディレクトリをコンテナの`/run/bellteam`へマウントする。BellTeam側には`BELLTEAM_CALL_BRIDGE_SOCKET`を設定する。BellTeam宛ての本文とBellTeam発信者宛ての返信はこのソケットを通り、マリアンは通らない。
+
+BellTeam宛ての開始例。`member_name`は名前またはBot IDを指定できる。同名のBotがいる場合はIDを指定する。BellTeamのBotが発信する場合は`local_system="bellteam"`と自身のBot IDを`local_id`に指定する。
+
+```json
+{"local_id":"caller-id","local_label":"呼び出し元","member_name":"bot-xxxxxxxx","member_system":"bellteam","local_system":"local"}
+```
+
+`call_open`のあと`call_send(session_id, from_party="local", message="...")`で着信させる。BellTeam宛ての`call_open`だけでは相手Botを起こさない。返信は相手Botが同じ`session_id`へ`from_party="member"`で送る。BellTeam発信の通話ではブリッジが返信を発信Botへ渡す。GrokBot発信者と一般のローカルAIは`call_poll(party="local")`で返信を読む。ローカルCodexの既存の自動配送はそのまま使える。
+
+GrokBot宛ての通話は従来どおりマリアンのWebhookで取り次ぐ。GrokBotのAIがレート制限中でも、電話帳、BellTeam宛ての直通、保存済み返信の取得は独立して動く。Webhookの2xxとBellTeamの受付は、相手Botの読了を示さない。
+
 Shared **phone-call bridge** MCP for **[Grok Bot](https://grok.x.ai/)** agent meshes (streamable HTTP).
 
-A local coding agent (Claude Code, Codex, Cursor, …) asks Marian (the Grok Bot switchboard) to **wake** a teammate. A local `call_send` posts `session.message` — including the text — to Marian's webhook so she can relay it into the member's main chat. `session.opened` still has no message body. Member replies stay on this MCP.
+A local coding agent (Claude Code, Codex, Cursor, …) calls either system through this MCP. Calls to GrokBot use Marian's webhook. Calls to BellTeam use its UNIX socket. Member replies remain in the call history; replies to a BellTeam caller are also delivered to that Bot.
 
 ## Why
 
@@ -126,7 +140,7 @@ Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 
 ## Phone directory
 
-Clients only call `call_directory` (or `GET /v0/directory`). The server builds the book **on that request** from Grok Bot seat profiles. Changing a seat’s name, title, or description shows up on the **next** call. There is no periodic sync, no Marian routine, and no operator push after a role edit.
+Clients only call `call_directory` (or `GET /v0/directory`). The server reads Grok Bot seat profiles and, when configured, BellTeam's directory **on that request**. Changing a profile shows up on the **next** call. Each member has `system` (`grokbot` or `bellteam`) and its existing `id`. One directory can remain available when the other fails.
 
 Source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag. Each member built from a profile also includes `id`: the seat directory name, which is the Grok Bot agent id (`profile.json` itself has no id field). Local `call_send` resolves `member_name` to that id and includes it as `member_agent_id` on `session.message`. A remote directory passes `id` or `agentId` through. A `directory.json` entry without an id cannot be relayed.
 
@@ -222,7 +236,9 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | `CALL_BRIDGE_DIRECTORY_URL_AUTH` | _(unset)_ | Bearer token sent on the unix and URL GETs (raw token or `Bearer …`) |
 | `CALL_BRIDGE_DIRECTORY_URL_TIMEOUT` | `2.5` | Seconds for each remote GET |
 | `CALL_BRIDGE_AGENTS_ROOT` | `/home/box/agent-data/agents` if that directory exists and the env var is unset | Local `profile.json` tree, used only when configured remotes fail (or none are set). When set, only that path is used |
-| `CALL_BRIDGE_DIRECTORY` | `./directory.json` | Last-resort snapshot file |
+| `CALL_BRIDGE_DIRECTORY` | `./directory.json` | Last-resort GrokBot snapshot file |
+| `CALL_BRIDGE_BELLTEAM_SOCKET_HOST` | `./bellteam` | Host directory mounted at `/run/bellteam` in Compose |
+| `CALL_BRIDGE_BELLTEAM_UNIX` | _(unset)_ | BellTeam socket inside the container, e.g. `/run/bellteam/bellteam.sock` |
 | `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard webhook. `call_open` posts `session.opened` (no body; an empty URL skips that POST). Local `call_send` posts `session.message` (the text, `reply_required`, and `member_agent_id`; an empty URL fails the send and does not store). A down directory unix socket posts `bridge.link_down` at most once per 60 seconds |
 | `CALL_BRIDGE_WAKE_WEBHOOK_AUTH` | _(unset)_ | `Authorization` header for those POSTs. Never placed in the payload |
 | `CALL_BRIDGE_PUBLIC_MCP_URL` | `https://call.kitepon.dev/mcp` | MCP URL included in `session.opened` and `session.message` |

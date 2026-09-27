@@ -33,6 +33,7 @@ import urllib.request
 from pathlib import Path
 from typing import Any
 
+from .bellteam import BellTeamError, fetch_directory as fetch_bellteam_directory, socket_path as bellteam_socket_path
 from .wake import LINK_DOWN_NOTE, notify_link_down
 
 log = logging.getLogger("call_bridge.directory")
@@ -429,7 +430,7 @@ def _note_unix_link_down(book: dict[str, Any], detail: str | None) -> dict[str, 
     return book
 
 
-def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
+def _load_grok_directory(*, skip_url: bool = False) -> dict[str, Any]:
     """Build the phone book for this request.
 
     ``skip_url`` is set when this process is already answering a directory GET
@@ -465,6 +466,37 @@ def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
     return _note_unix_link_down(_unavailable(unix_error, url_error), unix_down)
 
 
+def load_directory(*, skip_url: bool = False) -> dict[str, Any]:
+    """Return GrokBot and BellTeam members, keeping either available side usable."""
+    grok = _load_grok_directory(skip_url=skip_url)
+    grok_members = [{**item, "system": "grokbot"} for item in grok.get("members", [])] if grok.get("ok") else []
+    bell_members: list[dict[str, Any]] = []
+    bell_error: str | None = None
+    if bellteam_socket_path():
+        try:
+            bell_members = fetch_bellteam_directory()
+        except BellTeamError as exc:
+            bell_error = str(exc)
+    if not grok.get("ok") and not bell_members:
+        if bell_error:
+            grok["bellteam_error"] = bell_error
+        return grok
+    if not bellteam_socket_path():
+        return {**grok, "members": grok_members, "count": len(grok_members)}
+    out = {
+        "ok": True, "schema": "call-bridge.directory.v1", "source": "combined",
+        "members": grok_members + bell_members,
+        "count": len(grok_members) + len(bell_members),
+    }
+    if not grok.get("ok"):
+        out["grokbot_error"] = str(grok.get("detail") or grok.get("error"))
+    elif grok.get("note"):
+        out["note"] = grok["note"]
+    if bell_error:
+        out["bellteam_error"] = bell_error
+    return out
+
+
 def _agent_id_of(member: dict[str, Any]) -> str:
     """Agent id carried on a directory entry.
 
@@ -496,7 +528,7 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
     ``directory.json``). A snapshot entry with no id cannot be delivered.
     """
     name = (member_name or "").strip()
-    book = load_directory()
+    book = _load_grok_directory()
     if not book.get("ok"):
         detail = str(book.get("detail") or book.get("error") or "directory unavailable")
         return _resolve_failure(book, "error", f"directory unavailable: {detail}")
@@ -505,6 +537,7 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
         return _resolve_failure(book, "target_not_found", "member name is empty")
 
     ids: list[str] = []
+    names: dict[str, str] = {}
     found_name = False
     for member in members:
         if str(member.get("name") or "").strip() != name:
@@ -513,8 +546,9 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
         agent_id = _agent_id_of(member)
         if agent_id and agent_id not in ids:
             ids.append(agent_id)
+            names[agent_id] = str(member.get("name") or "")
     if len(ids) == 1:
-        return {"ok": True, "id": ids[0]}
+        return {"ok": True, "id": ids[0], "name": names[ids[0]]}
     if len(ids) > 1:
         return _resolve_failure(book, "target_not_found", f"multiple agent ids for {name}")
     if found_name:
@@ -524,8 +558,24 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
 
     for member in members:
         if _agent_id_of(member) == name:
-            return {"ok": True, "id": name}
+            return {"ok": True, "id": name, "name": str(member.get("name") or name)}
     return _resolve_failure(book, "target_not_found", f"no directory entry for {name}")
+
+
+def resolve_bellteam_member(value: str) -> dict[str, Any]:
+    """Resolve one BellTeam member by exact ID or unique exact name."""
+    if not bellteam_socket_path():
+        return {"ok": False, "error": "unavailable", "detail": "BellTeam socket not configured"}
+    try:
+        members = fetch_bellteam_directory()
+    except BellTeamError as exc:
+        return {"ok": False, "error": "unavailable", "detail": str(exc)}
+    matches = [m for m in members if m.get("id") == value]
+    if not matches:
+        matches = [m for m in members if m.get("name") == value]
+    if len(matches) != 1:
+        return {"ok": False, "error": "target_not_found", "detail": f"BellTeam member is missing or ambiguous: {value}"}
+    return {"ok": True, "id": matches[0]["id"], "name": matches[0]["name"], "system": "bellteam"}
 
 
 def search_directory(query: str | None = None, *, skip_url: bool = False) -> dict[str, Any]:
@@ -537,7 +587,7 @@ def search_directory(query: str | None = None, *, skip_url: bool = False) -> dic
     if q:
         filtered = []
         for m in members:
-            blob = " ".join(str(m.get(k) or "") for k in ("name", "title", "role")).lower()
+            blob = " ".join(str(m.get(k) or "") for k in ("system", "id", "name", "title", "role")).lower()
             if q in blob:
                 filtered.append(m)
         members = filtered
