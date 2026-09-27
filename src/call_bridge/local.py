@@ -299,7 +299,7 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 
 
 mcp = FastMCP("grokbot-bridge-local", instructions=(
-    "call_open は親 Codex のタスクへ GrokBot の返信を自動配送します。"
+    "call_open は親 Codex のタスクへ GrokBot または BellTeam の返信を自動配送します。"
     "親は call_poll や待機ループを実行せず、作業を続けるかターンを終えてください。"
 ), lifespan=_lifespan)
 
@@ -319,9 +319,12 @@ async def call_directory(query: str | None = None) -> dict[str, Any]:
     return await _remote_tool("call_directory", {"query": query})
 
 
-@mcp.tool(description="GrokBot メンバーとの通話を開き、返信を親 Codex へ自動配送")
+@mcp.tool(description="GrokBot または BellTeam のメンバーとの通話を開き、返信を親 Codex へ自動配送")
 async def call_open(local_id: str, local_label: str, member_name: str,
-                    purpose: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
+                    purpose: str | None = None,
+                    member_system: Literal["grokbot", "bellteam"] = "grokbot",
+                    local_system: Literal["local", "grokbot", "bellteam"] = "local",
+                    ctx: Context | None = None) -> dict[str, Any]:
     if ctx is None:
         raise DeliveryError("PARENT_UNAVAILABLE", "親タスクを確認できません")
     thread_id, home = _parent(ctx)
@@ -329,6 +332,7 @@ async def call_open(local_id: str, local_label: str, member_name: str,
     result = await _remote_tool("call_open", {
         "local_id": local_id, "local_label": local_label,
         "member_name": member_name, "purpose": purpose,
+        "member_system": member_system, "local_system": local_system,
     })
     session_id = result.get("session_id")
     if not isinstance(session_id, str):

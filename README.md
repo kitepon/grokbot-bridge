@@ -59,6 +59,8 @@ REST の `POST /v0/sessions/{session_id}/messages` でも本文に
 ### Codex 親への返信自動配送
 
 Codex から通話する端末では、ローカル MCP を登録すると `call_open` が親タスクを識別する。
+ローカル MCP でも `call_open(member_system="bellteam")` でBellTeam宛てを選べる。
+`member_system`の既定は`grokbot`、`local_system`の既定は`local`で、両方とも遠隔MCPへ渡す。
 ローカル MCP が通話の返信を裏で取得し、Codex の公式キューへ一通ずつ渡す。
 親AI自身が `call_poll` を繰り返す必要はない。親のターンが進行中なら
 `PostToolUse`／`Stop` hook が返信を同じターンへ差し込み、ターン終了後なら

@@ -91,6 +91,42 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         )
         self.assertEqual(local._parent(ctx)[0], thread_id)
 
+    async def test_call_open_forwards_systems_to_remote_mcp(self):
+        thread_id = str(uuid.uuid4())
+        session_id = str(uuid.uuid4())
+        tool = next(item for item in await local.mcp.list_tools() if item.name == "call_open")
+        self.assertIn("member_system", tool.inputSchema["properties"])
+        self.assertIn("local_system", tool.inputSchema["properties"])
+        with patch.object(local, "_parent", return_value=(thread_id, Path(self.temp.name))), \
+             patch.object(local, "verify_parent", new_callable=AsyncMock), \
+             patch.object(local, "_remote_tool", new_callable=AsyncMock,
+                          return_value={"session_id": session_id, "status": "ringing"}) as remote, \
+             patch.object(local.store, "add") as add, \
+             patch.object(local.watchers, "start") as start:
+            result = await local.call_open(
+                "caller", "発信者", "bot-1", "相談", "bellteam", "grokbot", ctx=object())
+
+        remote.assert_awaited_once_with("call_open", {
+            "local_id": "caller", "local_label": "発信者", "member_name": "bot-1",
+            "purpose": "相談", "member_system": "bellteam", "local_system": "grokbot",
+        })
+        add.assert_called_once_with(session_id, thread_id, Path(self.temp.name), "bot-1")
+        start.assert_called_once_with(session_id)
+        self.assertEqual(result["parent_delivery"]["state"], "watching")
+
+    async def test_call_open_keeps_grokbot_and_local_defaults(self):
+        session_id = str(uuid.uuid4())
+        with patch.object(local, "_parent", return_value=(str(uuid.uuid4()), Path(self.temp.name))), \
+             patch.object(local, "verify_parent", new_callable=AsyncMock), \
+             patch.object(local, "_remote_tool", new_callable=AsyncMock,
+                          return_value={"session_id": session_id}) as remote, \
+             patch.object(local.store, "add"), \
+             patch.object(local.watchers, "start"):
+            await local.call_open("caller", "発信者", "ラピ", ctx=object())
+
+        self.assertEqual(remote.await_args.args[1]["member_system"], "grokbot")
+        self.assertEqual(remote.await_args.args[1]["local_system"], "local")
+
     async def test_only_one_process_owns_a_call_watcher(self):
         session_id = str(uuid.uuid4())
         first = local._claim_session(session_id)
