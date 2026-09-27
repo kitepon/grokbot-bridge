@@ -42,6 +42,17 @@ def codex_binary() -> str:
     return binary
 
 
+def _same_pid_namespace(pid: int) -> bool:
+    if sys.platform != "linux":
+        return True
+    try:
+        return os.stat(f"/proc/{pid}/ns/pid").st_ino == os.stat("/proc/self/ns/pid").st_ino
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise DeliveryError("CODEX_PROCESS_UNAVAILABLE", "Codex の PID 名前空間を確認できません") from exc
+
+
 def codex_processes() -> list[dict[str, int | float]]:
     """Codex 本体の PID と生成時刻を保存し、PID 再利用と区別する。"""
     processes = []
@@ -50,6 +61,8 @@ def codex_processes() -> list[dict[str, int | float]]:
             name = (process.info["name"] or "").lower()
             executable = Path(process.info["exe"] or "").name.lower()
             if name not in ("codex", "codex.exe") and executable not in ("codex", "codex.exe"):
+                continue
+            if not _same_pid_namespace(process.pid):
                 continue
             created = process.info["create_time"]
             if not isinstance(created, (int, float)):
@@ -77,7 +90,8 @@ def _process_matches(process: psutil.Process, stale: list[dict[str, int | float]
 
 def _process_alive(row: dict[str, int | float]) -> bool:
     try:
-        return _process_matches(psutil.Process(row["pid"]), [row])
+        process = psutil.Process(row["pid"])
+        return _same_pid_namespace(process.pid) and _process_matches(process, [row])
     except psutil.NoSuchProcess:
         return False
     except psutil.Error as exc:

@@ -282,6 +282,16 @@ class HookTest(unittest.IsolatedAsyncioTestCase):
 
 
 class ProcessTest(unittest.IsolatedAsyncioTestCase):
+    async def test_codex_in_other_pid_namespace_does_not_require_restart(self):
+        current = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
+        foreign = SimpleNamespace(pid=current["pid"], info={
+            "name": "codex", "exe": "/usr/bin/codex", "create_time": current["create_time"],
+        })
+        with patch.object(codex_delivery, "_same_pid_namespace", return_value=False), \
+             patch.object(codex_delivery.psutil, "process_iter", return_value=[foreign]):
+            self.assertEqual(codex_delivery.codex_processes(), [])
+            self.assertFalse(codex_delivery.restart_required({"stale_processes": [current]}))
+
     async def test_preexisting_codex_process_requires_restart(self):
         current = {"pid": os.getpid(), "create_time": psutil.Process().create_time()}
         config = {"stale_processes": [current]}
