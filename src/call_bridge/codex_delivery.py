@@ -1,4 +1,4 @@
-"""GrokBot の返信を Codex のローカルキューへ配送する。"""
+"""通話の返信を Codex のローカルキューへ配送する。"""
 
 from __future__ import annotations
 
@@ -515,13 +515,8 @@ async def claim_exec_replies(event: dict[str, Any]) -> tuple[dict[str, Any], lis
                 _delivery_id, state = store.reserve(session_id, seq)
                 if state in ("submitted", "injected"):
                     store.submitted(session_id, seq, state)
-                elif state == "new":
-                    texts.append(f"通話の返信です。session_id={session_id} seq={seq} "
-                                 f"member={row['member_name']}\n\n{body}")
-                    reserved.append((session_id, seq))
-                elif state == "waiting":
-                    texts.append(f"通話の返信です。session_id={session_id} seq={seq} "
-                                 f"member={row['member_name']}\n\n{body}")
+                elif state in ("new", "waiting"):
+                    texts.append(local.reply_text(row, seq, body))
                     reserved.append((session_id, seq))
                 else:
                     store.stop(session_id, "unknown", "DELIVERY_PREVIOUSLY_STARTED", seq)

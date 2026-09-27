@@ -136,7 +136,8 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
             "local_id": "caller", "local_label": "発信者", "member_name": "bot-1",
             "purpose": "相談", "member_system": "bellteam", "local_system": "grokbot",
         })
-        add.assert_called_once_with(session_id, thread_id, Path(self.temp.name), "bot-1", "queue")
+        add.assert_called_once_with(session_id, thread_id, Path(self.temp.name), "bot-1", "queue",
+                                    "bellteam")
         start.assert_called_once_with(session_id)
         self.assertEqual(result["parent_delivery"]["state"], "watching")
 
@@ -198,6 +199,47 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(remote.await_args.args[1]["member_system"], "grokbot")
         self.assertEqual(remote.await_args.args[1]["local_system"], "local")
+
+    async def test_queue_reply_names_the_member_system(self):
+        store = local.LocalStore(Path(self.temp.name))
+        headers = {}
+        for system, expected in (("grokbot", "GrokBot の返信です。"), ("bellteam", "BellTeam の返信です。"),
+                                 (None, "通話の返信です。")):
+            session_id = str(uuid.uuid4())
+            store.add(session_id, str(uuid.uuid4()), Path(self.temp.name), "相手", member_system=system)
+            send = AsyncMock(return_value="queue-id")
+            with patch.object(local.httpx, "AsyncClient", return_value=FakeHTTP()), \
+                 patch.object(local, "submit_reply", send), \
+                 patch.object(local, "_POLL_SECONDS", 0):
+                await local.Watchers(store).watch(session_id)
+            headers[system] = send.await_args_list[0].args[3]
+            self.assertTrue(headers[system].startswith(expected), headers[system])
+        self.assertNotIn("GrokBot", headers["bellteam"])
+
+    async def test_exec_reply_names_bellteam_member(self):
+        thread_id, session_id = str(uuid.uuid4()), str(uuid.uuid4())
+        store = local.LocalStore(Path(self.temp.name))
+        store.add(session_id, thread_id, codex_delivery.codex_home(), "トロニー", "exec", "bellteam")
+        event = {"session_id": thread_id, "turn_id": "turn-1",
+                 "hook_event_name": "UserPromptSubmit", "prompt": "再開"}
+        with patch.object(local.httpx, "AsyncClient", return_value=FakeHTTP()):
+            output, _reserved, _closed = await codex_delivery.claim_exec_replies(event)
+        self.assertTrue(output["hookSpecificOutput"]["additionalContext"].startswith("BellTeam の返信です。"))
+
+    async def test_store_adds_member_system_to_existing_database(self):
+        path = Path(self.temp.name) / "local.sqlite"
+        import sqlite3
+        with sqlite3.connect(path) as db:
+            db.execute("CREATE TABLE subscriptions (session_id TEXT PRIMARY KEY, thread_id TEXT NOT NULL, "
+                       "codex_home TEXT NOT NULL, member_name TEXT NOT NULL, after_seq INTEGER NOT NULL DEFAULT 0, "
+                       "state TEXT NOT NULL DEFAULT 'active', last_error TEXT, "
+                       "delivery_mode TEXT NOT NULL DEFAULT 'queue')")
+            db.execute("INSERT INTO subscriptions(session_id, thread_id, codex_home, member_name) "
+                       "VALUES('old', 't', 'h', 'ラピ')")
+        store = local.LocalStore(Path(self.temp.name))
+        self.assertIsNone(store.subscription("old")["member_system"])
+        with self.assertRaises(ValueError):
+            store.add(str(uuid.uuid4()), "t", Path(self.temp.name), "x", member_system="other")
 
     async def test_only_one_process_owns_a_call_watcher(self):
         session_id = str(uuid.uuid4())

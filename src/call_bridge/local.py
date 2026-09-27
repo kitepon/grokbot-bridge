@@ -104,6 +104,17 @@ async def _remote_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     raise DeliveryError("BRIDGE_RESPONSE_INVALID", f"{name} の応答を認識できません")
 
 
+_REPLY_LABELS = {"grokbot": "GrokBot", "bellteam": "BellTeam"}
+
+
+def reply_text(subscription: dict[str, Any], seq: int, body: str) -> str:
+    """返信元の所属を見出しに付ける。所属を記録する前の通話は所属を名乗らない。"""
+    label = _REPLY_LABELS.get(subscription.get("member_system"))
+    head = f"{label} の返信です。" if label else "通話の返信です。"
+    return (f"{head}session_id={subscription['session_id']} seq={seq} "
+            f"member={subscription['member_name']}\n\n{body}")
+
+
 class LocalStore:
     def __init__(self, root: Path):
         self.path = root / "local.sqlite"
@@ -124,6 +135,8 @@ class LocalStore:
             columns = {row[1] for row in db.execute("PRAGMA table_info(subscriptions)")}
             if "delivery_mode" not in columns:
                 db.execute("ALTER TABLE subscriptions ADD COLUMN delivery_mode TEXT NOT NULL DEFAULT 'queue'")
+            if "member_system" not in columns:
+                db.execute("ALTER TABLE subscriptions ADD COLUMN member_system TEXT")
 
     def connect(self) -> sqlite3.Connection:
         db = sqlite3.connect(self.path)
@@ -131,12 +144,15 @@ class LocalStore:
         return db
 
     def add(self, session_id: str, thread_id: str, home: Path, member_name: str,
-            delivery_mode: str = "queue") -> None:
+            delivery_mode: str = "queue", member_system: str | None = None) -> None:
         if delivery_mode not in ("queue", "exec"):
             raise ValueError(delivery_mode)
+        if member_system not in (None, *_REPLY_LABELS):
+            raise ValueError(member_system)
         with self.connect() as db:
-            db.execute("INSERT INTO subscriptions(session_id, thread_id, codex_home, member_name, delivery_mode) VALUES(?,?,?,?,?)",
-                       (session_id, thread_id, str(home), member_name, delivery_mode))
+            db.execute("INSERT INTO subscriptions(session_id, thread_id, codex_home, member_name, delivery_mode, "
+                       "member_system) VALUES(?,?,?,?,?,?)",
+                       (session_id, thread_id, str(home), member_name, delivery_mode, member_system))
 
     def active(self) -> list[str]:
         with self.connect() as db:
@@ -286,8 +302,7 @@ class Watchers:
                         self.store.stop(session_id, "unknown", "DELIVERY_PREVIOUSLY_STARTED", seq)
                         return
                     else:
-                        text = (f"GrokBot の返信です。session_id={session_id} seq={seq} "
-                                f"member={subscription['member_name']}\n\n{body}")
+                        text = reply_text(subscription, seq, body)
                         try:
                             receipt = await submit_reply(subscription["thread_id"], Path(subscription["codex_home"]),
                                                          delivery_id, text)
@@ -392,7 +407,7 @@ async def call_open(local_id: str, local_label: str, member_name: str,
     except ValueError as exc:
         raise DeliveryError("BRIDGE_RESPONSE_INVALID", "通話IDが不正です") from exc
     store.add(session_id, thread_id, home, member_name,
-              "exec" if source == "exec" else "queue")
+              "exec" if source == "exec" else "queue", member_system)
     _start_watch(session_id)
     state = "awaiting_parent_prompt" if source == "exec" else "watching"
     return {**result, "parent_delivery": {"state": state, "thread_id": thread_id}}
