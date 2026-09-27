@@ -70,6 +70,17 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(store.status(session_id)["state"], "closed")
         self.assertEqual(store.status(session_id)["after_seq"], 4)
 
+    async def test_exec_reply_is_reported_as_persisted_injection(self):
+        store = local.LocalStore(Path(self.temp.name))
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), Path(self.temp.name), "ラピ")
+        with patch.object(local.httpx, "AsyncClient", return_value=FakeHTTP()), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="injected")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual([row["state"] for row in store.status(session_id)["deliveries"]],
+                         ["injected", "injected"])
+
     async def test_uncertain_queue_result_stops_without_resending(self):
         store = local.LocalStore(Path(self.temp.name))
         session_id = str(uuid.uuid4())
@@ -175,6 +186,37 @@ class HookTest(unittest.IsolatedAsyncioTestCase):
         self.env = patch.dict(os.environ, {"CALL_BRIDGE_STATE": self.temp.name})
         self.env.start()
         self.addCleanup(self.env.stop)
+
+    async def test_exec_reply_injects_once_into_persisted_history(self):
+        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
+        calls = []
+
+        class FakeRPC:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                pass
+
+            async def request(self, method, params):
+                calls.append((method, params))
+                if method == "thread/read":
+                    return {"thread": {"id": thread_id, "source": "exec"}}
+                return {}
+
+        with patch.object(codex_delivery, "CodexRPC", FakeRPC):
+            self.assertEqual(await codex_delivery.submit_reply(
+                thread_id, Path(self.temp.name), delivery_id, "返信本文"), "injected")
+            with self.assertRaisesRegex(codex_delivery.DeliveryError, "DELIVERY_ALREADY_STARTED"):
+                await codex_delivery.submit_reply(
+                    thread_id, Path(self.temp.name), delivery_id, "返信本文")
+        self.assertEqual([method for method, _ in calls[:3]],
+                         ["thread/read", "thread/resume", "thread/inject_items"])
+        self.assertEqual(calls[2][1]["items"][0]["content"][0]["text"], "返信本文")
+        self.assertFalse((codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json").exists())
 
     async def test_hook_claims_only_its_own_queued_reply(self):
         thread_id = str(uuid.uuid4())

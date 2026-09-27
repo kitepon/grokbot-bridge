@@ -153,10 +153,12 @@ class LocalStore:
                 return delivery_id, "new"
             return delivery_id, row["state"]
 
-    def submitted(self, session_id: str, seq: int) -> None:
+    def submitted(self, session_id: str, seq: int, state: str = "submitted") -> None:
+        if state not in ("submitted", "injected"):
+            raise ValueError(state)
         with self.connect() as db:
-            db.execute("UPDATE deliveries SET state = 'submitted' WHERE session_id = ? AND seq = ?",
-                       (session_id, seq))
+            db.execute("UPDATE deliveries SET state = ? WHERE session_id = ? AND seq = ?",
+                       (state, session_id, seq))
             db.execute("UPDATE subscriptions SET after_seq = ?, last_error = NULL WHERE session_id = ?",
                        (seq, session_id))
 
@@ -260,8 +262,8 @@ class Watchers:
                         self.store.stop(session_id, "failed", "BRIDGE_MESSAGE_INVALID")
                         return
                     delivery_id, state = self.store.reserve(session_id, seq)
-                    if state == "submitted":
-                        self.store.submitted(session_id, seq)
+                    if state in ("submitted", "injected"):
+                        self.store.submitted(session_id, seq, state)
                     elif state != "new":
                         self.store.stop(session_id, "unknown", "DELIVERY_PREVIOUSLY_STARTED", seq)
                         return
@@ -269,14 +271,15 @@ class Watchers:
                         text = (f"GrokBot の返信です。session_id={session_id} seq={seq} "
                                 f"member={subscription['member_name']}\n\n{body}")
                         try:
-                            await submit_reply(subscription["thread_id"], Path(subscription["codex_home"]),
-                                               delivery_id, text)
+                            receipt = await submit_reply(subscription["thread_id"], Path(subscription["codex_home"]),
+                                                         delivery_id, text)
                         except DeliveryError as exc:
                             state = "unknown" if exc.outcome_unknown else "failed"
                             self.store.stop(session_id, state, str(exc), seq)
                             log.error("reply delivery %s for %s seq=%s: %s", state, session_id, seq, exc)
                             return
-                        self.store.submitted(session_id, seq)
+                        self.store.submitted(session_id, seq,
+                                             "injected" if receipt == "injected" else "submitted")
                     subscription["after_seq"] = seq
                 if value.get("status") == "hungup":
                     self.store.stop(session_id, "closed")

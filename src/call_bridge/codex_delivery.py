@@ -187,6 +187,7 @@ class CodexRPC:
         self.sequence += 1
         request_id = self.sequence
         body = json.dumps({"id": request_id, "method": method, "params": params}).encode() + b"\n"
+        outcome_unknown = method in ("thread/queue/add", "thread/inject_items")
         try:
             self.process.stdin.write(body)
             await self.process.stdin.drain()
@@ -194,7 +195,7 @@ class CodexRPC:
                 line = await asyncio.wait_for(self.process.stdout.readline(), self.timeout)
                 if not line:
                     raise DeliveryError("CODEX_TRANSPORT_CLOSED", "Codex の接続が終了しました",
-                                        outcome_unknown=method == "thread/queue/add")
+                                        outcome_unknown=outcome_unknown)
                 response = json.loads(line)
                 if response.get("id") != request_id:
                     continue
@@ -203,14 +204,14 @@ class CodexRPC:
                 result = response.get("result")
                 if not isinstance(result, dict):
                     raise DeliveryError("CODEX_RESPONSE_INVALID", "Codex の応答を認識できません",
-                                        outcome_unknown=method == "thread/queue/add")
+                                        outcome_unknown=outcome_unknown)
                 return result
         except asyncio.TimeoutError as exc:
             raise DeliveryError("CODEX_REQUEST_TIMEOUT", f"{method} が時間内に返りませんでした",
-                                outcome_unknown=method == "thread/queue/add") from exc
+                                outcome_unknown=outcome_unknown) from exc
         except (BrokenPipeError, ConnectionError, json.JSONDecodeError) as exc:
             raise DeliveryError("CODEX_TRANSPORT_FAILED", "Codex との通信が失敗しました",
-                                outcome_unknown=method == "thread/queue/add") from exc
+                                outcome_unknown=outcome_unknown) from exc
 
 
 async def verify_parent(thread_id: str, home: Path) -> None:
@@ -298,6 +299,28 @@ def hook_delivery_state(thread_id: str, delivery_id: str) -> str | None:
 
 
 async def submit_reply(thread_id: str, home: Path, delivery_id: str, text: str) -> str:
+    async with CodexRPC(home) as rpc:
+        read = await rpc.request("thread/read", {"threadId": thread_id, "includeTurns": False})
+        thread = read.get("thread")
+        if not isinstance(thread, dict) or thread.get("id") != thread_id:
+            raise DeliveryError("CODEX_PARENT_UNAVAILABLE", "同じ Codex 環境に親タスクがありません")
+        if thread.get("source") == "exec":
+            await rpc.request("thread/resume", {"threadId": thread_id})
+            marker = state_root() / "codex-inputs" / thread_id / "injections" / f"{delivery_id}.json"
+            try:
+                _write_json_once(marker, {"thread_id": thread_id, "delivery_id": delivery_id,
+                                          "text_sha256": hashlib.sha256(text.encode()).hexdigest()})
+            except FileExistsError as exc:
+                raise DeliveryError("DELIVERY_ALREADY_STARTED", "同じ返信の配送記録があります",
+                                    outcome_unknown=True) from exc
+            except OSError as exc:
+                raise DeliveryError("DELIVERY_STATE_WRITE_FAILED", "配送記録を保存できません") from exc
+            await rpc.request("thread/inject_items", {
+                "threadId": thread_id,
+                "items": [{"type": "message", "role": "user",
+                           "content": [{"type": "input_text", "text": text}]}],
+            })
+            return "injected"
     pending = _pending_dir(thread_id) / f"{delivery_id}.json"
     try:
         _write_json_once(pending, {
