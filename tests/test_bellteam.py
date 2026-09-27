@@ -8,6 +8,7 @@ import socketserver
 import sys
 import tempfile
 import threading
+import time
 import unittest
 from http.server import BaseHTTPRequestHandler
 from pathlib import Path
@@ -17,7 +18,7 @@ SRC = Path(__file__).resolve().parents[1] / "src"
 if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
-from call_bridge.bellteam import BellTeamError, fetch_directory, send_delivery
+from call_bridge.bellteam import BellTeamError, BellTeamOutcomeUnknown, fetch_directory, send_delivery
 from call_bridge.db import CallStore
 from call_bridge.deliver import dispatch_send
 from call_bridge.directory import load_directory, resolve_bellteam_member
@@ -50,6 +51,12 @@ class UnixServer(socketserver.UnixStreamServer):
     allow_reuse_address = True
 
 
+class SlowHandler(Handler):
+    def do_POST(self):  # noqa: N802
+        time.sleep(3.2)
+        super().do_POST()
+
+
 class BellTeamTests(unittest.TestCase):
     def test_unix_directory_and_delivery(self):
         with tempfile.TemporaryDirectory() as root:
@@ -68,6 +75,42 @@ class BellTeamTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
                 thread.join()
+
+    def test_delivery_waits_for_acceptance_beyond_old_three_second_limit(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = str(Path(root) / "bellteam.sock")
+            server = UnixServer(path, SlowHandler)
+            thread = threading.Thread(target=server.serve_forever, daemon=True)
+            thread.start()
+            try:
+                with mock.patch.dict(os.environ, {"CALL_BRIDGE_BELLTEAM_UNIX": path}):
+                    receipt = send_delivery({"schema": "call-bridge.delivery.v1", "event": "session.message"})
+                self.assertEqual(receipt["delivery"], "running")
+            finally:
+                server.shutdown()
+                server.server_close()
+                thread.join()
+
+    def test_timeout_after_connect_is_unknown_and_connect_failure_is_definite(self):
+        with mock.patch.dict(os.environ, {"CALL_BRIDGE_BELLTEAM_UNIX": "/socket"}), \
+             mock.patch("call_bridge.bellteam._Connection") as connection:
+            connection.return_value.getresponse.side_effect = TimeoutError()
+            with self.assertRaises(BellTeamOutcomeUnknown):
+                send_delivery({"event": "session.message"})
+            connection.assert_called_with("/socket", timeout=30)
+            connection.return_value.connect.side_effect = FileNotFoundError()
+            with self.assertRaises(BellTeamError) as error:
+                send_delivery({"event": "session.message"})
+            self.assertNotIsInstance(error.exception, BellTeamOutcomeUnknown)
+
+    def test_server_error_after_delivery_request_is_unknown(self):
+        with mock.patch.dict(os.environ, {"CALL_BRIDGE_BELLTEAM_UNIX": "/socket"}), \
+             mock.patch("call_bridge.bellteam._Connection") as connection:
+            response = connection.return_value.getresponse.return_value
+            response.status = 502
+            response.read.return_value = b'{"error":"delivery failed"}'
+            with self.assertRaises(BellTeamOutcomeUnknown):
+                send_delivery({"event": "session.message"})
 
     def test_combined_directory_survives_grok_failure_and_resolves_exact_id(self):
         with mock.patch("call_bridge.directory._load_grok_directory", return_value={"ok": False, "detail": "Grok offline"}), \
@@ -109,6 +152,15 @@ class BellTeamTests(unittest.TestCase):
                 failed = dispatch_send(store, sid, "local", "届かない")
                 self.assertEqual(failed["delivery"]["status"], "error")
                 self.assertEqual(len(store.poll_messages(sid, "member")["messages"]), 1)
+            with mock.patch("call_bridge.deliver.send_delivery", side_effect=BellTeamOutcomeUnknown("receipt timed out")) as send:
+                unknown = dispatch_send(store, sid, "local", "届いたか不明")
+                self.assertEqual(unknown["delivery"]["status"], "unknown")
+                self.assertEqual(unknown["seq"], 3)
+                send.assert_called_once()
+                self.assertEqual(len(store.poll_messages(sid, "member")["messages"]), 2)
+                reply = dispatch_send(store, sid, "member", "返信の配送も不明")
+                self.assertEqual(reply["delivery"]["status"], "unknown")
+                self.assertEqual(len(store.poll_messages(sid, "local")["messages"]), 2)
 
     def test_bellteam_call_open_does_not_wake_marian(self):
         with tempfile.TemporaryDirectory() as root:

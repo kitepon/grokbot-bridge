@@ -47,7 +47,7 @@ BellTeam宛てはcall_sendがBellTeamへ直接届ける。マリアンは通ら�
 - call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（UNIX ソケット優先。定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
-- local の call_send は配送先の受付成功時だけ保存する。delivery.status=deliveredは受付を表し、相手の読了を表さない。返信不要の通知だけ reply_required=false
+- local の call_send は配送先の受付成功時に保存する。BellTeamへの送信後に受付結果を確認できなければdelivery.status=unknownで保存し、二重配送を避けるため自動再送しない。deliveredは受付を表し、相手の読了を表さない。返信不要の通知だけ reply_required=false
 """
 
 Party = Literal["local", "member"]
@@ -131,8 +131,9 @@ def call_open(
     description=(
         "セッションへメッセージ送信。localはGrokBot宛てならマリアンへ、BellTeam宛てなら直接配送する。"
         "返信不要なら reply_required=false。"
-        "結果の delivery.status は delivered または error。"
-        "配送失敗時はlocalの本文を保存しない。memberの返信は保存し、BellTeam発信者へは直接届ける。"
+        "結果の delivery.status は delivered、error、unknown。"
+        "BellTeamの結果がunknownなら本文を履歴へ保存し、二重配送を避けるため自動再送しない。"
+        "確定した配送失敗時はlocalの本文を保存しない。memberの返信は保存し、BellTeam発信者へは直接届ける。"
     )
 )
 def call_send(session_id: str, from_party: Party, message: str,

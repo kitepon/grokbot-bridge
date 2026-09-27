@@ -18,7 +18,7 @@ from typing import Any
 
 from .db import CallStore
 from .directory import resolve_member_agent_id
-from .bellteam import BellTeamError, send_delivery
+from .bellteam import BellTeamError, BellTeamOutcomeUnknown, send_delivery
 from .wake import notify_message
 
 log = logging.getLogger("call_bridge.deliver")
@@ -62,6 +62,8 @@ def dispatch_send(
                     "message": message, "reply_required": reply_required,
                 })
                 stored["delivery"] = {"status": "delivered", "detail": "BellTeam accepted"}
+            except BellTeamOutcomeUnknown as exc:
+                stored["delivery"] = {"status": "unknown", "detail": str(exc)}
             except BellTeamError as exc:
                 stored["delivery"] = {"status": "error", "detail": str(exc)}
         return stored
@@ -84,6 +86,10 @@ def dispatch_send(
                 "source_id": sess["local_id"], "source_label": sess["local_label"],
                 "message": message, "reply_required": reply_required,
             })
+        except BellTeamOutcomeUnknown as exc:
+            stored = store.send_message(session_id, "local", message, reply_required)
+            stored["delivery"] = {"status": "unknown", "detail": str(exc)}
+            return stored
         except BellTeamError as exc:
             return _delivery_failure("error", str(exc), "error")
         stored = store.send_message(session_id, "local", message, reply_required)

@@ -4,6 +4,8 @@
 
 電話帳はGrokBotのプロフィールとBellTeamのBot一覧を要求ごとに合わせて返す。各項目の`system`と`id`で宛先を区別する。BellTeam側のUNIXソケットを`CALL_BRIDGE_BELLTEAM_UNIX`に設定し、その親ディレクトリをコンテナの`/run/bellteam`へマウントする。BellTeam側には`BELLTEAM_CALL_BRIDGE_SOCKET`を設定する。BellTeam宛ての本文とBellTeam発信者宛ての返信はこのソケットを通り、マリアンは通らない。
 
+BellTeam宛ての配送受付は最大30秒待つ。UNIXソケットへの接続前の失敗は`delivery.status=error`で本文を保存しない。接続後のタイムアウトやHTTP 5xxは、BellTeam側へ届いた可能性があるため`delivery.status=unknown`として本文を通話履歴へ保存する。`unknown`を見て同じ本文を自動再送しない。BellTeamの通話記録と配送状態を`session_id`で確認してから対応を決める。`delivered`はBellTeam受付を示し、相手Botの読了を示さない。
+
 BellTeam宛ての開始例。`member_name`は名前またはBot IDを指定できる。同名のBotがいる場合はIDを指定する。BellTeamのBotが発信する場合は`local_system="bellteam"`と自身のBot IDを`local_id`に指定する。
 
 ```json
