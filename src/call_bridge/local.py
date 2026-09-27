@@ -313,7 +313,9 @@ def _launch_exec_watcher(session_id: str) -> None:
     options: dict[str, Any] = {"stdin": subprocess.DEVNULL,
                                "env": {**os.environ, "CALL_BRIDGE_STATE": str(state_root())}}
     if os.name == "nt":
-        options["creationflags"] = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        options["creationflags"] = (subprocess.DETACHED_PROCESS |
+                                    subprocess.CREATE_NEW_PROCESS_GROUP |
+                                    subprocess.CREATE_BREAKAWAY_FROM_JOB)
     else:
         options["start_new_session"] = True
     try:
