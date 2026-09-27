@@ -22,15 +22,24 @@ A local coding agent (Claude Code, Codex, Cursor, …) calls either system throu
 
 ## Why
 
-- Local agents cannot deliver into a member's main chat through the host gateway (`deliverAgentMessage` lands in a box-local New Agent conversation).
-- Local `call_send` wakes Marian with the text. She relays it into that main chat. Member replies still come back through this MCP.
-- One shared endpoint + a session id is enough: **ring → relay → reply → hang up**.
+- GrokBot's host gateway cannot deliver into a member's main chat (`deliverAgentMessage` lands in a box-local New Agent conversation). For a GrokBot target, local `call_send` sends the text to Marian's webhook for relay.
+- For a BellTeam target, local `call_send` uses BellTeam's UNIX socket. A reply to a BellTeam caller also uses that socket.
+- Both routes use the same MCP endpoint and `session_id`.
 
 ## Flow
 
-1. **Local** opens a session (`call_open` or `POST /v0/sessions`) → gets `session_id` (`ringing`). The server POSTs a wake envelope to the switchboard webhook (when `CALL_BRIDGE_WAKE_WEBHOOK_URL` is set) so the switchboard can wake the member. The body is session id, member name, local labels, purpose, and the public MCP URL — not message bodies. If the URL is unset, or the POST fails, the session is still returned; the response includes a non-fatal `wake` object (`status`: `ok`, `skipped`, or `error`).
-2. **Grok Bot switchboard** wakes the member with MCP URL + `session_id` only (no body relay).
-3. **Local** `call_send` POSTs `session.message` to the same switchboard webhook (`CALL_BRIDGE_WAKE_WEBHOOK_URL` / `CALL_BRIDGE_WAKE_WEBHOOK_AUTH`). That envelope includes the caller's text, `reply_required`, and the resolved `member_agent_id`, so Marian can relay it into the member's main chat. `delivery.status` is `delivered` when the webhook returns HTTP 2xx, and the message is stored only then. If the webhook URL is unset, or the POST fails, the call fails and the message is not stored. The stored copy still appends the reply hint when `reply_required` is true; the webhook `message` field is the caller's text. **Member** `call_send` is unchanged (stored for the local side, no webhook). `session.opened` still has no message body. `GROKBOT_GATEWAY_*` is not used.
+### GrokBot target
+
+1. **Local** opens a session (`call_open` or `POST /v0/sessions`) and gets a `session_id`. If `CALL_BRIDGE_WAKE_WEBHOOK_URL` is set, the server POSTs `session.opened` to the switchboard with the session ID and labels, but no message body. A missing URL or failed wake does not cancel the session; `wake.status` reports `skipped` or `error`.
+2. **GrokBot switchboard**, when notified, wakes the member with the MCP URL and `session_id`.
+3. **Local** `call_send` POSTs `session.message` to the switchboard webhook. Marian relays its text, `reply_required`, and resolved `member_agent_id` into the member's main chat. The message is stored only after HTTP 2xx; an unset URL or failed POST returns an error without storing it. The stored copy includes a reply hint when `reply_required=true`; the webhook message does not. The GrokBot member's `call_send(from_party="member")` stores the reply without a webhook POST. If the caller is a BellTeam Bot, the bridge also delivers that reply through BellTeam's UNIX socket.
+4. Either side (or ops) calls `call_hangup`.
+
+### BellTeam target
+
+1. **Local** `call_open(member_system="bellteam")` creates the session without waking a Bot.
+2. **Local** `call_send` sends the body to BellTeam's UNIX socket. On confirmed acceptance, the bridge stores it and returns `delivery.status=delivered`. If the connection fails before the request, it returns `error` without storing. If the request may have been accepted but its result is unavailable, it stores the message with `delivery.status=unknown`; do not resend blindly.
+3. The BellTeam member's `call_send(from_party="member")` stores the reply. If `local_system="bellteam"`, the bridge also sends that reply through BellTeam's UNIX socket to the calling Bot; that delivery can likewise be `delivered`, `error`, or `unknown`. Other callers retrieve the stored reply with `call_poll`, or receive it through the Codex local MCP when configured.
 4. Either side (or ops) calls `call_hangup`.
 
 When a real MCP or REST request finds the directory unix socket unreachable (`unix socket not found`, `timed out`, or `request failed` — the socket never produced an HTTP response), the server POSTs the same switchboard webhook once:
@@ -39,9 +48,9 @@ When a real MCP or REST request finds the directory unix socket unreachable (`un
 {"event":"bridge.link_down","link":"directory","detail":"unix socket not found"}
 ```
 
-`link` is `directory`. At most one of these wakes is sent per 60 seconds, in-process, with no background poll. `call_open`'s `session.opened` wake is unchanged and still has no message body. `call_directory` still uses its existing fallback and adds a note that the box link is down, the operator has been woken to reconnect, and to retry in about 30 seconds. A local `call_send` that cannot resolve the member because of that failure returns the error with the same note and does not store. If the directory falls back to local profiles and the member resolves, `call_send` still posts `session.message` after the `bridge.link_down` wake. A failed `session.message` POST is not a down box link and does not send `bridge.link_down`. `GROKBOT_GATEWAY_*` is not used, so a gateway forward is no longer a link-down source.
+`link` is `directory`. At most one of these wakes is sent per 60 seconds, in-process, with no background poll. For a GrokBot target, `call_open`'s `session.opened` wake still has no message body. `call_directory` uses its fallback and adds a note that the GrokBot box link is down. A GrokBot-targeted `call_send` that cannot resolve the member returns that note without storing; if fallback profiles provide an ID, it still posts `session.message` after the `bridge.link_down` wake. A failed `session.message` POST does not send `bridge.link_down`. BellTeam delivery uses its separate UNIX socket and does not post `session.message` to Marian. `GROKBOT_GATEWAY_*` is not used.
 
-`call_send` で `from_party="local"` のときは、同じスイッチボード webhook へ `session.message`（呼び出し側の本文、`member_agent_id`、`reply_required`）を送ってから保存する。保存される本文には、同じ `session_id` へ call-bridge MCP の `call_send`（`from_party=member`）で返答する案内が付く。webhook の `message` はその案内を含まない。配送が `delivered`（webhook が HTTP 2xx）のときだけ保存する。webhook URL が無い、または POST が失敗したときはエラーを返し、保存しない。`GROKBOT_GATEWAY_*` は使わない。ディレクトリの UNIX ソケットが落ちているときは、同じ webhook へ `bridge.link_down` を最大 60 秒に 1 回送る。定期的な死活監視はしない。返信不要の通知だけ `reply_required=false` を指定する。`from_party="member"` の本文は変更せず、webhook にも送らない。MCP と REST のどちらでも同じ動作になる。返信依頼はメンバーへ送る指示であり、返答そのものを保証するものではない。
+`call_send(from_party="local")`は宛先の所属で配送先を選ぶ。GrokBot宛てはマリアンのWebhookへ`session.message`を送り、HTTP 2xxで受付確認後に保存する。BellTeam宛てはBellTeamのUNIXソケットへ直接送る。受付結果が不明なら`delivery.status=unknown`で保存し、二重配送を避けるため自動再送しない。保存する本文には同じ`session_id`での返信案内を付けるが、配送先へ渡す本文には付けない。`from_party="member"`の返信は保存し、BellTeam発信者宛てだけは同じUNIXソケットへも届ける。返信不要の通知には`reply_required=false`を指定する。MCPとRESTは同じ動作を使う。返信依頼は相手への指示であり、返答を保証しない。
 
 `call_send` の通常送信の引数例：
 
@@ -105,6 +114,8 @@ call-bridge-setup status
 
 現在の自動配送対象は Codex 親。Claude Code／Cursor の直接 HTTP 接続と手動 `call_poll` は従来どおり使える。
 
+GrokBot宛てだけの経路：
+
 ```text
 Local agent ──call_open──▶ switchboard webhook session.opened (no message body)
 Local agent ──call_send──▶ grokbot-bridge ──session.message──▶ Marian (relay into the member's main chat)
@@ -134,7 +145,7 @@ Grok Bot member ──call_send──▶ grokbot-bridge (stored for the local si
 |------|------|
 | `call_directory` | Phone book, built on that call from live seat profiles |
 | `call_open` | Create session (local → member) |
-| `call_send` | Send a message. Local sends `session.message` to Marian's webhook (`delivery.status` is `delivered` on HTTP 2xx). Notices use `reply_required=false`. Member sends are stored only |
+| `call_send` | Send a message. GrokBot targets use Marian's webhook; BellTeam targets use its UNIX socket. A member reply is stored and is also delivered by UNIX socket when the caller is in BellTeam. Results can be `delivered`, `error`, or `unknown` for BellTeam delivery. Notices use `reply_required=false` |
 | `call_poll` | Fetch new messages for your party |
 | `call_list` | List / filter sessions |
 | `call_hangup` | End the call |
@@ -146,7 +157,7 @@ Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 
 Clients only call `call_directory` (or `GET /v0/directory`). The server reads Grok Bot seat profiles and, when configured, BellTeam's directory **on that request**. Changing a profile shows up on the **next** call. Each member has `system` (`grokbot` or `bellteam`) and its existing `id`. One directory can remain available when the other fails.
 
-Source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag. Each member built from a profile also includes `id`: the seat directory name, which is the Grok Bot agent id (`profile.json` itself has no id field). Local `call_send` resolves `member_name` to that id and includes it as `member_agent_id` on `session.message`. A remote directory passes `id` or `agentId` through. A `directory.json` entry without an id cannot be relayed.
+For GrokBot seats, the source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag. Each member built from a profile also includes `id`: the seat directory name, which is the GrokBot agent id (`profile.json` itself has no id field). A GrokBot-targeted `call_send` resolves `member_name` to that id and includes it as `member_agent_id` on `session.message`. A remote directory passes `id` or `agentId` through. A `directory.json` entry without an id cannot be relayed to GrokBot.
 
 Lookup order:
 
@@ -243,7 +254,7 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | `CALL_BRIDGE_DIRECTORY` | `./directory.json` | Last-resort GrokBot snapshot file |
 | `CALL_BRIDGE_BELLTEAM_SOCKET_HOST` | `./bellteam` | Host directory mounted at `/run/bellteam` in Compose |
 | `CALL_BRIDGE_BELLTEAM_UNIX` | _(unset)_ | BellTeam socket inside the container, e.g. `/run/bellteam/bellteam.sock` |
-| `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard webhook. `call_open` posts `session.opened` (no body; an empty URL skips that POST). Local `call_send` posts `session.message` (the text, `reply_required`, and `member_agent_id`; an empty URL fails the send and does not store). A down directory unix socket posts `bridge.link_down` at most once per 60 seconds |
+| `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | GrokBot switchboard webhook. GrokBot-targeted `call_open` posts `session.opened` (no body; an empty URL skips that POST). GrokBot-targeted local `call_send` posts `session.message` (the text, `reply_required`, and `member_agent_id`; an empty URL fails the send and does not store). A down GrokBot directory UNIX socket posts `bridge.link_down` at most once per 60 seconds |
 | `CALL_BRIDGE_WAKE_WEBHOOK_AUTH` | _(unset)_ | `Authorization` header for those POSTs. Never placed in the payload |
 | `CALL_BRIDGE_PUBLIC_MCP_URL` | `https://call.kitepon.dev/mcp` | MCP URL included in `session.opened` and `session.message` |
 
