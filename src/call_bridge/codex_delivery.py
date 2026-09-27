@@ -136,7 +136,8 @@ def owned_hooks(response: dict[str, Any], command: str, home: Path) -> list[dict
     rows = data[0]["hooks"]
     ours = [row for row in rows if isinstance(row, dict) and row.get("command") == command and
             row.get("sourcePath") == source]
-    if (len(ours) != 2 or {row.get("eventName") for row in ours} != {"postToolUse", "stop"} or
+    if (len(ours) != 3 or {row.get("eventName") for row in ours} !=
+            {"postToolUse", "stop", "userPromptSubmit"} or
             any(row.get("async") or row.get("handlerType") != "command" for row in ours)):
         raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "登録した同期 hook が Codex から見えません")
     return ours
@@ -466,16 +467,102 @@ async def claim_hook_replies(event: dict[str, Any]) -> tuple[dict[str, Any], lis
     return output, claimed
 
 
+async def claim_exec_replies(event: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, int]], list[str]]:
+    """Fetch exec replies when its parent starts a prompt; no child watcher must survive."""
+    from . import local
+    import httpx
+
+    thread_id = event.get("session_id")
+    if event.get("hook_event_name") != "UserPromptSubmit" or not isinstance(thread_id, str):
+        raise DeliveryError("CODEX_HOOK_INPUT_INVALID", "hook の入力が不正です")
+    try:
+        if str(uuid.UUID(thread_id)) != thread_id:
+            raise ValueError(thread_id)
+    except ValueError as exc:
+        raise DeliveryError("CODEX_HOOK_INPUT_INVALID", "親タスクIDが不正です") from exc
+    store = local.LocalStore(state_root())
+    subscriptions = [row for row in store.active_exec(thread_id)
+                     if Path(row["codex_home"]).resolve() == codex_home()]
+    if not subscriptions:
+        return {}, [], []
+    texts: list[str] = []
+    reserved: list[tuple[str, int]] = []
+    closed: list[str] = []
+    async with httpx.AsyncClient(headers=local._headers(), timeout=5) as client:
+        for row in subscriptions:
+            session_id = row["session_id"]
+            try:
+                response = await client.get(local._rest_url(session_id), params={
+                    "party": "local", "after_seq": row["after_seq"],
+                })
+                response.raise_for_status()
+                value = response.json()
+                if not isinstance(value, dict) or value.get("ok") is not True or not isinstance(value.get("messages"), list):
+                    raise DeliveryError("BRIDGE_POLL_INVALID", "通話の受信応答が不正です")
+                store.transport_error(session_id, None)
+            except (httpx.HTTPError, ValueError) as exc:
+                store.transport_error(session_id, f"BRIDGE_POLL_FAILED: {exc}")
+                continue
+            last_seq = row["after_seq"]
+            for message in value["messages"]:
+                if not isinstance(message, dict):
+                    store.stop(session_id, "failed", "BRIDGE_MESSAGE_INVALID")
+                    break
+                seq, body = message.get("seq"), message.get("message")
+                if type(seq) is not int or seq <= last_seq or not isinstance(body, str):
+                    store.stop(session_id, "failed", "BRIDGE_MESSAGE_INVALID")
+                    break
+                _delivery_id, state = store.reserve(session_id, seq)
+                if state in ("submitted", "injected"):
+                    store.submitted(session_id, seq, state)
+                elif state == "new":
+                    texts.append(f"通話の返信です。session_id={session_id} seq={seq} "
+                                 f"member={row['member_name']}\n\n{body}")
+                    reserved.append((session_id, seq))
+                elif state == "waiting":
+                    texts.append(f"通話の返信です。session_id={session_id} seq={seq} "
+                                 f"member={row['member_name']}\n\n{body}")
+                    reserved.append((session_id, seq))
+                else:
+                    store.stop(session_id, "unknown", "DELIVERY_PREVIOUSLY_STARTED", seq)
+                    break
+                last_seq = seq
+            else:
+                if value.get("status") == "hungup":
+                    closed.append(session_id)
+    if not texts:
+        return {}, reserved, closed
+    return {"hookSpecificOutput": {"hookEventName": "UserPromptSubmit",
+                                   "additionalContext": "\n\n".join(texts)}}, reserved, closed
+
+
 def hook_main() -> None:
     claimed: list[Path] = []
+    exec_reserved: list[tuple[str, int]] = []
     try:
         event = json.load(sys.stdin)
-        output, claimed = asyncio.run(claim_hook_replies(event))
+        if event.get("hook_event_name") == "UserPromptSubmit":
+            output, exec_reserved, closed = asyncio.run(claim_exec_replies(event))
+        else:
+            output, claimed = asyncio.run(claim_hook_replies(event))
+            closed = []
         sys.stdout.write(json.dumps(output, ensure_ascii=False) + "\n")
         sys.stdout.flush()
+        if exec_reserved or closed:
+            from . import local
+            store = local.LocalStore(state_root())
+            for session_id, seq in exec_reserved:
+                store.submitted(session_id, seq, "injected")
+            for session_id in closed:
+                store.stop(session_id, "closed")
         for path in claimed:
             _set_claim_state(path, "emitted")
     except Exception as exc:
+        if exec_reserved:
+            from . import local
+            store = local.LocalStore(state_root())
+            for session_id, seq in exec_reserved:
+                store.stop(session_id, "unknown", "CODEX_HOOK_DELIVERY_UNCONFIRMED", seq)
         for path in claimed:
             _set_claim_state(path, "unknown")
         print(f"CALL_BRIDGE_HOOK_FAILED: {exc}", file=sys.stderr)

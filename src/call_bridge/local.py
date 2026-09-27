@@ -142,6 +142,12 @@ class LocalStore:
         with self.connect() as db:
             return [row[0] for row in db.execute("SELECT session_id FROM subscriptions WHERE state = 'active'")]
 
+    def active_exec(self, thread_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            rows = db.execute("SELECT * FROM subscriptions WHERE state = 'active' AND delivery_mode = 'exec' "
+                              "AND thread_id = ? ORDER BY session_id", (thread_id,)).fetchall()
+        return [dict(row) for row in rows]
+
     def subscription(self, session_id: str) -> dict[str, Any]:
         with self.connect() as db:
             row = db.execute("SELECT * FROM subscriptions WHERE session_id = ?", (session_id,)).fetchone()
@@ -328,9 +334,7 @@ def _launch_exec_watcher(session_id: str) -> None:
 
 def _start_watch(session_id: str) -> None:
     subscription = store.subscription(session_id)
-    if subscription["delivery_mode"] == "exec":
-        _launch_exec_watcher(session_id)
-    else:
+    if subscription["delivery_mode"] == "queue":
         watchers.start(session_id)
 
 
@@ -390,7 +394,8 @@ async def call_open(local_id: str, local_label: str, member_name: str,
     store.add(session_id, thread_id, home, member_name,
               "exec" if source == "exec" else "queue")
     _start_watch(session_id)
-    return {**result, "parent_delivery": {"state": "watching", "thread_id": thread_id}}
+    state = "awaiting_parent_prompt" if source == "exec" else "watching"
+    return {**result, "parent_delivery": {"state": state, "thread_id": thread_id}}
 
 
 @mcp.tool(description="通話へメッセージを送信。local は返信依頼が既定。返信不要なら reply_required=false")

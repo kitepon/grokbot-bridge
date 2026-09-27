@@ -66,7 +66,7 @@ def _merge_hooks(file: Path, command: str | None, previous_command: str | None =
     next_value = dict(current)
     hooks = dict(current.get("hooks", {}))
     owned_commands = {value for value in (command, previous_command) if value is not None}
-    for event in ("PostToolUse", "Stop"):
+    for event in ("PostToolUse", "Stop", "UserPromptSubmit"):
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
             raise DeliveryError("CODEX_HOOK_CONFIG_INVALID", f"{event} の形式が不正です")
@@ -86,6 +86,8 @@ def _merge_hooks(file: Path, command: str | None, previous_command: str | None =
             group = {"hooks": [entry]}
             if event == "PostToolUse":
                 group["matcher"] = ".*"
+                entry["additionalContextLimit"] = 0
+            if event == "UserPromptSubmit":
                 entry["additionalContextLimit"] = 0
             kept.append(group)
         if kept:

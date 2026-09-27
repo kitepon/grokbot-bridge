@@ -140,7 +140,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         start.assert_called_once_with(session_id)
         self.assertEqual(result["parent_delivery"]["state"], "watching")
 
-    async def test_exec_call_open_starts_independent_watcher(self):
+    async def test_exec_call_open_waits_for_parent_prompt(self):
         session_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
         store = local.LocalStore(Path(self.temp.name))
         with patch.object(local, "_parent", return_value=(thread_id, Path(self.temp.name))), \
@@ -150,10 +150,41 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
              patch.object(local, "store", store), \
              patch.object(local, "_launch_exec_watcher") as launch, \
              patch.object(local.watchers, "start") as in_process:
-            await local.call_open("caller", "発信者", "bot-1", ctx=object())
+            result = await local.call_open("caller", "発信者", "bot-1", ctx=object())
         self.assertEqual(store.subscription(session_id)["delivery_mode"], "exec")
-        launch.assert_called_once_with(session_id)
+        self.assertEqual(result["parent_delivery"]["state"], "awaiting_parent_prompt")
+        launch.assert_not_called()
         in_process.assert_not_called()
+
+    async def test_exec_prompt_hook_emits_stored_replies_once(self):
+        thread_id, session_id = str(uuid.uuid4()), str(uuid.uuid4())
+        store = local.LocalStore(Path(self.temp.name))
+        store.add(session_id, thread_id, codex_delivery.codex_home(), "ベル", "exec")
+
+        class ReplyHTTP(FakeHTTP):
+            async def get(self, url, params):
+                self.polls.append(params["after_seq"])
+                body = {"ok": True, "status": "open", "messages": [
+                    {"seq": 2, "message": "返信の証拠"},
+                ] if params["after_seq"] == 0 else []}
+                return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+        event = {"session_id": thread_id, "turn_id": "turn-1",
+                 "hook_event_name": "UserPromptSubmit", "prompt": "再開"}
+        with patch.object(local.httpx, "AsyncClient", return_value=ReplyHTTP()):
+            output, reserved, closed = await codex_delivery.claim_exec_replies(event)
+        self.assertIn("返信の証拠", output["hookSpecificOutput"]["additionalContext"])
+        self.assertEqual(reserved, [(session_id, 2)])
+        self.assertEqual(closed, [])
+        for sid, seq in reserved:
+            store.submitted(sid, seq, "injected")
+        self.assertEqual(store.status(session_id)["after_seq"], 2)
+        self.assertEqual(store.status(session_id)["deliveries"][0]["state"], "injected")
+
+        with patch.object(local.httpx, "AsyncClient", return_value=ReplyHTTP()):
+            second, reserved, _closed = await codex_delivery.claim_exec_replies(event)
+        self.assertEqual(second, {})
+        self.assertEqual(reserved, [])
 
     async def test_call_open_keeps_grokbot_and_local_defaults(self):
         session_id = str(uuid.uuid4())
