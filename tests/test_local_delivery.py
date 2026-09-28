@@ -22,6 +22,8 @@ from call_bridge import codex_delivery, local, setup
 class FakeHTTP:
     def __init__(self, *_args, **_kwargs):
         self.polls: list[int] = []
+        self.tokens: list[str] = []
+        self.on_poll = None
 
     async def __aenter__(self):
         return self
@@ -29,8 +31,11 @@ class FakeHTTP:
     async def __aexit__(self, *_args):
         pass
 
-    async def get(self, url, params):
+    async def get(self, url, params, headers=None):
         self.polls.append(params["after_seq"])
+        self.tokens.append((headers or {}).get("Authorization", ""))
+        if self.on_poll is not None:
+            self.on_poll()
         if params["after_seq"] == 0:
             body = {"ok": True, "status": "open", "messages": [
                 {"seq": 2, "message": "一通目"}, {"seq": 4, "message": "二通目"},
@@ -69,6 +74,19 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("二通目", send.await_args_list[1].args[3])
         self.assertEqual(store.status(session_id)["state"], "closed")
         self.assertEqual(store.status(session_id)["after_seq"], 4)
+
+    async def test_watcher_reads_rotated_token_on_the_next_poll(self):
+        store = local.LocalStore(Path(self.temp.name))
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), Path(self.temp.name), "ラピ")
+        fake = FakeHTTP()
+        fake.on_poll = lambda: os.environ.__setitem__("CALL_BRIDGE_TOKEN", "rotated-token")
+        with patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer test-token", "Bearer rotated-token"])
+        self.assertEqual(store.status(session_id)["state"], "closed")
 
     async def test_exec_reply_is_reported_as_persisted_injection(self):
         store = local.LocalStore(Path(self.temp.name))

@@ -260,10 +260,11 @@ class Watchers:
 
     async def _watch_claimed(self, session_id: str) -> None:
         subscription = self.store.subscription(session_id)
-        async with httpx.AsyncClient(headers=_headers(), timeout=10) as client:
+        async with httpx.AsyncClient(timeout=10) as client:
             while True:
                 try:
-                    response = await client.get(_rest_url(session_id), params={
+                    # Read the token per poll so a rotated auth.json reaches a long-lived watcher.
+                    response = await client.get(_rest_url(session_id), headers=_headers(), params={
                         "party": "local", "after_seq": subscription["after_seq"],
                     })
                     response.raise_for_status()
