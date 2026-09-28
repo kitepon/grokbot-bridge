@@ -61,7 +61,10 @@ load_dotenv()
 DB_PATH = os.environ.get("CALL_BRIDGE_DB", "data/calls.db")
 HOST = os.environ.get("CALL_BRIDGE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CALL_BRIDGE_PORT", "18910"))
-AUTH = Authenticator.from_env()
+try:
+    AUTH = Authenticator.from_env()
+except AuthError as _e:
+    raise SystemExit(f"call-bridge: {_e}") from None
 
 store = CallStore(DB_PATH)
 
@@ -78,15 +81,18 @@ mcp = FastMCP(
 
 
 def _principal(ctx: Context | None) -> Principal:
-    """The authenticated caller of this MCP request; in-process calls are open."""
-    if ctx is None:
-        return OPEN
-    try:
-        request = ctx.request_context.request
-    except ValueError:
-        return OPEN
+    """The authenticated caller of this MCP request.
+
+    Without a request (in-process calls) it is open only when auth is off.
+    """
+    request = None
+    if ctx is not None:
+        try:
+            request = ctx.request_context.request
+        except (ValueError, AttributeError):
+            request = None
     if request is None:
-        return OPEN
+        return UNAUTHENTICATED if AUTH.enabled else OPEN
     return _request_principal(request)
 
 
@@ -122,6 +128,7 @@ def _session_view(sess: dict[str, Any], wake: dict[str, str]) -> dict[str, Any]:
     description=(
         "通話セッションを開く（local→member）。BellTeam宛てはmember_system=bellteam、"
         "BellTeam Bot発信はlocal_system=bellteamと自身のBot IDをlocal_idに指定する。"
+        "local_systemを省くと、所属に結び付いた接続ではその所属、それ以外はlocalになる。"
         "GrokBot宛てだけスイッチボードへ本文なしのwakeを送る。session_idを返す。"
     )
 )
@@ -131,7 +138,7 @@ def call_open(
     member_name: str,
     purpose: str | None = None,
     member_system: str = "grokbot",
-    local_system: str = "local",
+    local_system: str | None = None,
     ctx: Context | None = None,
 ) -> dict[str, Any]:
     return _open(_principal(ctx), local_id, local_label, member_name, purpose, member_system, local_system)
@@ -144,8 +151,10 @@ def _open(
     member_name: str,
     purpose: str | None,
     member_system: str,
-    local_system: str,
+    local_system: str | None,
 ) -> dict[str, Any]:
+    if local_system is None:
+        local_system = principal.system if principal.system else "local"
     if member_system not in ("grokbot", "bellteam") or local_system not in ("local", "grokbot", "bellteam"):
         return {"error": "rejected", "detail": "invalid member_system or local_system"}
     denied = check_open(principal, local_system, local_id)
@@ -357,7 +366,7 @@ async def rest_open_session(request: Request) -> Response:
     member_name = body.get("member_name") or (body.get("to") or {}).get("name")
     purpose = body.get("purpose")
     member_system = body.get("member_system", "grokbot")
-    local_system = body.get("local_system", "local")
+    local_system = body.get("local_system")
     if not local_id or not local_label or not member_name:
         return JSONResponse(
             {
@@ -443,7 +452,11 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
         try:
             principal = AUTH.authenticate(request.headers)
         except AuthError as e:
-            return JSONResponse({"ok": False, "error": "forbidden", "detail": str(e)}, status_code=403)
+            log.warning("caller header rejected: %s", e)
+            return JSONResponse(
+                {"ok": False, "error": "forbidden", "detail": "caller id header is not allowed for this token"},
+                status_code=403,
+            )
         if principal is None:
             return JSONResponse(
                 {"ok": False, "error": "unauthorized"},

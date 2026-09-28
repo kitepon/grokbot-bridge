@@ -19,7 +19,8 @@ from mcp import ClientSession
 from mcp.client.streamable_http import streamablehttp_client
 
 from call_bridge import server
-from call_bridge.auth import LEGACY, AuthError, Authenticator, check_open, is_party
+from call_bridge import auth as auth_module
+from call_bridge.auth import LEGACY, OPEN, UNAUTHENTICATED, AuthError, Authenticator, check_open, is_party
 from call_bridge.db import CallStore
 
 BELLTEAM = "bellteam-token"
@@ -75,18 +76,70 @@ class AuthenticatorTest(unittest.TestCase):
         with self.assertRaises(AuthError):
             self.auth.authenticate(_request(GROKBOT, "someone"))
 
-    def test_legacy_token_is_unrestricted(self) -> None:
+    def test_legacy_token_is_unrestricted_and_ignores_the_header(self) -> None:
         with self.assertLogs("call_bridge.auth", "WARNING"):
             self.assertIs(self.auth.authenticate(_request(SHARED)), LEGACY)
+        self.assertIs(self.auth.authenticate(_request(SHARED, "bot-a")), LEGACY)
 
-    def test_no_configuration_is_open(self) -> None:
-        self.assertTrue(Authenticator().authenticate({}).unrestricted)
+    def test_legacy_warning_is_limited_to_once_per_five_minutes(self) -> None:
+        clock = [1000.0]
+        with mock.patch.object(auth_module.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(auth_module.log, "warning") as warning:
+            self.auth.authenticate(_request(SHARED))
+            clock[0] += 299
+            self.auth.authenticate(_request(SHARED))
+            self.assertEqual(warning.call_count, 1)
+            clock[0] += 1
+            self.auth.authenticate(_request(SHARED))
+            self.assertEqual(warning.call_count, 2)
 
-    def test_entry_without_system_must_be_ops(self) -> None:
+    def test_legacy_only_does_not_warn(self) -> None:
+        with mock.patch.object(auth_module.log, "warning") as warning:
+            self.assertIs(Authenticator(SHARED).authenticate(_request(SHARED)), LEGACY)
+        warning.assert_not_called()
+
+    def test_no_configuration_is_open_with_ops(self) -> None:
+        principal = Authenticator().authenticate({})
+        self.assertIs(principal, OPEN)
+        self.assertTrue(principal.unrestricted and principal.ops)
+
+    def _bad_file(self, content: str) -> str:
         path = Path(self.tmp.name) / "bad.json"
-        path.write_text(json.dumps({"tokens": [{"name": "x", "sha256": _sha("x")}]}), encoding="utf-8")
+        path.write_text(content, encoding="utf-8")
+        return str(path)
+
+    def test_invalid_token_files_stop_with_one_line_errors(self) -> None:
+        entry = {"name": "x", "sha256": _sha("x"), "system": "grokbot"}
+        cases = {
+            "empty list": json.dumps({"tokens": []}),
+            "empty object": "{}",
+            "not an object": "[]",
+            "broken json": "{",
+            "ops as string": json.dumps({"tokens": [{**entry, "ops": "false"}]}),
+            "header flag as string": json.dumps({"tokens": [{**entry, "caller_id_header": "true"}]}),
+            "system not a string": json.dumps({"tokens": [{**entry, "system": 1}]}),
+            "unknown system": json.dumps({"tokens": [{**entry, "system": "other"}]}),
+            "bad sha": json.dumps({"tokens": [{**entry, "sha256": "zz"}]}),
+            "duplicate sha": json.dumps({"tokens": [entry, {**entry, "name": "y"}]}),
+            "no system without ops": json.dumps({"tokens": [{"name": "x", "sha256": _sha("x")}]}),
+        }
+        for label, content in cases.items():
+            with self.subTest(label), self.assertRaises(AuthError) as caught:
+                Authenticator("", self._bad_file(content))
+            self.assertNotIn("\n", str(caught.exception))
         with self.assertRaises(AuthError):
-            Authenticator("", str(path))
+            Authenticator("", str(Path(self.tmp.name) / "missing.json"))
+
+    def test_named_file_turns_auth_on_even_without_legacy_token(self) -> None:
+        auth = Authenticator("", _write_tokens(self.tmp.name))
+        self.assertTrue(auth.enabled)
+        self.assertIsNone(auth.authenticate({}))
+
+    def test_in_process_call_is_open_only_when_auth_is_off(self) -> None:
+        with mock.patch.object(server, "AUTH", self.auth):
+            self.assertIs(server._principal(None), UNAUTHENTICATED)
+        with mock.patch.object(server, "AUTH", Authenticator()):
+            self.assertIs(server._principal(None), OPEN)
 
     def test_request_without_middleware_matches_nothing_when_auth_is_on(self) -> None:
         request = mock.Mock()
@@ -213,6 +266,50 @@ class HttpIdentityTest(unittest.TestCase):
         sid = self._open_as_bot_a()
         reply = self._tool(_headers(SHARED), "call_send", session_id=sid, from_party="member", message="旧")
         self.assertEqual(reply["seq"], 1, reply)
+
+    def test_grokbot_token_without_local_system_calls_as_grokbot(self) -> None:
+        opened = self._tool(_headers(GROKBOT), "call_open", local_id="g-2", local_label="G",
+                            member_name="マリアン")
+        self.assertEqual(opened["local_system"], "grokbot", opened)
+        sent = self._tool(_headers(GROKBOT), "call_send", session_id=opened["session_id"],
+                          from_party="local", message="x")
+        self.assertNotEqual(sent.get("error"), "forbidden", sent)
+
+    def test_forbidden_header_body_does_not_name_the_token(self) -> None:
+        with httpx.Client(base_url=self.base, timeout=10) as client:
+            response = client.get("/v0/directory", headers=_headers(GROKBOT, "g-1"))
+        self.assertEqual(response.status_code, 403)
+        self.assertNotIn("grokbot", response.text)
+
+    def _current_behavior(self, headers: dict[str, str]) -> None:
+        opened = self._tool(headers, "call_open", local_id="dev", local_label="D", member_name="マリアン")
+        self.assertEqual(opened["local_system"], "local", opened)
+        sid = opened["session_id"]
+        self.assertEqual(self._tool(headers, "call_send", session_id=sid, from_party="member",
+                                    message="返事")["seq"], 1)
+        polled = self._tool(headers, "call_poll", session_id=sid, party="local")
+        self.assertEqual([m["message"] for m in polled["messages"]], ["返事"])
+        self.assertEqual(self._tool(headers, "call_info", session_id=sid)["message_count"], 1)
+        self.assertIn(sid, [s["session_id"] for s in self._tool(headers, "call_list")["sessions"]])
+        self.assertEqual(self._tool(headers, "call_hangup", session_id=sid, by_party="ops")["status"], "hungup")
+        with httpx.Client(base_url=self.base, timeout=10) as client:
+            rest = client.post("/v0/sessions", headers=headers, json={
+                "local_id": "dev", "local_label": "D", "member_name": "マリアン"})
+            self.assertEqual(rest.status_code, 201, rest.text)
+            self.assertEqual(rest.json()["local_system"], "local")
+            rsid = rest.json()["session_id"]
+            self.assertEqual(client.post(f"/v0/sessions/{rsid}/messages", headers=headers,
+                                         json={"from_party": "member", "message": "ok"}).status_code, 200)
+            self.assertEqual(client.get(f"/v0/sessions/{rsid}/poll", params={"party": "local"},
+                                        headers=headers).status_code, 200)
+
+    def test_without_token_file_legacy_token_keeps_every_path(self) -> None:
+        with mock.patch.object(server, "AUTH", Authenticator(SHARED)):
+            self._current_behavior(_headers(SHARED))
+
+    def test_dev_mode_keeps_every_path_including_ops_hangup(self) -> None:
+        with mock.patch.object(server, "AUTH", Authenticator()):
+            self._current_behavior({})
 
     def test_rest_routes_use_the_same_identity(self) -> None:
         with httpx.Client(base_url=self.base, timeout=10) as client:

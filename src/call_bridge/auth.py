@@ -16,7 +16,9 @@ principal is system-wide. An entry without ``system`` is unrestricted and needs
 ``ops: true``.
 
 ``CALL_BRIDGE_TOKEN`` stays accepted as an unrestricted legacy token during
-migration and logs a warning. With neither setting the bridge is open (dev).
+migration; once the file has entries its use logs a warning every 5 minutes.
+With neither setting the bridge is open (dev). A named file must hold at least
+one valid entry, or the bridge refuses to start.
 """
 
 from __future__ import annotations
@@ -50,7 +52,8 @@ class Principal:
         return self.system is None
 
 
-OPEN = Principal(name="open")
+# No token configured (development) or an in-process call: the current behavior.
+OPEN = Principal(name="open", ops=True)
 # A request that skipped authentication: no system matches it.
 UNAUTHENTICATED = Principal(name="unauthenticated", system="")
 LEGACY = Principal(name="legacy", ops=True)
@@ -70,26 +73,63 @@ class _Entry:
     ops: bool
 
 
+def _flag(raw: dict[str, Any], key: str, name: str) -> bool:
+    value = raw.get(key, False)
+    if not isinstance(value, bool):
+        raise AuthError(f"token entry {name}: {key} must be true or false")
+    return value
+
+
+def _text(raw: dict[str, Any], key: str, name: str) -> str | None:
+    value = raw.get(key)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise AuthError(f"token entry {name}: {key} must be a non-empty string")
+    return value.strip()
+
+
 def _load_entries(path: str) -> list[_Entry]:
-    data = json.loads(Path(path).read_text(encoding="utf-8"))
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except OSError as e:
+        raise AuthError(f"CALL_BRIDGE_TOKENS_FILE cannot be read: {path}: {e.strerror or e}") from e
+    except ValueError as e:
+        raise AuthError(f"CALL_BRIDGE_TOKENS_FILE is not valid JSON: {path}: {e}") from e
+    tokens = data.get("tokens") if isinstance(data, dict) else None
+    if not isinstance(tokens, list) or not tokens:
+        raise AuthError(f"CALL_BRIDGE_TOKENS_FILE has no tokens: {path}")
     entries: list[_Entry] = []
-    for raw in data.get("tokens", []):
-        name = str(raw.get("name") or "").strip()
-        digest_hex = str(raw.get("sha256") or "").strip().lower()
-        system = raw.get("system")
-        if not name or len(digest_hex) != 64:
-            raise AuthError(f"token entry needs name and sha256: {name or '?'}")
+    seen: set[bytes] = set()
+    for index, raw in enumerate(tokens):
+        if not isinstance(raw, dict):
+            raise AuthError(f"token entry #{index} must be an object")
+        name = _text(raw, "name", f"#{index}")
+        if name is None:
+            raise AuthError(f"token entry #{index} needs a name")
+        digest_hex = (_text(raw, "sha256", name) or "").lower()
+        try:
+            digest = bytes.fromhex(digest_hex)
+        except ValueError:
+            digest = b""
+        if len(digest) != 32:
+            raise AuthError(f"token entry {name}: sha256 must be 64 hex characters")
+        if digest in seen:
+            raise AuthError(f"token entry {name}: the same sha256 appears twice")
+        seen.add(digest)
+        system = _text(raw, "system", name)
         if system is not None and system not in SYSTEMS:
-            raise AuthError(f"unknown system in token entry {name}: {system}")
-        if system is None and not raw.get("ops"):
-            raise AuthError(f"token entry {name} without system must set ops")
+            raise AuthError(f"token entry {name}: unknown system {system}")
+        ops = _flag(raw, "ops", name)
+        if system is None and not ops:
+            raise AuthError(f"token entry {name}: an entry without system must set ops")
         entries.append(_Entry(
             name=name,
-            digest=bytes.fromhex(digest_hex),
+            digest=digest,
             system=system,
-            id=(str(raw["id"]).strip() or None) if raw.get("id") else None,
-            caller_id_header=bool(raw.get("caller_id_header")),
-            ops=bool(raw.get("ops")),
+            id=_text(raw, "id", name),
+            caller_id_header=_flag(raw, "caller_id_header", name),
+            ops=ops,
         ))
     return entries
 
@@ -97,8 +137,9 @@ def _load_entries(path: str) -> list[_Entry]:
 class Authenticator:
     def __init__(self, legacy_token: str = "", tokens_file: str = "") -> None:
         self.legacy_token = legacy_token.strip()
+        self.tokens_file = tokens_file
         self.entries = _load_entries(tokens_file) if tokens_file else []
-        self._last_legacy_warn = 0.0
+        self._last_legacy_warn: float | None = None
 
     @classmethod
     def from_env(cls) -> Authenticator:
@@ -109,7 +150,7 @@ class Authenticator:
 
     @property
     def enabled(self) -> bool:
-        return bool(self.legacy_token or self.entries)
+        return bool(self.legacy_token or self.tokens_file)
 
     def authenticate(self, headers: Any) -> Principal | None:
         """Return the caller's principal, or None when the token is wrong."""
@@ -124,12 +165,19 @@ class Authenticator:
             if hmac.compare_digest(digest, entry.digest):
                 return self._principal(entry, headers.get(CALLER_ID_HEADER, ""))
         if self.legacy_token and hmac.compare_digest(token.encode("utf-8"), self.legacy_token.encode("utf-8")):
-            now = time.monotonic()
-            if now - self._last_legacy_warn >= LEGACY_WARN_INTERVAL:
-                self._last_legacy_warn = now
-                log.warning("legacy shared CALL_BRIDGE_TOKEN in use; caller identity is not checked")
+            self._warn_legacy()
             return LEGACY
         return None
+
+    def _warn_legacy(self) -> None:
+        # Before the switch every client uses the shared token; warn only once
+        # bound tokens exist and the shared one should be going away.
+        if not self.entries:
+            return
+        now = time.monotonic()
+        if self._last_legacy_warn is None or now - self._last_legacy_warn >= LEGACY_WARN_INTERVAL:
+            self._last_legacy_warn = now
+            log.warning("legacy shared CALL_BRIDGE_TOKEN in use; caller identity is not checked")
 
     @staticmethod
     def _principal(entry: _Entry, header_id: str) -> Principal:
