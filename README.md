@@ -223,14 +223,22 @@ Auth: `Authorization: Bearer <token>` on `/mcp` and `/v0/*` (`/health` is open).
 
 #### 切り替え手順
 
-1. 所属ごとにトークンを作り、配る先と方法を決める（GrokBot 側はマリアン、BellTeam はトロニーが受け持つ）。対応ファイルにはハッシュだけを書く。発行はブリッジのホストで `scripts/issue_token.py` を使う。トークン本体は `--out` のファイル（権限600で作る）か、`--out -` の標準出力にだけ出す。同じ名前や既存の `--out` は `--replace` がない限り止まる。対応ファイルはロックを取り、一時ファイルから置き換える（隣に `tokens.json.lock` ができる）。
+1. 所属ごとにトークンを作り、配る先と方法を決める（GrokBot 側はマリアン、BellTeam はトロニーが受け持つ）。対応ファイルにはハッシュだけを書く。発行はブリッジのホストで、リポジトリの `scripts/issue_token.py` を使う（`src/call_bridge/auth.py` と同じ規則で結果を確かめるので、リポジトリの中から動かす）。
+   - トークン本体は `--out` のファイル（権限600で作る）か、`--out -` の標準出力にだけ出す。
+   - 名前と `--id` は前後の空白を落とし、空なら止まる。書き込む前に、できあがる対応ファイル全体をブリッジの読み込み規則で確かめる。
+   - 同じ名前や既存の `--out` は、`--replace` がない限り止まる。
+   - 失敗しても、それまでのトークンは使える。対応ファイルは新しいトークンを渡し終えてから置き換え、`--out` の置き換えに失敗したら元に戻す。`--out -` は標準出力へ書き終えてから登録する。
+   - 対応ファイルはロックを取り、一時ファイルから置き換えて、ディレクトリも fsync する。止まった時でも、隣に `tokens.json.lock` は作られる。
 
    ```sh
-   python3 scripts/issue_token.py --tokens-file tokens.json --name bellteam --system bellteam \
-       --caller-id-header --out /path/to/bellteam.token
+   mkdir -p auth
+   python3 scripts/issue_token.py --tokens-file auth/tokens.json --name bellteam --system bellteam \
+       --caller-id-header --out /path/to/headers --format header
    ssh main-server 'cd /home/kite/call-bridge && python3 scripts/issue_token.py \
-       --tokens-file tokens.json --name grokbot --system grokbot --out -' > grokbot.token
+       --tokens-file auth/tokens.json --name grokbot --system grokbot --out -' > grokbot.token
    ```
+
+   対応ファイルは、発行してからマウントする。ファイルそのものではなく `./auth` ディレクトリを読み取り専用でマウントする（`docker-compose.yml` の例）。ファイルがないまま compose でファイルをマウントすると、Docker がそこにディレクトリを作ってしまう。ファイルのマウントだと、スクリプトが置き換えた後も古い実体を見続ける。どちらにしてもブリッジは起動時にしか読まないので、発行や入れ替えのたびに再起動する。
 2. 対応ファイルを読み取り専用でマウントし、`CALL_BRIDGE_TOKENS_FILE` を設定して再起動する。旧トークンは残す。この時点では誰も新しいトークンを使っていないので、動きは変わらない。
 3. 各基盤の接続設定を新しいトークンへ切り替える。BellTeam は `X-Call-Bridge-Caller-Id` を付ける版を先に入れておく。
 4. 切り替えた基盤から、`local_system` を省いた発信と返信を1往復ずつ試す。

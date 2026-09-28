@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Issue a bearer token bound to a system and record its hash.
 
-Run on the bridge host. The token is generated here, its SHA-256 goes into
-``CALL_BRIDGE_TOKENS_FILE`` and the token itself is written only to ``--out``
-(created with mode 600) or, with ``--out -``, to stdout for a pipe such as
+Run on the bridge host from the repository (it checks the result with
+``src/call_bridge/auth.py``). The token is generated here, its SHA-256 goes
+into ``CALL_BRIDGE_TOKENS_FILE`` and the token itself is written only to
+``--out`` (mode 600) or, with ``--out -``, to stdout for a pipe such as
 ``ssh main-server ... --out - > file-on-the-box``. It is never printed otherwise.
 
     python3 scripts/issue_token.py --tokens-file tokens.json \\
         --name bellteam --system bellteam --caller-id-header --out /path/token
 
-An existing name stops the run unless ``--replace`` is given. The tokens file
-is rewritten through a temporary file and a lock. The bridge reads the file at
-startup, so restart it after issuing.
+An existing name or ``--out`` file stops the run unless ``--replace`` is given.
+A failed run leaves the previous token working: the tokens file is only
+replaced once the new token is safely out, and put back if placing ``--out``
+fails. The bridge reads the file at startup, so restart it after issuing.
 """
 
 from __future__ import annotations
@@ -28,7 +30,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
 
-SYSTEMS = ("local", "grokbot", "bellteam")
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from call_bridge.auth import SYSTEMS, AuthError, _load_entries  # noqa: E402
 
 
 class IssueError(Exception):
@@ -46,21 +49,32 @@ def _locked(tokens_file: Path) -> Iterator[None]:
         os.close(fd)
 
 
-def _read_tokens(tokens_file: Path) -> dict[str, Any]:
+def _read_tokens(tokens_file: Path) -> tuple[dict[str, Any], str | None]:
+    """The parsed tokens file and its original text (None when missing)."""
     try:
-        data = json.loads(tokens_file.read_text(encoding="utf-8"))
+        text = tokens_file.read_text(encoding="utf-8")
     except FileNotFoundError:
-        return {"tokens": []}
+        return {"tokens": []}, None
+    try:
+        data = json.loads(text)
     except ValueError as e:
         raise IssueError(f"{tokens_file} is not valid JSON: {e}") from e
     if not isinstance(data, dict) or not isinstance(data.get("tokens", []), list):
         raise IssueError(f"{tokens_file} must be an object with a tokens list")
     data.setdefault("tokens", [])
-    return data
+    return data, text
 
 
-def _write_atomic(path: Path, text: str, mode: int) -> None:
-    """Write ``text`` to a mode-``mode`` temporary file, then rename it over ``path``."""
+def _fsync_dir(directory: Path) -> None:
+    fd = os.open(directory, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _stage(path: Path, text: str, mode: int) -> Path:
+    """Write ``text`` to a mode-``mode`` temporary file next to ``path``."""
     fd, tmp = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
     try:
         os.fchmod(fd, mode)
@@ -68,13 +82,32 @@ def _write_atomic(path: Path, text: str, mode: int) -> None:
             f.write(text)
             f.flush()
             os.fsync(f.fileno())
-        os.replace(tmp, path)
     except BaseException:
+        _discard(Path(tmp))
+        raise
+    return Path(tmp)
+
+
+def _place(staged: Path, path: Path) -> None:
+    os.replace(staged, path)
+    _fsync_dir(path.parent)
+
+
+def _discard(path: Path | None) -> None:
+    if path is not None:
         try:
-            os.unlink(tmp)
+            path.unlink()
         except FileNotFoundError:
             pass
-        raise
+
+
+def _clean(value: str | None, label: str) -> str | None:
+    if value is None:
+        return None
+    value = value.strip()
+    if not value:
+        raise IssueError(f"{label} must not be empty")
+    return value
 
 
 def _entry(args: argparse.Namespace, digest: str) -> dict[str, Any]:
@@ -94,7 +127,17 @@ def _token_text(token: str, fmt: str) -> str:
     return f"Authorization: Bearer {token}\n" if fmt == "header" else f"{token}\n"
 
 
+def _write_stdout(text: str) -> None:
+    try:
+        sys.stdout.write(text)
+        sys.stdout.flush()
+    except (OSError, ValueError) as e:
+        raise IssueError(f"could not write the token to stdout; nothing was registered: {e}") from e
+
+
 def issue(args: argparse.Namespace) -> None:
+    args.name = _clean(args.name, "--name")
+    args.id = _clean(args.id, "--id")
     if not args.system and not args.ops:
         raise IssueError("give --system, or --ops for an unrestricted entry")
     if args.caller_id_header and not args.system:
@@ -110,24 +153,50 @@ def issue(args: argparse.Namespace) -> None:
             raise IssueError(f"{out} exists; use --replace to issue a new token over it")
 
     token = secrets.token_urlsafe(32)
+    token_text = _token_text(token, args.format)
     digest = hashlib.sha256(token.encode("utf-8")).hexdigest()
     with _locked(tokens_file):
-        data = _read_tokens(tokens_file)
+        data, original = _read_tokens(tokens_file)
         names = [t.get("name") for t in data["tokens"] if isinstance(t, dict)]
         if args.name in names and not args.replace:
             raise IssueError(f"token name {args.name} exists; use --replace to rotate it")
-        mode = tokens_file.stat().st_mode & 0o777 if tokens_file.exists() else 0o600
-        tokens = [t for t in data["tokens"] if not (isinstance(t, dict) and t.get("name") == args.name)]
-        tokens.append(_entry(args, digest))
-        data["tokens"] = tokens
-        # Token first: if recording its hash then fails, the token just does
-        # not authenticate. Nothing half-written is ever accepted.
-        if out is not None:
-            _write_atomic(out, _token_text(token, args.format), 0o600)
-        _write_atomic(tokens_file, json.dumps(data, ensure_ascii=False, indent=2) + "\n", mode)
-    if out is None:
-        sys.stdout.write(_token_text(token, args.format))
-        sys.stdout.flush()
+        mode = tokens_file.stat().st_mode & 0o777 if original is not None else 0o600
+        data["tokens"] = [t for t in data["tokens"]
+                          if not (isinstance(t, dict) and t.get("name") == args.name)]
+        data["tokens"].append(_entry(args, digest))
+
+        staged_tokens = staged_out = None
+        try:
+            staged_tokens = _stage(tokens_file, json.dumps(data, ensure_ascii=False, indent=2) + "\n", mode)
+            # The bridge refuses to start on a bad file; check the whole
+            # result with its own loader before anything is replaced.
+            try:
+                _load_entries(str(staged_tokens))
+            except AuthError as e:
+                raise IssueError(f"the resulting tokens file would not load: {e}") from e
+            if out is not None:
+                staged_out = _stage(out, token_text, 0o600)
+            else:
+                # Hand the token over before registering it: a token that
+                # never got registered just does not work.
+                _write_stdout(token_text)
+            _place(staged_tokens, tokens_file)
+            staged_tokens = None
+            if staged_out is not None and out is not None:
+                try:
+                    _place(staged_out, out)
+                    staged_out = None
+                except OSError:
+                    # Put the previous registration back so the old token
+                    # (still in --out) keeps working.
+                    if original is None:
+                        _discard(tokens_file)
+                    else:
+                        _place(_stage(tokens_file, original, mode), tokens_file)
+                    raise
+        finally:
+            _discard(staged_tokens)
+            _discard(staged_out)
     print(
         f"issued {args.name} ({args.system or 'ops'}) into {tokens_file}; restart call-bridge to load it",
         file=sys.stderr,
