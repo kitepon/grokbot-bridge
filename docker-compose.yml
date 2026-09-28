@@ -26,9 +26,12 @@ services:
       - ${CALL_BRIDGE_DIRECTORY_UNIX_HOST:-./dirlive}:/run/dirlive
       # BellTeam creates this socket in its Bot integration directory.
       - ${CALL_BRIDGE_BELLTEAM_SOCKET_HOST:-./bellteam}:/run/bellteam
-      # Caller identity (optional). Mount the token map read-only and set
-      # CALL_BRIDGE_TOKENS_FILE=/run/call-bridge/tokens.json in .env.
-      # - ./tokens.json:/run/call-bridge/tokens.json:ro
+      # Caller identity (optional). Issue tokens into ./auth/tokens.json first
+      # (scripts/issue_token.py), then mount the directory read-only and set
+      # CALL_BRIDGE_TOKENS_FILE=/run/call-bridge/tokens.json in .env. Mount the
+      # directory, not the file: a missing file would become a directory, and
+      # a file mount keeps the old inode after the script replaces the file.
+      # - ./auth:/run/call-bridge:ro
     healthcheck:
       test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health', timeout=3)"]
       interval: 30s
