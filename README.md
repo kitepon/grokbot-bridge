@@ -92,6 +92,7 @@ call-bridge-setup status
 `enable` は既存の URL と token 環境変数名を読み、その MCP 登録をローカル MCP に切り替える。
 Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ保存し、MCP の PATH が狭い環境でも返信配送用 App Server を起動する。CLI や Node を移動した後は `enable` を再実行する。
 認証値は製品の state directory（既定は `~/.grokbot-bridge`）の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。Git や Codex 設定には書かない。`disable` はそのファイルを削除する。
+ローカル MCP と返信の見張りは、問い合わせのたびに `auth.json` を読み直すので、ファイルを差し替えれば動いたまま新しいトークンへ移る。ただし環境変数（既定は `CALL_BRIDGE_TOKEN`）が設定されていればそちらが優先され、プロセスの起動時の値から変わらない。トークンを入れ替える端末では、MCP を環境変数なしで起動し、`auth.json` で渡す。
 また、本製品専用の Codex hook を登録・承認する。他製品の hook は保持する。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
 元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。
@@ -248,7 +249,7 @@ Auth: `Authorization: Bearer <token>` on `/mcp` and `/v0/*` (`/health` is open).
    sqlite3 data/calls.db "SELECT session_id, local_system, local_id, member_system, member_id, status FROM sessions WHERE status IN ('ringing','open')"
    ```
 
-6. 旧トークンの警告が出なくなったら、`CALL_BRIDGE_TOKEN` を外して再起動する。
+6. 旧トークンの警告が出なくなったら、`CALL_BRIDGE_TOKEN` を外して再起動する。この修正より前の版のローカル MCP は、返信の見張りを始めた時のトークンを通話が終わるまで使い続ける。その見張りは旧トークンを止めると 401 で `failed` になるので、`local.sqlite` の `subscriptions` で `active` に戻し、環境変数なしで `python -m call_bridge.exec_watcher <session_id>` を起動して付け直す。`after_seq` は残るので返信は取りこぼさない。
 
 ### Client examples
 

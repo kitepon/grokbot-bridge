@@ -88,6 +88,66 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(fake.tokens, ["Bearer test-token", "Bearer rotated-token"])
         self.assertEqual(store.status(session_id)["state"], "closed")
 
+    async def test_watcher_reads_replaced_auth_file_on_the_next_poll(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        setup._write_json(root / "auth.json", {"token": "old-file-token"})
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        fake.on_poll = lambda: setup._write_json(root / "auth.json", {"token": "new-file-token"})
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer old-file-token", "Bearer new-file-token"])
+        self.assertEqual(store.status(session_id)["state"], "closed")
+
+    async def test_watcher_rides_out_a_briefly_unreadable_auth_file(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        (root / "auth.json").write_text("{", encoding="utf-8")
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        reads = 0
+
+        def headers():
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                setup._write_json(root / "auth.json", {"token": "restored-token"})
+            return real_headers()
+
+        real_headers = local._headers
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}), \
+             patch.object(local, "_headers", headers), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer restored-token", "Bearer restored-token"])
+        self.assertEqual(store.status(session_id)["state"], "closed")
+
+    async def test_watcher_stops_when_the_token_stays_unreadable(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        (root / "auth.json").write_text("{", encoding="utf-8")
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.polls, [])
+        status = store.status(session_id)
+        self.assertEqual(status["state"], "failed")
+
     async def test_exec_reply_is_reported_as_persisted_injection(self):
         store = local.LocalStore(Path(self.temp.name))
         session_id = str(uuid.uuid4())
