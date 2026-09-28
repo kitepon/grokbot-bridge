@@ -26,6 +26,9 @@ from .codex_delivery import (DeliveryError, codex_home, hook_delivery_state,
 log = logging.getLogger("call_bridge.local")
 _DELIVERY_NAMESPACE = uuid.UUID("ddf85db7-8d27-4c57-8ba5-9ad498cd64c9")
 _POLL_SECONDS = 2.0
+# Consecutive polls without a readable token before the watcher gives up
+# (about 30 seconds, enough to delete and recreate auth.json by hand).
+_TOKEN_READ_ATTEMPTS = 15
 
 
 def _config() -> dict[str, str]:
@@ -53,6 +56,8 @@ def _rest_url(session_id: str) -> str:
 
 
 def _headers() -> dict[str, str]:
+    # The environment variable wins over auth.json and is fixed for the life of the
+    # process; only auth.json can be rotated under a running MCP or watcher.
     config = _config()
     token_env = config.get("token_env", "CALL_BRIDGE_TOKEN")
     token = os.environ.get(token_env, "").strip()
@@ -260,10 +265,27 @@ class Watchers:
 
     async def _watch_claimed(self, session_id: str) -> None:
         subscription = self.store.subscription(session_id)
-        async with httpx.AsyncClient(headers=_headers(), timeout=10) as client:
+        token_failures = 0
+        async with httpx.AsyncClient(timeout=10) as client:
             while True:
+                # Read the token per poll so a rotated auth.json reaches a long-lived watcher.
+                # A replacement in progress can leave it briefly unreadable; only a lasting
+                # failure stops the watch.
                 try:
-                    response = await client.get(_rest_url(session_id), params={
+                    headers = _headers()
+                except (DeliveryError, ValueError, OSError) as exc:
+                    token_failures += 1
+                    detail = str(exc) if isinstance(exc, DeliveryError) else f"LOCAL_CONFIG_INVALID: {exc}"
+                    if token_failures >= _TOKEN_READ_ATTEMPTS:
+                        self.store.stop(session_id, "failed", detail)
+                        return
+                    self.store.transport_error(session_id, detail)
+                    log.warning("reply watch token unreadable for %s: %s", session_id, exc)
+                    await asyncio.sleep(_POLL_SECONDS)
+                    continue
+                token_failures = 0
+                try:
+                    response = await client.get(_rest_url(session_id), headers=headers, params={
                         "party": "local", "after_seq": subscription["after_seq"],
                     })
                     response.raise_for_status()

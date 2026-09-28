@@ -22,6 +22,8 @@ from call_bridge import codex_delivery, local, setup
 class FakeHTTP:
     def __init__(self, *_args, **_kwargs):
         self.polls: list[int] = []
+        self.tokens: list[str] = []
+        self.on_poll = None
 
     async def __aenter__(self):
         return self
@@ -29,8 +31,11 @@ class FakeHTTP:
     async def __aexit__(self, *_args):
         pass
 
-    async def get(self, url, params):
+    async def get(self, url, params, headers=None):
         self.polls.append(params["after_seq"])
+        self.tokens.append((headers or {}).get("Authorization", ""))
+        if self.on_poll is not None:
+            self.on_poll()
         if params["after_seq"] == 0:
             body = {"ok": True, "status": "open", "messages": [
                 {"seq": 2, "message": "一通目"}, {"seq": 4, "message": "二通目"},
@@ -69,6 +74,145 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("二通目", send.await_args_list[1].args[3])
         self.assertEqual(store.status(session_id)["state"], "closed")
         self.assertEqual(store.status(session_id)["after_seq"], 4)
+
+    async def test_watcher_reads_rotated_token_on_the_next_poll(self):
+        store = local.LocalStore(Path(self.temp.name))
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), Path(self.temp.name), "ラピ")
+        fake = FakeHTTP()
+        fake.on_poll = lambda: os.environ.__setitem__("CALL_BRIDGE_TOKEN", "rotated-token")
+        with patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer test-token", "Bearer rotated-token"])
+        self.assertEqual(store.status(session_id)["state"], "closed")
+
+    async def test_watcher_reads_replaced_auth_file_on_the_next_poll(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        setup._write_json(root / "auth.json", {"token": "old-file-token"})
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        fake.on_poll = lambda: setup._write_json(root / "auth.json", {"token": "new-file-token"})
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer old-file-token", "Bearer new-file-token"])
+        self.assertEqual(store.status(session_id)["state"], "closed")
+
+    async def test_watcher_rides_out_a_briefly_unreadable_auth_file(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        (root / "auth.json").write_text("{", encoding="utf-8")
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        reads = 0
+
+        def headers():
+            nonlocal reads
+            reads += 1
+            if reads == 3:
+                setup._write_json(root / "auth.json", {"token": "restored-token"})
+            return real_headers()
+
+        real_headers = local._headers
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}), \
+             patch.object(local, "_headers", headers), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer restored-token", "Bearer restored-token"])
+        self.assertEqual(store.status(session_id)["state"], "closed")
+
+    async def test_watcher_stops_when_the_token_stays_unreadable(self):
+        root = Path(self.temp.name)
+        setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+        (root / "auth.json").write_text("{", encoding="utf-8")
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        reads = 0
+        real_headers = local._headers
+
+        def headers():
+            nonlocal reads
+            reads += 1
+            return real_headers()
+
+        with patch.dict(os.environ, {"CALL_BRIDGE_TOKEN": ""}), \
+             patch.object(local, "_headers", headers), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.polls, [])
+        self.assertEqual(reads, local._TOKEN_READ_ATTEMPTS)
+        subscription = store.subscription(session_id)
+        self.assertEqual(subscription["state"], "failed")
+        self.assertTrue(subscription["last_error"].startswith("BRIDGE_TOKEN_INVALID"))
+
+    async def test_watcher_counts_only_consecutive_unreadable_tokens(self):
+        root = Path(self.temp.name)
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        # Fail one short of the limit before every successful read, three times over.
+        limit = local._TOKEN_READ_ATTEMPTS
+        results = iter(([False] * (limit - 1) + [True]) * 3)
+        polls = 0
+
+        def headers():
+            if not next(results):
+                raise codex_delivery.DeliveryError("BRIDGE_TOKEN_INVALID", "読めません")
+            return {"Authorization": "Bearer test-token"}
+
+        class OpenThenHungup(FakeHTTP):
+            async def get(self, url, params, headers=None):
+                nonlocal polls
+                polls += 1
+                status = "hungup" if polls == 3 else "open"
+                return httpx.Response(200, json={"ok": True, "status": status, "messages": []},
+                                      request=httpx.Request("GET", url))
+
+        with patch.object(local, "_headers", headers), \
+             patch.object(local.httpx, "AsyncClient", return_value=OpenThenHungup()), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(polls, 3)
+        self.assertEqual(store.subscription(session_id)["state"], "closed")
+
+    async def test_watcher_rides_out_a_broken_config_file(self):
+        root = Path(self.temp.name)
+        (root / "config.json").write_text("{", encoding="utf-8")
+        store = local.LocalStore(root)
+        session_id = str(uuid.uuid4())
+        store.add(session_id, str(uuid.uuid4()), root, "ラピ")
+        fake = FakeHTTP()
+        reads = 0
+        real_headers = local._headers
+
+        def headers():
+            nonlocal reads
+            reads += 1
+            if reads == 2:
+                setup._write_json(root / "config.json", {"enabled": True, "token_env": "CALL_BRIDGE_TOKEN"})
+            return real_headers()
+
+        with patch.object(local, "_headers", headers), \
+             patch.object(local.httpx, "AsyncClient", return_value=fake), \
+             patch.object(local, "submit_reply", AsyncMock(return_value="queue-id")), \
+             patch.object(local, "_POLL_SECONDS", 0):
+            await local.Watchers(store).watch(session_id)
+        self.assertEqual(fake.tokens, ["Bearer test-token", "Bearer test-token"])
+        self.assertEqual(store.subscription(session_id)["state"], "closed")
 
     async def test_exec_reply_is_reported_as_persisted_injection(self):
         store = local.LocalStore(Path(self.temp.name))
