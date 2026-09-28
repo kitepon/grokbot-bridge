@@ -172,6 +172,54 @@ class IssueTokenTest(unittest.TestCase):
         self.assertIn("nothing was registered", err.getvalue())
         self.assertEqual(self.tokens.read_text(), before)
 
+    def test_directory_sync_failure_after_rename_only_warns(self) -> None:
+        out = self.dir / "grok.token"
+        with mock.patch.object(issue_token, "_fsync_dir", side_effect=OSError("no sync")):
+            code, _, err = self._run("--name", "grokbot", "--system", "grokbot", "--out", str(out))
+        self.assertEqual(code, 0, err)
+        self.assertIn("warning", err)
+        self.assertEqual(Authenticator("", str(self.tokens)).authenticate(
+            {"authorization": f"Bearer {out.read_text().strip()}"}).system, "grokbot")
+
+    def test_failed_restore_keeps_the_new_token_and_says_where(self) -> None:
+        out = self.dir / "grok.token"
+        self._run("--name", "grokbot", "--system", "grokbot", "--out", str(out))
+        old_token = out.read_text().strip()
+        real_replace = issue_token.os.replace
+        calls = {"tokens": 0}
+
+        def replace(src, dst):
+            if Path(dst) == out:
+                raise OSError("out busy")
+            if Path(dst) == self.tokens:
+                calls["tokens"] += 1
+                if calls["tokens"] > 1:
+                    raise OSError("restore failed")
+            return real_replace(src, dst)
+
+        with mock.patch.object(issue_token.os, "replace", replace):
+            code, _, err = self._run("--name", "grokbot", "--system", "grokbot", "--out", str(out), "--replace")
+        self.assertEqual(code, 1)
+        self.assertEqual(out.read_text().strip(), old_token)
+        kept = [p for p in self.dir.iterdir() if p.name.startswith(".grok.token.")]
+        self.assertEqual(len(kept), 1)
+        self.assertIn(str(kept[0]), err)
+        self.assertEqual(stat.S_IMODE(kept[0].stat().st_mode), 0o600)
+        auth = Authenticator("", str(self.tokens))
+        self.assertEqual(auth.authenticate({"authorization": f"Bearer {kept[0].read_text().strip()}"}).system,
+                         "grokbot")
+        self.assertIsNone(auth.authenticate({"authorization": f"Bearer {old_token}"}))
+        self.assertEqual([p for p in self.dir.iterdir() if p.name.startswith(".tokens.json.")], [])
+
+    def test_missing_stdout_registers_nothing(self) -> None:
+        err = io.StringIO()
+        with contextlib.redirect_stdout(None), contextlib.redirect_stderr(err):
+            code = issue_token.main(["--tokens-file", str(self.tokens), "--name", "grokbot",
+                                     "--system", "grokbot", "--out", "-"])
+        self.assertEqual(code, 1)
+        self.assertIn("nothing was registered", err.getvalue())
+        self.assertFalse(self.tokens.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

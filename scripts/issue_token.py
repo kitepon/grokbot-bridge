@@ -89,8 +89,13 @@ def _stage(path: Path, text: str, mode: int) -> Path:
 
 
 def _place(staged: Path, path: Path) -> None:
+    """Rename ``staged`` over ``path``. Once renamed, only warn if the
+    directory fsync fails: the new file is in place and must not be undone."""
     os.replace(staged, path)
-    _fsync_dir(path.parent)
+    try:
+        _fsync_dir(path.parent)
+    except OSError as e:
+        print(f"issue_token: warning: {path.parent} was not synced to disk: {e}", file=sys.stderr)
 
 
 def _discard(path: Path | None) -> None:
@@ -128,6 +133,8 @@ def _token_text(token: str, fmt: str) -> str:
 
 
 def _write_stdout(text: str) -> None:
+    if sys.stdout is None:
+        raise IssueError("stdout is closed; nothing was registered")
     try:
         sys.stdout.write(text)
         sys.stdout.flush()
@@ -186,13 +193,26 @@ def issue(args: argparse.Namespace) -> None:
                 try:
                     _place(staged_out, out)
                     staged_out = None
-                except OSError:
+                except OSError as e:
                     # Put the previous registration back so the old token
                     # (still in --out) keeps working.
-                    if original is None:
-                        _discard(tokens_file)
-                    else:
-                        _place(_stage(tokens_file, original, mode), tokens_file)
+                    restore = None
+                    try:
+                        if original is None:
+                            _discard(tokens_file)
+                        else:
+                            restore = _stage(tokens_file, original, mode)
+                            _place(restore, tokens_file)
+                            restore = None
+                    except OSError as restore_error:
+                        _discard(restore)
+                        kept, staged_out = staged_out, None
+                        raise IssueError(
+                            f"could not place {out} ({e}) nor restore {tokens_file} ({restore_error}). "
+                            f"{tokens_file} now registers the new token for {args.name}, which is kept in {kept}; "
+                            f"{out} still holds the old token, which no longer works. "
+                            f"Move {kept} to {out}, or rerun with --replace."
+                        ) from e
                     raise
         finally:
             _discard(staged_tokens)
