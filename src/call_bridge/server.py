@@ -15,11 +15,12 @@ from pathlib import Path
 from typing import Any, Literal
 
 from dotenv import load_dotenv
-from mcp.server.fastmcp import FastMCP
+from mcp.server.fastmcp import Context, FastMCP
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
+from .auth import AuthError, Authenticator, OPEN, Principal, check_open, is_participant, is_party
 from .db import CallStore
 from .deliver import dispatch_send
 from .directory import DIRECTORY_HOP_HEADER, resolve_bellteam_member, resolve_member_agent_id, search_directory
@@ -34,6 +35,7 @@ _INSTRUCTIONS = """
 BellTeam宛てはcall_openのmember_system="bellteam"、member_nameには名前かBot IDを指定する。
 BellTeamのBotが発信する時はlocal_system="bellteam"、local_idには自身のBot IDを指定する。
 同名が複数あればBot IDを使う。local/memberは通話内の発信者/受信者を表す。
+接続のトークンが所属に結び付いている時は、その所属（BellTeamはBot IDまで）の当事者としてだけ操作でき、違えばerror=forbiddenになる。
 GrokBot宛てのsession.openedには本文を含めず、localのcall_sendをMarianが中継する。
 BellTeam宛てはcall_sendがBellTeamへ直接届ける。マリアンは通らない。
 
@@ -59,7 +61,7 @@ load_dotenv()
 DB_PATH = os.environ.get("CALL_BRIDGE_DB", "data/calls.db")
 HOST = os.environ.get("CALL_BRIDGE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("CALL_BRIDGE_PORT", "18910"))
-TOKEN = os.environ.get("CALL_BRIDGE_TOKEN", "").strip()
+AUTH = Authenticator.from_env()
 
 store = CallStore(DB_PATH)
 
@@ -73,6 +75,30 @@ mcp = FastMCP(
 
 
 # ---------- MCP tools ----------
+
+
+def _principal(ctx: Context | None) -> Principal:
+    """The authenticated caller of this MCP request; in-process calls are open."""
+    if ctx is None:
+        return OPEN
+    try:
+        request = ctx.request_context.request
+    except ValueError:
+        return OPEN
+    if request is None:
+        return OPEN
+    return getattr(request.state, "principal", OPEN)
+
+
+def _forbidden(detail: str) -> dict[str, Any]:
+    return {"error": "forbidden", "detail": detail}
+
+
+def _party_denied(principal: Principal, session_id: str, party: str) -> dict[str, Any] | None:
+    sess = store.get_session(session_id)
+    if sess is None or is_party(principal, sess, party):
+        return None
+    return _forbidden(f"this connection is not the {party} party of the call")
 
 
 def _session_view(sess: dict[str, Any], wake: dict[str, str]) -> dict[str, Any]:
@@ -106,9 +132,25 @@ def call_open(
     purpose: str | None = None,
     member_system: str = "grokbot",
     local_system: str = "local",
+    ctx: Context | None = None,
+) -> dict[str, Any]:
+    return _open(_principal(ctx), local_id, local_label, member_name, purpose, member_system, local_system)
+
+
+def _open(
+    principal: Principal,
+    local_id: str,
+    local_label: str,
+    member_name: str,
+    purpose: str | None,
+    member_system: str,
+    local_system: str,
 ) -> dict[str, Any]:
     if member_system not in ("grokbot", "bellteam") or local_system not in ("local", "grokbot", "bellteam"):
         return {"error": "rejected", "detail": "invalid member_system or local_system"}
+    denied = check_open(principal, local_system, local_id)
+    if denied:
+        return _forbidden(denied)
     member_id = None
     if member_system == "bellteam":
         resolved = resolve_bellteam_member(member_name)
@@ -137,7 +179,15 @@ def call_open(
     )
 )
 def call_send(session_id: str, from_party: Party, message: str,
-              reply_required: bool = True) -> dict[str, Any]:
+              reply_required: bool = True, ctx: Context | None = None) -> dict[str, Any]:
+    return _send(_principal(ctx), session_id, from_party, message, reply_required)
+
+
+def _send(principal: Principal, session_id: str, from_party: str, message: str,
+          reply_required: bool) -> dict[str, Any]:
+    denied = _party_denied(principal, session_id, from_party)
+    if denied:
+        return denied
     try:
         return dispatch_send(store, session_id, from_party, message, reply_required)
     except KeyError as e:
@@ -156,7 +206,15 @@ def call_poll(
     session_id: str,
     party: Party,
     after_seq: int = 0,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
+    return _poll(_principal(ctx), session_id, party, after_seq)
+
+
+def _poll(principal: Principal, session_id: str, party: str, after_seq: int) -> dict[str, Any]:
+    denied = _party_denied(principal, session_id, party)
+    if denied:
+        return denied
     try:
         return store.poll_messages(session_id, party, after_seq=after_seq, mark_delivered=True)
     except KeyError as e:
@@ -171,10 +229,13 @@ def call_list(
     local_id: str | None = None,
     member_name: str | None = None,
     status: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
+    principal = _principal(ctx)
     sessions = store.list_sessions(
         party=party, local_id=local_id, member_name=member_name, status=status
     )
+    sessions = [s for s in sessions if is_participant(principal, s)]
     return {"sessions": sessions, "count": len(sessions)}
 
 
@@ -183,7 +244,16 @@ def call_hangup(
     session_id: str,
     by_party: HangupParty,
     reason: str | None = None,
+    ctx: Context | None = None,
 ) -> dict[str, Any]:
+    principal = _principal(ctx)
+    if by_party == "ops":
+        if not principal.ops:
+            return _forbidden("this connection may not hang up as ops")
+    else:
+        denied = _party_denied(principal, session_id, by_party)
+        if denied:
+            return denied
     try:
         sess = store.hangup(session_id, by_party, reason)
         return {
@@ -200,9 +270,13 @@ def call_hangup(
 
 
 @mcp.tool(description="セッション詳細（メタデータ＋メッセージ数）。")
-def call_info(session_id: str) -> dict[str, Any]:
+def call_info(session_id: str, ctx: Context | None = None) -> dict[str, Any]:
+    principal = _principal(ctx)
     try:
-        return store.session_info(session_id)
+        info = store.session_info(session_id)
+        if not is_participant(principal, info):
+            return _forbidden("this connection is not a party of the call")
+        return info
     except KeyError as e:
         return {"error": "not_found", "detail": str(e)}
 
@@ -237,21 +311,13 @@ def _delivery_http_status(error: str) -> int:
         return 400
     if error == "rejected":
         return 409
+    if error == "forbidden":
+        return 403
     return 502
 
 
-def _check_bearer(request: Request) -> Response | None:
-    """Return 401 Response if token required and missing/wrong; else None."""
-    if not TOKEN:
-        return None
-    auth = request.headers.get("authorization", "")
-    if auth == f"Bearer {TOKEN}":
-        return None
-    return JSONResponse(
-        {"ok": False, "error": "unauthorized"},
-        status_code=401,
-        headers={"WWW-Authenticate": "Bearer"},
-    )
+def _request_principal(request: Request) -> Principal:
+    return getattr(request.state, "principal", OPEN)
 
 
 @mcp.custom_route("/health", methods=["GET"])
@@ -269,9 +335,6 @@ async def health(_request: Request) -> Response:
 
 @mcp.custom_route("/v0/directory", methods=["GET"])
 async def rest_directory(request: Request) -> Response:
-    denied = _check_bearer(request)
-    if denied is not None:
-        return denied
     query = request.query_params.get("q") or request.query_params.get("query")
     # Hop header: this GET is itself a directory fetch. Do not call the unix
     # socket or CALL_BRIDGE_DIRECTORY_URL again. Wake/webhook behavior is unchanged.
@@ -281,9 +344,6 @@ async def rest_directory(request: Request) -> Response:
 
 @mcp.custom_route("/v0/sessions", methods=["POST"])
 async def rest_open_session(request: Request) -> Response:
-    denied = _check_bearer(request)
-    if denied is not None:
-        return denied
     try:
         body = await request.json()
     except Exception:
@@ -303,7 +363,7 @@ async def rest_open_session(request: Request) -> Response:
             },
             status_code=400,
         )
-    result = await asyncio.to_thread(call_open, str(local_id), str(local_label), str(member_name), purpose, member_system, local_system)
+    result = await asyncio.to_thread(_open, _request_principal(request), str(local_id), str(local_label), str(member_name), purpose, member_system, local_system)
     if result.get("error"):
         return JSONResponse({"ok": False, **result}, status_code=_delivery_http_status(str(result["error"])))
     return JSONResponse({"ok": True, **result}, status_code=201)
@@ -311,9 +371,6 @@ async def rest_open_session(request: Request) -> Response:
 
 @mcp.custom_route("/v0/sessions/{session_id}/messages", methods=["POST"])
 async def rest_send(request: Request) -> Response:
-    denied = _check_bearer(request)
-    if denied is not None:
-        return denied
     session_id = request.path_params["session_id"]
     try:
         body = await request.json()
@@ -333,8 +390,8 @@ async def rest_send(request: Request) -> Response:
         )
     try:
         result = await asyncio.to_thread(
-            dispatch_send,
-            store,
+            _send,
+            _request_principal(request),
             session_id,
             from_party,
             str(message),
@@ -354,9 +411,6 @@ async def rest_send(request: Request) -> Response:
 
 @mcp.custom_route("/v0/sessions/{session_id}/poll", methods=["GET"])
 async def rest_poll(request: Request) -> Response:
-    denied = _check_bearer(request)
-    if denied is not None:
-        return denied
     session_id = request.path_params["session_id"]
     party = request.query_params.get("party", "")
     after_seq = int(request.query_params.get("after_seq", "0"))
@@ -365,37 +419,34 @@ async def rest_poll(request: Request) -> Response:
             {"ok": False, "error": "query party=local|member required"},
             status_code=400,
         )
-    try:
-        result = store.poll_messages(session_id, party, after_seq=after_seq)
-        return JSONResponse({"ok": True, **result})
-    except KeyError as e:
-        return JSONResponse({"ok": False, "error": "not_found", "detail": str(e)}, status_code=404)
+    result = _poll(_request_principal(request), session_id, party, after_seq)
+    if result.get("error"):
+        return JSONResponse({"ok": False, **result}, status_code=_delivery_http_status(str(result["error"])))
+    return JSONResponse({"ok": True, **result})
 
 
 class BearerAuthMiddleware(BaseHTTPMiddleware):
-    """Require Bearer token on /mcp (and anything except /health).
+    """Authenticate every path except /health and record the caller.
 
-    /v0/* also checks in-handler (custom routes skip FastMCP OAuth), but
-    middleware covers /mcp streamable HTTP which has no built-in simple bearer.
+    The principal goes to ``request.state.principal``; MCP tools and /v0
+    handlers read it to decide which party of a call the caller may act as.
     """
 
     async def dispatch(self, request: Request, call_next):
         path = request.url.path
         if path == "/health" or path.rstrip("/") == "/health":
             return await call_next(request)
-        # /v0 handlers do their own check so we don't double-gate, but
-        # still protect /mcp and unknown paths when TOKEN is set.
-        if path.startswith("/v0/"):
-            return await call_next(request)
-        if not TOKEN:
-            return await call_next(request)
-        auth = request.headers.get("authorization", "")
-        if auth != f"Bearer {TOKEN}":
+        try:
+            principal = AUTH.authenticate(request.headers)
+        except AuthError as e:
+            return JSONResponse({"ok": False, "error": "forbidden", "detail": str(e)}, status_code=403)
+        if principal is None:
             return JSONResponse(
                 {"ok": False, "error": "unauthorized"},
                 status_code=401,
                 headers={"WWW-Authenticate": "Bearer"},
             )
+        request.state.principal = principal
         return await call_next(request)
 
 
@@ -406,13 +457,16 @@ def main() -> None:
     )
     Path(DB_PATH).parent.mkdir(parents=True, exist_ok=True)
 
-    if not TOKEN:
+    if not AUTH.enabled:
         log.warning(
-            "CALL_BRIDGE_TOKEN unset — MCP and /v0 are open (dev only). "
-            "Set a strong token in .env for production."
+            "CALL_BRIDGE_TOKEN and CALL_BRIDGE_TOKENS_FILE unset — MCP and /v0 are open (dev only). "
+            "Set tokens for production."
         )
     else:
-        log.info("Bearer auth enabled (token length=%d)", len(TOKEN))
+        log.info(
+            "Bearer auth enabled (bound tokens=%d, legacy token=%s)",
+            len(AUTH.entries), "on" if AUTH.legacy_token else "off",
+        )
 
     mcp.settings.host = HOST
     mcp.settings.port = PORT

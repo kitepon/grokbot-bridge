@@ -198,7 +198,26 @@ curl -sS http://127.0.0.1:18910/health
 ```
 
 MCP endpoint: `http://127.0.0.1:18910/mcp`  
-Auth: `Authorization: Bearer <CALL_BRIDGE_TOKEN>` on `/mcp` and `/v0/*` (`/health` is open). Without a token, `/mcp` and `/v0/*` are also open; use this only for local development.
+Auth: `Authorization: Bearer <token>` on `/mcp` and `/v0/*` (`/health` is open). Without any token setting, `/mcp` and `/v0/*` are also open; use this only for local development.
+
+### 発信者の本人確認
+
+`CALL_BRIDGE_TOKENS_FILE` を設定すると、トークンごとに所属を結び付ける。ファイルにはトークン本体ではなく SHA-256 を書く（`printf %s "$TOKEN" | sha256sum`）。
+
+```json
+{"tokens": [
+  {"name": "bellteam", "sha256": "<hex>", "system": "bellteam", "caller_id_header": true},
+  {"name": "grokbot", "sha256": "<hex>", "system": "grokbot"},
+  {"name": "macbook", "sha256": "<hex>", "system": "local"},
+  {"name": "ops", "sha256": "<hex>", "ops": true}
+]}
+```
+
+- `system` 付きのトークンは、その所属の当事者としてだけ動ける。`call_open` の `local_system` は所属と一致しなければならない。
+- `call_send`・`call_poll`・`call_hangup` は、通話の `local`／`member` のうち、接続の所属に当たる側だけを受け付ける。`call_info`・`call_list` も当事者の通話だけを返す。違反は `error=forbidden`（REST は 403）。
+- `caller_id_header: true` のトークンは、基盤が `X-Call-Bridge-Caller-Id` で発信者の ID を付けられる。付いた接続は、その ID の通話だけを扱える。BellTeam は Bot ごとに付ける。付かない接続と GrokBot は所属単位で扱う。許可のないトークンにこのヘッダーがあると 403。
+- `system` のない項目は全権で、`ops: true` が必要。`call_hangup(by_party="ops")` は `ops` のトークンだけが使える。
+- 移行中は `CALL_BRIDGE_TOKEN` も全権の旧トークンとして受け付け、5分に1回警告を記録する。`CALL_BRIDGE_TOKENS_FILE` がなければ、今までと同じ動きになる。
 
 ### Client examples
 
@@ -241,6 +260,7 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `CALL_BRIDGE_TOKEN` | _(unset)_ | Bearer token. Set it for production; if unset, MCP and REST are open for local development |
+| `CALL_BRIDGE_TOKENS_FILE` | _(unset)_ | 所属に結び付けたトークンの対応ファイル（上記）。コンテナでは読み取り専用でマウントする |
 | `CALL_BRIDGE_HOST` | `0.0.0.0` | Bind host |
 | `CALL_BRIDGE_PORT` | `18910` | Bind port |
 | `CALL_BRIDGE_DB` | `data/calls.db` | SQLite path |
