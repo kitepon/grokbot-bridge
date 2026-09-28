@@ -7,7 +7,7 @@ requires-python = ">=3.11"
 license = { text = "MIT" }
 authors = [{ name = "kitepon.dev" }]
 dependencies = [
-    "mcp>=1.2.0,<2",
+    "mcp>=1.14,<2",
     "python-dotenv>=1.0",
     "psutil>=7.2,<9",
 ]

@@ -187,7 +187,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(second, {})
         self.assertEqual(reserved, [])
 
-    async def test_call_open_keeps_grokbot_and_local_defaults(self):
+    async def test_call_open_keeps_grokbot_default_and_leaves_local_system_to_the_bridge(self):
         session_id = str(uuid.uuid4())
         with patch.object(local, "_parent", return_value=(str(uuid.uuid4()), Path(self.temp.name))), \
              patch.object(local, "verify_parent", new_callable=AsyncMock), \
@@ -198,7 +198,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
             await local.call_open("caller", "発信者", "ラピ", ctx=object())
 
         self.assertEqual(remote.await_args.args[1]["member_system"], "grokbot")
-        self.assertEqual(remote.await_args.args[1]["local_system"], "local")
+        self.assertNotIn("local_system", remote.await_args.args[1])
 
     async def test_queue_reply_names_the_member_system(self):
         store = local.LocalStore(Path(self.temp.name))

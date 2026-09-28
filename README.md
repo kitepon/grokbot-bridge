@@ -71,7 +71,7 @@ REST の `POST /v0/sessions/{session_id}/messages` でも本文に
 
 Codex から通話する端末では、ローカル MCP を登録すると `call_open` が親タスクを識別する。
 ローカル MCP でも `call_open(member_system="bellteam")` でBellTeam宛てを選べる。
-`member_system`の既定は`grokbot`、`local_system`の既定は`local`で、両方とも遠隔MCPへ渡す。
+`member_system`の既定は`grokbot`で、遠隔MCPへ渡す。`local_system`は指定した時だけ渡し、省くと遠隔MCPが接続のトークンの所属を使う（共通トークンでは`local`）。
 ローカル MCP が通話の返信を裏で取得し、Codex 親へ一通ずつ渡す。
 親AI自身が `call_poll` を繰り返す必要はない。継続型の親ではCodexの公式キューを使い、進行中なら
 `PostToolUse`／`Stop` hook が返信を同じターンへ差し込み、ターン終了後なら
@@ -198,7 +198,42 @@ curl -sS http://127.0.0.1:18910/health
 ```
 
 MCP endpoint: `http://127.0.0.1:18910/mcp`  
-Auth: `Authorization: Bearer <CALL_BRIDGE_TOKEN>` on `/mcp` and `/v0/*` (`/health` is open). Without a token, `/mcp` and `/v0/*` are also open; use this only for local development.
+Auth: `Authorization: Bearer <token>` on `/mcp` and `/v0/*` (`/health` is open). Without any token setting, `/mcp` and `/v0/*` are also open; use this only for local development.
+
+### 発信者の本人確認
+
+`CALL_BRIDGE_TOKENS_FILE` を設定すると、トークンごとに所属を結び付ける。ファイルにはトークン本体ではなく SHA-256 を書く（`printf %s "$TOKEN" | sha256sum`）。
+
+```json
+{"tokens": [
+  {"name": "bellteam", "sha256": "<hex>", "system": "bellteam", "caller_id_header": true},
+  {"name": "grokbot", "sha256": "<hex>", "system": "grokbot"},
+  {"name": "macbook", "sha256": "<hex>", "system": "local"},
+  {"name": "ops", "sha256": "<hex>", "ops": true}
+]}
+```
+
+- `system` 付きのトークンは、その所属の当事者としてだけ動ける。`call_open` の `local_system` は所属と一致しなければならない。
+- `call_send`・`call_poll`・`call_hangup` は、通話の `local`／`member` のうち、接続の所属に当たる側だけを受け付ける。`call_info`・`call_list` も当事者の通話だけを返す。違反は `error=forbidden`（REST は 403）。
+- `call_open` で `local_system` を省くと、所属に結び付いた接続ではその所属を使う。旧トークンと開発モードでは今までどおり `local`。
+- `caller_id_header: true` のトークンは、基盤が `X-Call-Bridge-Caller-Id` で発信者の ID を付けられる。付いた接続は、その ID の通話だけを扱える。BellTeam は Bot ごとに付ける。BellTeam トークンでヘッダーを付けない接続は、BellTeam 全体として扱う。GrokBot は1つの接続設定を共有するので所属単位。許可のないトークンにこのヘッダーがあると 403。旧トークンに付いたヘッダーは無視する。
+- `system` のない項目は全権で、`ops: true` が必要。`call_hangup(by_party="ops")` は `ops` のトークンと旧トークンだけが使える。
+- `ops`・`caller_id_header` は真偽値、`name`・`sha256`・`system`・`id` は文字列で書く。型の違い、同じ `sha256` の重複、項目0件、読めないファイル、壊れた JSON は、1行のエラーで起動を止める。
+- 移行中は `CALL_BRIDGE_TOKEN` も全権の旧トークンとして受け付ける。対応ファイルに項目がある間は、旧トークンが使われると5分に1回警告を記録する。`CALL_BRIDGE_TOKENS_FILE` がなければ、今までと同じ動きになる。
+
+#### 切り替え手順
+
+1. 所属ごとにトークンを作り、配る先と方法を決める（GrokBot 側はマリアン、BellTeam はトロニーが受け持つ）。対応ファイルにはハッシュだけを書く。
+2. 対応ファイルを読み取り専用でマウントし、`CALL_BRIDGE_TOKENS_FILE` を設定して再起動する。旧トークンは残す。この時点では誰も新しいトークンを使っていないので、動きは変わらない。
+3. 各基盤の接続設定を新しいトークンへ切り替える。BellTeam は `X-Call-Bridge-Caller-Id` を付ける版を先に入れておく。
+4. 切り替えた基盤から、`local_system` を省いた発信と返信を1往復ずつ試す。
+5. 切り替え前に開いた通話は、発信者の所属が `local_system='local'` のまま残っていることがある。新しいトークンでは当事者と一致せず `forbidden` になる。旧トークンを止める前に、進行中の通話を確かめて終わらせる。
+
+   ```sh
+   sqlite3 data/calls.db "SELECT session_id, local_system, local_id, member_system, member_id, status FROM sessions WHERE status IN ('ringing','open')"
+   ```
+
+6. 旧トークンの警告が出なくなったら、`CALL_BRIDGE_TOKEN` を外して再起動する。
 
 ### Client examples
 
@@ -241,6 +276,7 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | Env | Default | Meaning |
 |-----|---------|---------|
 | `CALL_BRIDGE_TOKEN` | _(unset)_ | Bearer token. Set it for production; if unset, MCP and REST are open for local development |
+| `CALL_BRIDGE_TOKENS_FILE` | _(unset)_ | 所属に結び付けたトークンの対応ファイル（上記）。コンテナでは読み取り専用でマウントする |
 | `CALL_BRIDGE_HOST` | `0.0.0.0` | Bind host |
 | `CALL_BRIDGE_PORT` | `18910` | Bind port |
 | `CALL_BRIDGE_DB` | `data/calls.db` | SQLite path |
