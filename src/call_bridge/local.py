@@ -388,17 +388,21 @@ async def call_directory(query: str | None = None) -> dict[str, Any]:
 async def call_open(local_id: str, local_label: str, member_name: str,
                     purpose: str | None = None,
                     member_system: Literal["grokbot", "bellteam"] = "grokbot",
-                    local_system: Literal["local", "grokbot", "bellteam"] = "local",
+                    local_system: Literal["local", "grokbot", "bellteam"] | None = None,
                     ctx: Context | None = None) -> dict[str, Any]:
     if ctx is None:
         raise DeliveryError("PARENT_UNAVAILABLE", "親タスクを確認できません")
     thread_id, home = _parent(ctx)
     source = await verify_parent(thread_id, home)
-    result = await _remote_tool("call_open", {
+    arguments = {
         "local_id": local_id, "local_label": local_label,
         "member_name": member_name, "purpose": purpose,
-        "member_system": member_system, "local_system": local_system,
-    })
+        "member_system": member_system,
+    }
+    # Omitted, the bridge uses the token's system (local for the shared token).
+    if local_system is not None:
+        arguments["local_system"] = local_system
+    result = await _remote_tool("call_open", arguments)
     session_id = result.get("session_id")
     if not isinstance(session_id, str):
         raise DeliveryError("BRIDGE_RESPONSE_INVALID", "通話IDを確認できません")
