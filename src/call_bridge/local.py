@@ -26,8 +26,9 @@ from .codex_delivery import (DeliveryError, codex_home, hook_delivery_state,
 log = logging.getLogger("call_bridge.local")
 _DELIVERY_NAMESPACE = uuid.UUID("ddf85db7-8d27-4c57-8ba5-9ad498cd64c9")
 _POLL_SECONDS = 2.0
-# Consecutive polls without a readable token before the watcher gives up.
-_TOKEN_READ_ATTEMPTS = 5
+# Consecutive polls without a readable token before the watcher gives up
+# (about 30 seconds, enough to delete and recreate auth.json by hand).
+_TOKEN_READ_ATTEMPTS = 15
 
 
 def _config() -> dict[str, str]:
@@ -272,12 +273,13 @@ class Watchers:
                 # failure stops the watch.
                 try:
                     headers = _headers()
-                except DeliveryError as exc:
+                except (DeliveryError, ValueError, OSError) as exc:
                     token_failures += 1
+                    detail = str(exc) if isinstance(exc, DeliveryError) else f"LOCAL_CONFIG_INVALID: {exc}"
                     if token_failures >= _TOKEN_READ_ATTEMPTS:
-                        self.store.stop(session_id, "failed", str(exc))
+                        self.store.stop(session_id, "failed", detail)
                         return
-                    self.store.transport_error(session_id, str(exc))
+                    self.store.transport_error(session_id, detail)
                     log.warning("reply watch token unreadable for %s: %s", session_id, exc)
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
