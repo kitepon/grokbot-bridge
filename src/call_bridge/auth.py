@@ -51,6 +51,8 @@ class Principal:
 
 
 OPEN = Principal(name="open")
+# A request that skipped authentication: no system matches it.
+UNAUTHENTICATED = Principal(name="unauthenticated", system="")
 LEGACY = Principal(name="legacy", ops=True)
 
 

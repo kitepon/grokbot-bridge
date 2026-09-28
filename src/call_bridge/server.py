@@ -20,7 +20,7 @@ from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request
 from starlette.responses import JSONResponse, Response
 
-from .auth import AuthError, Authenticator, OPEN, Principal, check_open, is_participant, is_party
+from .auth import UNAUTHENTICATED, AuthError, Authenticator, OPEN, Principal, check_open, is_participant, is_party
 from .db import CallStore
 from .deliver import dispatch_send
 from .directory import DIRECTORY_HOP_HEADER, resolve_bellteam_member, resolve_member_agent_id, search_directory
@@ -87,7 +87,7 @@ def _principal(ctx: Context | None) -> Principal:
         return OPEN
     if request is None:
         return OPEN
-    return getattr(request.state, "principal", OPEN)
+    return _request_principal(request)
 
 
 def _forbidden(detail: str) -> dict[str, Any]:
@@ -317,7 +317,11 @@ def _delivery_http_status(error: str) -> int:
 
 
 def _request_principal(request: Request) -> Principal:
-    return getattr(request.state, "principal", OPEN)
+    """The principal the auth middleware recorded; nothing matches without it."""
+    principal = getattr(request.state, "principal", None)
+    if principal is not None:
+        return principal
+    return UNAUTHENTICATED if AUTH.enabled else OPEN
 
 
 @mcp.custom_route("/health", methods=["GET"])

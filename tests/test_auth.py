@@ -88,6 +88,15 @@ class AuthenticatorTest(unittest.TestCase):
         with self.assertRaises(AuthError):
             Authenticator("", str(path))
 
+    def test_request_without_middleware_matches_nothing_when_auth_is_on(self) -> None:
+        request = mock.Mock()
+        request.state = mock.Mock(spec=[])
+        with mock.patch.object(server, "AUTH", self.auth):
+            principal = server._request_principal(request)
+        self.assertFalse(principal.unrestricted)
+        self.assertFalse(is_party(principal, {"local_system": "local", "local_id": "x"}, "local"))
+        self.assertIsNotNone(check_open(principal, "local", "x"))
+
     def test_party_rules(self) -> None:
         sess = {"local_system": "bellteam", "local_id": "bot-a",
                 "member_system": "grokbot", "member_id": "g-1"}
