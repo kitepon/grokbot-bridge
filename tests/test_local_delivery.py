@@ -767,13 +767,13 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
 
     def test_windows_shim_resolves_to_the_package_script(self):
         with tempfile.TemporaryDirectory() as temp:
-            shim = fake_package(Path(temp), "0.1.1", windows_shim=True)
+            shim = fake_package(Path(temp), "0.1.3", windows_shim=True)
             script = codex_delivery.resolve_steer_cli(str(shim))
             self.assertEqual(script, (Path(temp) / "node_modules" / "aiterm-steer-delivery" / "dist" / "cli.js").resolve())
-            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.1")
+            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.3")
 
     def test_package_version_is_checked(self):
-        for version, expected in (("0.1.0", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
+        for version, expected in (("0.1.2", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
             with tempfile.TemporaryDirectory() as temp:
                 script = fake_package(Path(temp), version)
                 if expected:
@@ -810,6 +810,23 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
                     await setup._merge_hooks(file, None, "old")
             self.assertEqual(file.read_text(encoding="utf-8"), original)
             self.assertEqual(writes, [])
+
+    async def test_large_app_server_answer_is_read(self):
+        # 設定の大きい端末では config/read の応答が 64KiB を超える（2026-09-29 MacBook）。
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "codex"
+            script.write_text(f"""#!{sys.executable}
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" in request:
+        print(json.dumps({{"id": request["id"], "result": {{"config": {{"large": "x" * 200000}}}}}}), flush=True)
+""", encoding="utf-8")
+            script.chmod(0o700)
+            with patch.dict(os.environ, {"CODEX_CLI_PATH": str(script), "CALL_BRIDGE_STATE": temp}):
+                async with codex_delivery.CodexRPC(Path(temp)) as rpc:
+                    result = await rpc.request("config/read", {"includeLayers": False})
+            self.assertEqual(len(result["config"]["large"]), 200000)
 
     async def test_reenable_keeps_own_hook_in_place(self):
         with tempfile.TemporaryDirectory() as temp:

@@ -14,38 +14,8 @@ from pathlib import Path
 from unittest.mock import patch
 
 from call_bridge.codex_delivery import STEER_PROFILE, CodexRPC, steer_profile, submit_reply, verify_parent
-from call_bridge.setup import _command, _merge_hooks, _replace_mcp, _steer_runtime, _verify_hooks, _write_json
-
-
-async def _install_package_steer_hook(home: Path, state: Path, binary: str) -> dict[str, str | None]:
-    """aiterm-steer-delivery の codex setup enable と同じ登録を置く。setup は macOS／Windows 専用のため。"""
-    runtime = _steer_runtime()
-    node = runtime["steer_node"]
-    hook = str(Path(runtime["steer_cli"]).parent / "codex-hook.js")
-    directory = state / "codex-parent-hooks"
-    directory.mkdir(parents=True)
-    _write_json(state / STEER_PROFILE, steer_profile("call-bridge"))
-    (directory / "profile.json").write_text((state / STEER_PROFILE).read_text(encoding="utf-8"), encoding="utf-8")
-    command = " ".join("'" + value.replace("'", "'\"'\"'") + "'" for value in (node, hook, str(directory)))
-    hooks = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
-    hooks["hooks"]["PostToolUse"] = [{"matcher": ".*", "hooks": [
-        {"type": "command", "command": command, "timeout": 20, "additionalContextLimit": 0}]}]
-    hooks["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": command, "timeout": 20}]}]
-    (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
-    async with CodexRPC(home) as rpc:
-        rows = (await rpc.request("hooks/list", {"cwds": [str(home)]}))["data"][0]["hooks"]
-        edits = []
-        for row in rows:
-            if row.get("command") == command:
-                key = f"hooks.state.{json.dumps(row['key'])}"
-                edits += [{"keyPath": f"{key}.trusted_hash", "value": row["currentHash"], "mergeStrategy": "replace"},
-                          {"keyPath": f"{key}.enabled", "value": True, "mergeStrategy": "replace"}]
-        await rpc.request("config/batchWrite", {"edits": edits, "filePath": str(home / "config.toml")})
-    _write_json(directory / "config.json", {
-        "schema": "call-bridge.codex-parent-hooks.v1", "enabled": True, "codex_home": str(home.resolve()),
-        "binary": binary, "command": command, "node": node, "hook": hook, "stale_processes": [],
-    })
-    return runtime
+from call_bridge.setup import (_command, _merge_hooks, _replace_mcp, _steer_runtime, _steer_setup, _verify_hooks,
+                               _write_json)
 
 
 class ModelHandler(BaseHTTPRequestHandler):
@@ -187,11 +157,12 @@ stream_max_retries = 0
                     command = _command()
                     await _merge_hooks(home / "hooks.json", command)
                     await _verify_hooks(command, approve=True)
-                    runtime = await _install_package_steer_hook(home, base / "state", env["CODEX_CLI_PATH"])
-                    _write_json(base / "state" / "config.json", {
-                        "enabled": True, "hook_command": command,
-                        "codex_binary": env["CODEX_CLI_PATH"], **runtime,
-                    })
+                    config = {"enabled": True, "hook_command": command,
+                              "codex_binary": env["CODEX_CLI_PATH"], **_steer_runtime()}
+                    _write_json(base / "state" / "config.json", config)
+                    _write_json(base / "state" / STEER_PROFILE, steer_profile("call-bridge"))
+                    # 0.1.3 から Linux と Desktop の無い Codex でも、パッケージの setup が Steer の hook を入れる。
+                    self.assertIn(await asyncio.to_thread(_steer_setup, "enable", config), ("ready", "restart_required"))
                     async with CodexRPC(home) as parent:
                         started = await parent.request("thread/start", {"cwd": root})
                         thread_id = started["thread"]["id"]

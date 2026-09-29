@@ -273,7 +273,7 @@ def _steer_runtime() -> dict[str, str | None]:
 
 
 def _steer_setup(action: str, config: dict[str, Any]) -> str:
-    """パッケージの Steer hook を操作する。Linux など対応外の OS は unsupported を返す。"""
+    """パッケージの Steer hook を操作する。パッケージが Codex を見つけられない環境は unsupported を返す。"""
     result = steer_sync(["setup", action], config)
     status = result.get("status")
     if status not in ("ready", "disabled", "restart_required", "unsupported"):
