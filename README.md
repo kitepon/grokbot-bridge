@@ -73,9 +73,10 @@ Codex から通話する端末では、ローカル MCP を登録すると `call
 ローカル MCP でも `call_open(member_system="bellteam")` でBellTeam宛てを選べる。
 `member_system`の既定は`grokbot`で、遠隔MCPへ渡す。`local_system`は指定した時だけ渡し、省くと遠隔MCPが接続のトークンの所属を使う（共通トークンでは`local`）。
 ローカル MCP が通話の返信を裏で取得し、Codex 親へ一通ずつ渡す。
-親AI自身が `call_poll` を繰り返す必要はない。継続型の親ではCodexの公式キューを使い、進行中なら
-`PostToolUse`／`Stop` hook が返信を同じターンへ差し込み、ターン終了後なら
-キューが次のターンとして届ける。短命な `codex exec` の親では返信をブリッジの通話履歴に保持し、次に親がプロンプトを受けた時、同期 `UserPromptSubmit` hook が取得してモデルへ渡す。親 CLI の終了時に子プロセスも止まる Windows でも、この経路は常駐プロセスを必要としない。GrokBot メンバーは従来どおり公開 MCP に接続し、
+親AI自身が `call_poll` を繰り返す必要はない。継続型の親では共通パッケージ
+[aiterm-steer-delivery](https://github.com/kitepon/aiterm-steer-delivery)（Aitermと同じ配送）がCodexの公式キューへ一度だけ入れる。
+macOS／Windowsの公式Codex Desktopでは、進行中ならパッケージの `PostToolUse`／`Stop` hook が返信を同じターンへ差し込み、
+ターン終了後ならキューが次のターンとして届ける。それ以外（Linuxなど）ではhookを入れず、キューがターンの区切りで届ける。短命な `codex exec` の親では返信をブリッジの通話履歴に保持し、次に親がプロンプトを受けた時、同期 `UserPromptSubmit` hook が取得してモデルへ渡す。親 CLI の終了時に子プロセスも止まる Windows でも、この経路は常駐プロセスを必要としない。GrokBot メンバーは従来どおり公開 MCP に接続し、
 返信には `from_party="member"` を使う。
 
 対象は通常の Codex 親タスク。native sub-agent への自動配送は未対応。
@@ -84,23 +85,45 @@ Codex から通話する端末では、ローカル MCP を登録すると `call
 
 ```bash
 python -m pip install git+https://github.com/kitepon/grokbot-bridge.git
+npm install -g aiterm-steer-delivery@^0.1.1
 call-bridge-setup enable
 # Codex を完全終了して再起動
 call-bridge-setup status
 ```
 
+`uv tool` で入れた端末は、`pip install` の代わりに `uv tool install git+https://github.com/kitepon/grokbot-bridge.git` を使う。
+
+既存の端末を更新する手順：
+
+```bash
+uv tool upgrade grokbot-bridge            # pip の場合は pip install -U git+https://github.com/kitepon/grokbot-bridge.git
+npm install -g aiterm-steer-delivery@^0.1.1
+call-bridge-setup enable
+# Codex を完全終了して再起動
+call-bridge-setup status
+```
+
+`enable` をやり直すと、旧版が登録した本製品の `PostToolUse`／`Stop` hook を外し、パッケージの Steer hook に入れ替える。
+Windows で Steer hook を使うには PowerShell 7（`pwsh.exe`）が要る。Codex は hook を PowerShell 7 で起動する。
+
 `enable` は既存の URL と token 環境変数名を読み、その MCP 登録をローカル MCP に切り替える。
 Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ保存し、MCP の PATH が狭い環境でも返信配送用 App Server を起動する。CLI や Node を移動した後は `enable` を再実行する。
 認証値は製品の state directory（既定は `~/.grokbot-bridge`）の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。Git や Codex 設定には書かない。`disable` はそのファイルを削除する。
 ローカル MCP と返信の見張りは、問い合わせのたびに `auth.json` を読み直すので、ファイルを差し替えれば動いたまま新しいトークンへ移る。読めない状態が約30秒続いた時だけ見張りを止める。ただし環境変数（既定は `CALL_BRIDGE_TOKEN`）が設定されていればそちらが優先され、プロセスの起動時の値から変わらない。トークンを入れ替える端末では、MCP を環境変数なしで起動し、`auth.json` で渡す。
-また、本製品専用の Codex hook を登録・承認する。他製品の hook は保持する。
+また、`codex exec` の親へ返信を渡す本製品専用の `UserPromptSubmit` hook を登録・承認し、
+`aiterm-steer-delivery codex setup enable` でパッケージの Steer hook を登録する。他製品の hook は保持する。
+旧版が登録した本製品の `PostToolUse`／`Stop` hook は外す。
+hook を外したり置き換えたりして他の hook の位置が動く時は、Codex が位置ごとに持つ承認をその hook の新しい位置へ写す。そのため、後ろにある他製品の hook の承認が外れることはない。
+`aiterm-steer-delivery` の場所（`AITERM_STEER_DELIVERY` か PATH）と Node の絶対パスは製品設定へ保存し（npm のシムではなく、同じ場所にあるパッケージの `dist/cli.js` を Node で直接起動する。`enable` と `status` は 0.1.1 以上かを確かめる）、パッケージへ渡す識別情報は state directory の `steer-profile.json` に置く。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
 元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。
+`aiterm-steer-delivery` が消えていても `disable` は call-bridge の設定を元へ戻す。その場合、Steer hook を外せなかったことを結果の `warning` で知らせる。
 
 `BRIDGE_TOKEN_MISSING` が出た場合は、既存の HTTP MCP 登録に指定した環境変数を
 `enable` を実行するシェルへ渡し、`call-bridge-setup enable` を再実行する。
 シェルに値があっても、起動済みの Codex MCP プロセスがその値を継承するとは限らない。
 `enable` 後は Codex を完全終了して再起動する。`status` は登録と hook の状態を確認する。
+結果の `steer` はパッケージの Steer hook の状態で、対応外の OS では `unsupported` になる。
 `enable` は導入前から動く Codex の PID と生成時刻を記録し、そのプロセスが残る間は
 `restart_required` を返す。`call_open` も同じ親プロセスへの配送を拒否する。
 完全終了・再起動後に `call-bridge-setup status` の `ready` を確認する。

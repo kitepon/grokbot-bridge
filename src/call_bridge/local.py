@@ -218,15 +218,21 @@ class LocalStore:
         with self.connect() as db:
             rows = db.execute("SELECT seq, delivery_id, state, error FROM deliveries WHERE session_id = ? ORDER BY seq",
                               (session_id,)).fetchall()
-        deliveries = [dict(row) for row in rows]
-        for delivery in deliveries:
+        return {"state": subscription["state"], "after_seq": subscription["after_seq"],
+                "last_error": subscription["last_error"], "deliveries": [dict(row) for row in rows]}
+
+    async def delivery_status(self, session_id: str) -> dict[str, Any]:
+        """キューの受付後に hook が取り出し中・中断した配送を、その状態で示す。"""
+        subscription = self.subscription(session_id)
+        status = self.status(session_id)
+        for delivery in status["deliveries"]:
             if delivery["state"] == "submitted":
-                hook_state = hook_delivery_state(subscription["thread_id"], delivery["delivery_id"])
+                hook_state = await hook_delivery_state(subscription["thread_id"], Path(subscription["codex_home"]),
+                                                       delivery["delivery_id"])
                 if hook_state:
                     delivery["state"] = hook_state
                     delivery["error"] = "CODEX_HOOK_DELIVERY_UNCONFIRMED" if hook_state == "unknown" else None
-        return {"state": subscription["state"], "after_seq": subscription["after_seq"],
-                "last_error": subscription["last_error"], "deliveries": deliveries}
+        return status
 
 
 class Watchers:
@@ -469,7 +475,7 @@ async def call_hangup(session_id: str, by_party: Literal["local", "member", "ops
 async def call_info(session_id: str) -> dict[str, Any]:
     result = await _remote_tool("call_info", {"session_id": session_id})
     try:
-        result["parent_delivery"] = store.status(session_id)
+        result["parent_delivery"] = await store.delivery_status(session_id)
     except DeliveryError as exc:
         if exc.code != "CALL_NOT_LOCAL":
             raise

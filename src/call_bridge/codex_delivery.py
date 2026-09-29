@@ -1,4 +1,9 @@
-"""通話の返信を Codex のローカルキューへ配送する。"""
+"""通話の返信を Codex 親へ配送する。
+
+継続型の親は共通パッケージ aiterm-steer-delivery の CLI が公式キューへ入れ、
+作業中の turn への差し込みもそのパッケージの hook が行う。
+短命な codex exec の親への配送（inject と UserPromptSubmit hook）は call-bridge 独自に残す。
+"""
 
 from __future__ import annotations
 
@@ -6,14 +11,19 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
+import subprocess
 import sys
-import tempfile
 import uuid
 from pathlib import Path
 from typing import Any
 
 import psutil
+
+STEER_PROFILE = "steer-profile.json"
+STEER_MIN_VERSION = (0, 1, 1)
+_STEER_TIMEOUT = 60
 
 
 class DeliveryError(RuntimeError):
@@ -136,9 +146,8 @@ def owned_hooks(response: dict[str, Any], command: str, home: Path) -> list[dict
     rows = data[0]["hooks"]
     ours = [row for row in rows if isinstance(row, dict) and row.get("command") == command and
             row.get("sourcePath") == source]
-    if (len(ours) != 3 or {row.get("eventName") for row in ours} !=
-            {"postToolUse", "stop", "userPromptSubmit"} or
-            any(row.get("async") or row.get("handlerType") != "command" for row in ours)):
+    if (len(ours) != 1 or ours[0].get("eventName") != "userPromptSubmit" or
+            ours[0].get("async") or ours[0].get("handlerType") != "command"):
         raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "登録した同期 hook が Codex から見えません")
     return ours
 
@@ -215,43 +224,167 @@ class CodexRPC:
                                 outcome_unknown=outcome_unknown) from exc
 
 
+def steer_profile(mcp_server: str) -> dict[str, Any]:
+    """aiterm-steer-delivery へ渡す call-bridge の識別情報。置き場は state directory にまとめる。"""
+    root = str(state_root().resolve())
+    return {
+        "id": "call-bridge", "display_name": "call-bridge",
+        "setup_command": "call-bridge-setup enable", "codex_steer_command": "call-bridge-setup enable",
+        "mcp_server": mcp_server, "dispatch_tools": ["call_open"],
+        "state_root": root, "config_root": root,
+        "hooks": {"codex": "call-bridge-codex-hook.js", "claude": "call-bridge-claude-hook.js",
+                  "cursor": "call-bridge-cursor-hook.js"},
+        "codex_client_name": "grokbot_bridge_parent_delivery",
+        "codex_hook_schema": "call-bridge.codex-parent-hooks.v1",
+        "backup_suffix": ".call-bridge-backup",
+    }
+
+
+def resolve_steer_cli(cli: str) -> Path:
+    """npm のシム（Windows の .cmd など）を、同じ場所にあるパッケージの dist/cli.js へ解決する。
+
+    シムを経由すると、Windows ではパスの & % ^ を cmd.exe が解釈してしまう。
+    """
+    path = Path(cli).resolve()
+    if path.suffix.lower() in (".js", ".mjs"):
+        return path
+    script = Path(cli).parent / "node_modules" / "aiterm-steer-delivery" / "dist" / "cli.js"
+    return script.resolve() if script.is_file() else path
+
+
+def current_steer_cli(config: dict[str, Any]) -> Path:
+    cli = os.environ.get("AITERM_STEER_DELIVERY") or config.get("steer_cli") or shutil.which("aiterm-steer-delivery")
+    if not cli:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE",
+                            "aiterm-steer-delivery が見つかりません。npm install -g aiterm-steer-delivery を実行してください")
+    return resolve_steer_cli(cli)
+
+
+def check_steer_version(cli: Path) -> str:
+    """dist/cli.js の隣の package.json で版を確かめる。0.1.1 より前は verify が thread を返さない。"""
+    try:
+        package = json.loads((cli.parent.parent / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        package = None
+    version = package.get("version") if isinstance(package, dict) and package.get("name") == "aiterm-steer-delivery" else None
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version) if isinstance(version, str) else None
+    if match is None:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", f"aiterm-steer-delivery の版を確認できません: {cli}")
+    if tuple(map(int, match.groups())) < STEER_MIN_VERSION:
+        raise DeliveryError("STEER_DELIVERY_OUTDATED",
+                            f"aiterm-steer-delivery {version} は古いです。npm install -g aiterm-steer-delivery@^0.1.1 を実行してください")
+    return version
+
+
+def _steer_command(config: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+    cli = str(current_steer_cli(config))
+    env = dict(os.environ)
+    command = [cli]
+    node = config.get("steer_node")
+    if Path(cli).suffix.lower() in (".js", ".mjs"):
+        node = node or shutil.which("node")
+        if not isinstance(node, str) or not Path(node).is_file():
+            raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery の Node 実行ファイルが見つかりません")
+        command = [node, cli]
+    # MCP の PATH が狭くても、パッケージが setup で記録した Codex と Node を使えるようにする。
+    for runtime in (node, config.get("node_binary")):
+        if isinstance(runtime, str):
+            env["PATH"] = os.pathsep.join([str(Path(runtime).parent), env.get("PATH", "")])
+    binary = os.environ.get("CODEX_CLI_PATH") or config.get("codex_binary")
+    if isinstance(binary, str) and "CODEX_BIN" not in env:
+        env["CODEX_BIN"] = binary
+    return command, env
+
+
+def _steer_arguments(args: list[str]) -> list[str]:
+    profile = state_root() / STEER_PROFILE
+    if not profile.is_file():
+        raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "call-bridge-setup enable を実行してください")
+    return ["--profile", str(profile), "codex", *args]
+
+
+def _steer_result(stdout: bytes, stderr: bytes, outcome_unknown: bool) -> dict[str, Any]:
+    lines = stdout.decode("utf-8", "replace").strip().splitlines()
+    try:
+        value = json.loads(lines[-1]) if lines else None
+    except json.JSONDecodeError:
+        value = None
+    if not isinstance(value, dict) or not isinstance(value.get("ok"), bool):
+        detail = stderr.decode("utf-8", "replace").strip()[-500:] or "応答がありません"
+        raise DeliveryError("STEER_DELIVERY_INVALID", f"aiterm-steer-delivery の応答を認識できません: {detail}",
+                            outcome_unknown=outcome_unknown)
+    if value["ok"]:
+        return value
+    code = value.get("code") if isinstance(value.get("code"), str) else "STEER_DELIVERY_FAILED"
+    message = str(value.get("message", ""))
+    raise DeliveryError(code, message.removeprefix(f"{code}: "), outcome_unknown=value.get("outcome_unknown") is True)
+
+
+async def steer(args: list[str], *, text: str | None = None, sends: bool = False) -> dict[str, Any]:
+    """aiterm-steer-delivery の codex 命令を一度だけ実行する。sends は受付の成否が不明になりうる送信。"""
+    command, env = _steer_command(_bridge_config())
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *command, *_steer_arguments(args),
+            stdin=asyncio.subprocess.PIPE if text is not None else asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+        )
+    except OSError as exc:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery を起動できません") from exc
+    try:
+        stdout, stderr = await asyncio.wait_for(
+            process.communicate(text.encode() if text is not None else None), _STEER_TIMEOUT)
+    except asyncio.TimeoutError as exc:
+        process.kill()
+        await process.wait()
+        raise DeliveryError("STEER_DELIVERY_TIMEOUT", "aiterm-steer-delivery が時間内に終わりませんでした",
+                            outcome_unknown=sends) from exc
+    return _steer_result(stdout, stderr, sends)
+
+
+def steer_sync(args: list[str], config: dict[str, Any]) -> dict[str, Any]:
+    """setup から codex setup 命令を実行する。"""
+    command, env = _steer_command(config)
+    try:
+        result = subprocess.run([*command, *_steer_arguments(args)], capture_output=True,
+                                stdin=subprocess.DEVNULL, env=env, timeout=_STEER_TIMEOUT)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery を実行できません") from exc
+    return _steer_result(result.stdout, result.stderr, False)
+
+
+def _bridge_config() -> dict[str, Any]:
+    config_file = state_root() / "config.json"
+    return json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+
+
 async def verify_parent(thread_id: str, home: Path) -> str | None:
     try:
         uuid.UUID(thread_id)
     except ValueError as exc:
         raise DeliveryError("CODEX_PARENT_ID_INVALID", "親タスクIDが不正です") from exc
+    config = _bridge_config()
+    if not config:
+        raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "call-bridge-setup enable を実行してください")
+    if config.get("enabled") is False:
+        raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "自動配送が無効です")
+    if config.get("codex_home") and Path(config["codex_home"]).resolve() != home:
+        raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "配送先と hook の Codex 環境が一致しません")
+    assert_parent_current(config)
+    command = config.get("hook_command")
+    if not isinstance(command, str):
+        raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook の設定がありません")
+    # 親の確認と、Steer の hook が有効ならその登録の確認はパッケージが行う。
+    thread = (await steer(["verify", "--thread", thread_id, "--codex-home", str(home)])).get("thread")
+    if not isinstance(thread, dict) or thread.get("thread_id") != thread_id:
+        raise DeliveryError("STEER_DELIVERY_OUTDATED", "aiterm-steer-delivery を 0.1.1 以降へ更新してください")
+    source = thread.get("source")
     async with CodexRPC(home) as rpc:
-        result = await rpc.request("thread/read", {"threadId": thread_id, "includeTurns": False})
-        thread = result.get("thread")
-        if not isinstance(thread, dict) or thread.get("id") != thread_id:
-            raise DeliveryError("CODEX_PARENT_UNAVAILABLE", "同じ Codex 環境に親タスクがありません")
-        source = thread.get("source")
-        if isinstance(source, dict) and isinstance(source.get("subAgent"), dict) and "thread_spawn" in source["subAgent"]:
-            raise DeliveryError("CODEX_PARENT_UNSUPPORTED", "native sub-agent への配送は未対応です")
-        await rpc.request("thread/queue/list", {"threadId": thread_id, "limit": 1})
-        config_file = state_root() / "config.json"
-        if not config_file.exists():
-            raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "call-bridge-setup enable を実行してください")
-        config = json.loads(config_file.read_text(encoding="utf-8"))
-        if config.get("enabled") is False:
-            raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "自動配送が無効です")
-        if config.get("codex_home") and Path(config["codex_home"]).resolve() != home:
-            raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "配送先と hook の Codex 環境が一致しません")
-        assert_parent_current(config)
-        command = config.get("hook_command")
-        if not isinstance(command, str):
-            raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook の設定がありません")
         hooks = await rpc.request("hooks/list", {"cwds": [thread.get("cwd") or str(home)]})
         ours = owned_hooks(hooks, command, home)
         if any(not row.get("enabled") or row.get("trustStatus") not in ("trusted", "managed") for row in ours):
             raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook が有効ではありません")
         return source if isinstance(source, str) else None
-
-
-def _pending_dir(thread_id: str) -> Path:
-    directory = state_root() / "codex-inputs" / thread_id / "pending"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return directory
 
 
 def _write_json_once(path: Path, value: dict[str, Any]) -> None:
@@ -261,43 +394,16 @@ def _write_json_once(path: Path, value: dict[str, Any]) -> None:
         handle.write("\n")
 
 
-def _write_json(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    fd, temporary = tempfile.mkstemp(prefix=path.name + ".", dir=path.parent)
-    try:
-        if hasattr(os, "fchmod"):
-            os.fchmod(fd, 0o600)
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(value, handle, ensure_ascii=False)
-            handle.write("\n")
-        os.replace(temporary, path)
-    finally:
-        if os.path.exists(temporary):
-            os.unlink(temporary)
-
-
-def _set_claim_state(path: Path, state: str) -> None:
-    _write_json(path, {**json.loads(path.read_text(encoding="utf-8")), "state": state})
-
-
-def hook_delivery_state(thread_id: str, delivery_id: str) -> str | None:
-    claim = state_root() / "codex-inputs" / thread_id / "claims" / f"{delivery_id}.json"
-    try:
-        value = json.loads(claim.read_text(encoding="utf-8"))
-    except FileNotFoundError:
+async def hook_delivery_state(thread_id: str, home: Path, delivery_id: str) -> str | None:
+    """パッケージの hook が公式キューから取り出し中なら sending、中断したなら unknown。"""
+    # Steer の hook を一度も使っていない端末では、Node を起動せずに状態なしとする。
+    if not (state_root() / "codex-parent-hooks" / "inputs").is_dir():
         return None
-    except (OSError, ValueError) as exc:
-        raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook の配送記録を読めません") from exc
-    state = value.get("state")
-    if state == "unknown":
-        return "unknown"
-    if state == "deleting":
-        if type(value.get("pid")) is not int or not isinstance(value.get("create_time"), (int, float)):
-            raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook のプロセス記録が不正です")
-        return "sending" if _process_alive(value) else "unknown"
-    if state in ("emitted", "not_in_queue") or state is None:
-        return None
-    raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook の配送状態が不正です")
+    result = await steer(["state", "--thread", thread_id, "--delivery", delivery_id, "--codex-home", str(home)])
+    state = result.get("state")
+    if state not in (None, "sending", "unknown"):
+        raise DeliveryError("CODEX_HOOK_STATE_INVALID", "hook の配送状態が不正です")
+    return state
 
 
 async def submit_reply(thread_id: str, home: Path, delivery_id: str, text: str) -> str:
@@ -328,143 +434,12 @@ async def submit_reply(thread_id: str, home: Path, delivery_id: str, text: str) 
                            "content": [{"type": "input_text", "text": text}]}],
             })
             return "injected"
-    pending = _pending_dir(thread_id) / f"{delivery_id}.json"
-    try:
-        _write_json_once(pending, {
-            "thread_id": thread_id,
-            "delivery_id": delivery_id,
-            "text_sha256": hashlib.sha256(text.encode()).hexdigest(),
-        })
-    except FileExistsError as exc:
-        raise DeliveryError("DELIVERY_ALREADY_STARTED", "同じ返信の配送記録があります",
-                            outcome_unknown=True) from exc
-    except OSError as exc:
-        raise DeliveryError("DELIVERY_STATE_WRITE_FAILED", "配送記録を保存できません") from exc
-    try:
-        async with CodexRPC(home) as rpc:
-            result = await rpc.request("thread/queue/add", {
-                "threadId": thread_id,
-                "clientUserMessageId": delivery_id,
-                "input": [{"type": "text", "text": text, "text_elements": []}],
-            })
-    finally:
-        settled = pending.parent.parent / "settled" / pending.name
-        _write_json(settled, {"delivery_id": delivery_id})
-        if not pending.exists():
-            settled.unlink(missing_ok=True)
-    item = result.get("queuedSubmission")
-    if not isinstance(item, dict) or not isinstance(item.get("id"), str):
+    result = await steer(["submit", "--thread", thread_id, "--delivery", delivery_id,
+                          "--text-file", "-", "--codex-home", str(home)], text=text, sends=True)
+    receipt = result.get("queued_submission_id")
+    if not isinstance(receipt, str):
         raise DeliveryError("CODEX_QUEUE_RECEIPT_INVALID", "キュー受付IDを確認できません", outcome_unknown=True)
-    return item["id"]
-
-
-async def _queued(rpc: CodexRPC, thread_id: str) -> list[dict[str, Any]]:
-    entries: list[dict[str, Any]] = []
-    cursor: str | None = None
-    while True:
-        result = await rpc.request("thread/queue/list", {
-            "threadId": thread_id, "cursor": cursor, "limit": 100,
-        })
-        page = result.get("data")
-        if not isinstance(page, list):
-            raise DeliveryError("CODEX_QUEUE_INVALID", "キュー一覧を認識できません")
-        entries.extend(item for item in page if isinstance(item, dict))
-        next_cursor = result.get("nextCursor")
-        if next_cursor is None:
-            return entries
-        if not isinstance(next_cursor, str) or next_cursor == cursor:
-            raise DeliveryError("CODEX_QUEUE_INVALID", "キューの次ページが不正です")
-        cursor = next_cursor
-
-
-async def claim_hook_replies(event: dict[str, Any]) -> tuple[dict[str, Any], list[Path]]:
-    config_file = state_root() / "config.json"
-    if config_file.exists():
-        config = json.loads(config_file.read_text(encoding="utf-8"))
-        if config.get("codex_home") and Path(config["codex_home"]).resolve() != codex_home():
-            raise DeliveryError("CODEX_HOOK_HOME_MISMATCH", "配送先と hook の Codex 環境が一致しません")
-    thread_id = event.get("session_id")
-    turn_id = event.get("turn_id")
-    kind = event.get("hook_event_name")
-    if not isinstance(thread_id, str) or not isinstance(turn_id, str) or kind not in ("PostToolUse", "Stop"):
-        raise DeliveryError("CODEX_HOOK_INPUT_INVALID", "hook の入力が不正です")
-    try:
-        if str(uuid.UUID(thread_id)) != thread_id:
-            raise ValueError(thread_id)
-    except ValueError as exc:
-        raise DeliveryError("CODEX_HOOK_INPUT_INVALID", "親タスクIDが不正です") from exc
-    pending_dir = _pending_dir(thread_id)
-    if not any(pending_dir.iterdir()):
-        return {}, []
-    claims_dir = pending_dir.parent / "claims"
-    claims_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
-    claimed: list[Path] = []
-    texts: list[str] = []
-    try:
-        async with CodexRPC(codex_home(), timeout=5) as rpc:
-            entries = await _queued(rpc, thread_id)
-            queued_ids = {item.get("clientUserMessageId") for item in entries}
-            settled_dir = pending_dir.parent / "settled"
-            for source in pending_dir.glob("*.json"):
-                settled = settled_dir / source.name
-                if source.stem not in queued_ids and settled.is_file():
-                    source.unlink(missing_ok=True)
-                    settled.unlink(missing_ok=True)
-            for item in entries:
-                delivery_id = item.get("clientUserMessageId")
-                if not isinstance(delivery_id, str):
-                    continue
-                try:
-                    if str(uuid.UUID(delivery_id)) != delivery_id:
-                        continue
-                except ValueError:
-                    continue
-                source = pending_dir / f"{delivery_id}.json"
-                if not source.is_file():
-                    continue
-                inputs = item.get("input")
-                if not isinstance(inputs, list) or len(inputs) != 1 or not isinstance(inputs[0], dict):
-                    raise DeliveryError("CODEX_HOOK_INPUT_CHANGED", "キュー本文が変更されました")
-                text = inputs[0].get("text")
-                if inputs[0].get("type") != "text" or not isinstance(text, str):
-                    raise DeliveryError("CODEX_HOOK_INPUT_CHANGED", "キュー本文が変更されました")
-                owner = json.loads(source.read_text(encoding="utf-8"))
-                if (owner.get("thread_id") != thread_id or owner.get("delivery_id") != delivery_id
-                        or owner.get("text_sha256") != hashlib.sha256(text.encode()).hexdigest()):
-                    raise DeliveryError("CODEX_HOOK_INPUT_CHANGED", "配送記録とキュー本文が一致しません")
-                claim = claims_dir / f"{delivery_id}.json"
-                try:
-                    os.link(source, claim)
-                    source.unlink()
-                except FileExistsError:
-                    continue
-                except FileNotFoundError:
-                    continue
-                claimed.append(claim)
-                settled = settled_dir / source.name
-                settled.unlink(missing_ok=True)
-                identity = psutil.Process()
-                _write_json(claim, {**owner, "text": text, "state": "deleting",
-                                    "turn_id": turn_id, "queued_submission_id": item.get("id"),
-                                    "pid": identity.pid, "create_time": identity.create_time()})
-                result = await rpc.request("thread/queue/delete", {
-                    "threadId": thread_id, "queuedSubmissionId": item.get("id"),
-                })
-                if result.get("deleted") is True:
-                    texts.append(text)
-                else:
-                    _set_claim_state(claim, "not_in_queue")
-                    claimed.pop()
-    except Exception:
-        for claim in claimed:
-            _set_claim_state(claim, "unknown")
-        raise
-    if not texts:
-        return {}, claimed
-    joined = "\n\n".join(texts)
-    output = ({"decision": "block", "reason": joined} if kind == "Stop" else
-              {"hookSpecificOutput": {"hookEventName": "PostToolUse", "additionalContext": joined}})
-    return output, claimed
+    return receipt
 
 
 async def claim_exec_replies(event: dict[str, Any]) -> tuple[dict[str, Any], list[tuple[str, int]], list[str]]:
@@ -532,15 +507,16 @@ async def claim_exec_replies(event: dict[str, Any]) -> tuple[dict[str, Any], lis
 
 
 def hook_main() -> None:
-    claimed: list[Path] = []
+    """codex exec の親へ、次のプロンプトで返信を渡す UserPromptSubmit hook。"""
     exec_reserved: list[tuple[str, int]] = []
     try:
         event = json.load(sys.stdin)
         if event.get("hook_event_name") == "UserPromptSubmit":
             output, exec_reserved, closed = asyncio.run(claim_exec_replies(event))
         else:
-            output, claimed = asyncio.run(claim_hook_replies(event))
-            closed = []
+            # 旧版の PostToolUse／Stop hook を読み込んだまま再起動前の Codex からも呼ばれる。
+            # 何も取り出さず、キューの返信は公式キューが次のターンで届ける。
+            output, closed = {}, []
         sys.stdout.write(json.dumps(output, ensure_ascii=False) + "\n")
         sys.stdout.flush()
         if exec_reserved or closed:
@@ -550,16 +526,12 @@ def hook_main() -> None:
                 store.submitted(session_id, seq, "injected")
             for session_id in closed:
                 store.stop(session_id, "closed")
-        for path in claimed:
-            _set_claim_state(path, "emitted")
     except Exception as exc:
         if exec_reserved:
             from . import local
             store = local.LocalStore(state_root())
             for session_id, seq in exec_reserved:
                 store.stop(session_id, "unknown", "CODEX_HOOK_DELIVERY_UNCONFIRMED", seq)
-        for path in claimed:
-            _set_claim_state(path, "unknown")
         print(f"CALL_BRIDGE_HOOK_FAILED: {exc}", file=sys.stderr)
         raise SystemExit(1) from exc
 

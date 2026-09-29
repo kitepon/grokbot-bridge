@@ -13,8 +13,39 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from unittest.mock import patch
 
-from call_bridge.codex_delivery import CodexRPC, submit_reply
-from call_bridge.setup import _command, _merge_hooks, _replace_mcp, _verify_hooks, _write_json
+from call_bridge.codex_delivery import STEER_PROFILE, CodexRPC, steer_profile, submit_reply, verify_parent
+from call_bridge.setup import _command, _merge_hooks, _replace_mcp, _steer_runtime, _verify_hooks, _write_json
+
+
+async def _install_package_steer_hook(home: Path, state: Path, binary: str) -> dict[str, str | None]:
+    """aiterm-steer-delivery の codex setup enable と同じ登録を置く。setup は macOS／Windows 専用のため。"""
+    runtime = _steer_runtime()
+    node = runtime["steer_node"]
+    hook = str(Path(runtime["steer_cli"]).parent / "codex-hook.js")
+    directory = state / "codex-parent-hooks"
+    directory.mkdir(parents=True)
+    _write_json(state / STEER_PROFILE, steer_profile("call-bridge"))
+    (directory / "profile.json").write_text((state / STEER_PROFILE).read_text(encoding="utf-8"), encoding="utf-8")
+    command = " ".join("'" + value.replace("'", "'\"'\"'") + "'" for value in (node, hook, str(directory)))
+    hooks = json.loads((home / "hooks.json").read_text(encoding="utf-8"))
+    hooks["hooks"]["PostToolUse"] = [{"matcher": ".*", "hooks": [
+        {"type": "command", "command": command, "timeout": 20, "additionalContextLimit": 0}]}]
+    hooks["hooks"]["Stop"] = [{"hooks": [{"type": "command", "command": command, "timeout": 20}]}]
+    (home / "hooks.json").write_text(json.dumps(hooks), encoding="utf-8")
+    async with CodexRPC(home) as rpc:
+        rows = (await rpc.request("hooks/list", {"cwds": [str(home)]}))["data"][0]["hooks"]
+        edits = []
+        for row in rows:
+            if row.get("command") == command:
+                key = f"hooks.state.{json.dumps(row['key'])}"
+                edits += [{"keyPath": f"{key}.trusted_hash", "value": row["currentHash"], "mergeStrategy": "replace"},
+                          {"keyPath": f"{key}.enabled", "value": True, "mergeStrategy": "replace"}]
+        await rpc.request("config/batchWrite", {"edits": edits, "filePath": str(home / "config.toml")})
+    _write_json(directory / "config.json", {
+        "schema": "call-bridge.codex-parent-hooks.v1", "enabled": True, "codex_home": str(home.resolve()),
+        "binary": binary, "command": command, "node": node, "hook": hook, "stale_processes": [],
+    })
+    return runtime
 
 
 class ModelHandler(BaseHTTPRequestHandler):
@@ -82,6 +113,44 @@ bearer_token_env_var = "TEST_TOKEN"
                 "command": "python", "args": ["-m", "call_bridge.local"],
             })
 
+    async def test_removing_old_hooks_keeps_later_hooks_trusted(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "codex"
+            home.mkdir()
+            old = "python -m call_bridge.codex_delivery"
+            other = "echo other-product"
+            (home / "hooks.json").write_text(json.dumps({"hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": old}]},
+                         {"hooks": [{"type": "command", "command": other}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": old}]},
+                                     {"hooks": [{"type": "command", "command": other}]}],
+            }}), encoding="utf-8")
+            with patch.dict(os.environ, {"CODEX_HOME": str(home), "CALL_BRIDGE_STATE": str(Path(root) / "state"),
+                                      "CODEX_CLI_PATH": os.environ["CALL_BRIDGE_TEST_CODEX_BINARY"]}):
+                async def trust(approve: bool) -> list[dict]:
+                    async with CodexRPC(home) as rpc:
+                        rows = (await rpc.request("hooks/list", {"cwds": [str(home)]}))["data"][0]["hooks"]
+                        if approve:
+                            edits = []
+                            for row in rows:
+                                key = f"hooks.state.{json.dumps(row['key'])}"
+                                edits += [{"keyPath": f"{key}.trusted_hash", "value": row["currentHash"],
+                                           "mergeStrategy": "replace"},
+                                          {"keyPath": f"{key}.enabled", "value": True, "mergeStrategy": "replace"}]
+                            await rpc.request("config/batchWrite", {"edits": edits,
+                                                                    "filePath": str(home / "config.toml")})
+                            rows = (await rpc.request("hooks/list", {"cwds": [str(home)]}))["data"][0]["hooks"]
+                        return rows
+
+                self.assertEqual({row["trustStatus"] for row in await trust(True)}, {"trusted"})
+                self.assertTrue(await _merge_hooks(home / "hooks.json", old))
+                rows = await trust(False)
+            others = [row for row in rows if row["command"] == other]
+            self.assertEqual(sorted((row["eventName"], row["trustStatus"], row["enabled"]) for row in others),
+                             [("stop", "trusted", True), ("userPromptSubmit", "trusted", True)])
+            [ours] = [row for row in rows if row["command"] == old]
+            self.assertEqual(ours["eventName"], "userPromptSubmit")
+
     async def test_active_parent_receives_reply_once_in_same_turn(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root)
@@ -116,11 +185,12 @@ stream_max_retries = 0
             try:
                 with patch.dict(os.environ, env):
                     command = _command()
-                    _merge_hooks(home / "hooks.json", command)
+                    await _merge_hooks(home / "hooks.json", command)
                     await _verify_hooks(command, approve=True)
+                    runtime = await _install_package_steer_hook(home, base / "state", env["CODEX_CLI_PATH"])
                     _write_json(base / "state" / "config.json", {
                         "enabled": True, "hook_command": command,
-                        "codex_binary": env["CODEX_CLI_PATH"],
+                        "codex_binary": env["CODEX_CLI_PATH"], **runtime,
                     })
                     async with CodexRPC(home) as parent:
                         started = await parent.request("thread/start", {"cwd": root})
@@ -129,8 +199,9 @@ stream_max_retries = 0
                             "input": [{"type": "text", "text": "最初の試験入力"}]})
                         arrived = await asyncio.to_thread(ModelHandler.arrived.wait, 10)
                         self.assertTrue(arrived, "最初のモデル要求が来ない")
+                        self.assertNotEqual(await verify_parent(thread_id, home.resolve()), "exec")
                         marker = "CALL_BRIDGE_REPLY_" + uuid.uuid4().hex
-                        await submit_reply(thread_id, home, str(uuid.uuid4()), marker)
+                        self.assertIsInstance(await submit_reply(thread_id, home, str(uuid.uuid4()), marker), str)
                         ModelHandler.release.set()
                         for _ in range(200):
                             if len(ModelHandler.requests) >= 2:
@@ -146,6 +217,9 @@ stream_max_retries = 0
                                 break
                             await asyncio.sleep(0.1)
                         self.assertEqual(len(history["turns"]), 1, "返信は同じターンへ届く")
+                        claims = list((base / "state" / "codex-parent-hooks" / "inputs").glob(f"*/{thread_id}/claims/*.json"))
+                        self.assertEqual([json.loads(file.read_text())["state"] for file in claims], ["emitted"],
+                                         "パッケージの hook が取り出す")
                         idle_marker = "CALL_BRIDGE_IDLE_" + uuid.uuid4().hex
                         await submit_reply(thread_id, home, str(uuid.uuid4()), idle_marker)
                         for _ in range(200):
