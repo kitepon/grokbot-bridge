@@ -20,9 +20,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .codex_delivery import (STEER_PROFILE, CodexRPC, DeliveryError, codex_binary, codex_command,
-                             codex_home, codex_processes, owned_hooks, restart_required, state_root,
-                             steer_profile, steer_sync)
+from .codex_delivery import (STEER_PROFILE, CodexRPC, DeliveryError, check_steer_version, codex_binary,
+                             codex_command, codex_home, codex_processes, current_steer_cli, owned_hooks,
+                             restart_required, state_root, steer_profile, steer_sync)
 
 _NAMES = ("call-bridge", "grokbot-bridge")
 
@@ -148,6 +148,11 @@ async def _merge_hooks(file: Path, command: str | None, previous_command: str | 
         def key(event: str, position: tuple[int, int]) -> str:
             return f"{prefix}:{_snake(event)}:{position[0]}:{position[1]}"
 
+        # 鍵の形は Codex の内部に頼っている。移す前の鍵が公式 API に無ければ、何も書かずに止める。
+        listed_keys = {row.get("key") for row in rows[0].get("hooks", []) if isinstance(row, dict)}
+        if any(key(event, old) not in listed_keys for event, old, _new in moves):
+            raise DeliveryError("CODEX_HOOK_LIST_INVALID", "hook の承認の鍵の形を確認できません。hooks.json は変えていません")
+
         config = (await rpc.request("config/read", {"includeLayers": False})).get("config") or {}
         state = (config.get("hooks") or {}).get("state") or {}
         config_file = str(home / "config.toml")
@@ -257,15 +262,14 @@ async def _replace_mcp(name: str, registration: dict[str, Any]) -> None:
 
 
 def _steer_runtime() -> dict[str, str | None]:
-    cli = os.environ.get("AITERM_STEER_DELIVERY") or shutil.which("aiterm-steer-delivery")
-    if not cli:
-        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE",
-                            "aiterm-steer-delivery が見つかりません。npm install -g aiterm-steer-delivery を実行してください")
-    path = Path(cli).resolve()
-    node = shutil.which("node") if path.suffix.lower() in (".js", ".mjs") else None
-    if path.suffix.lower() in (".js", ".mjs") and not node:
+    path = current_steer_cli({})
+    if path.suffix.lower() not in (".js", ".mjs"):
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", f"aiterm-steer-delivery の dist/cli.js を特定できません: {path}")
+    check_steer_version(path)
+    node = shutil.which("node")
+    if not node:
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery の Node 実行ファイルが見つかりません")
-    return {"steer_cli": str(path), "steer_node": str(Path(node).resolve()) if node else None}
+    return {"steer_cli": str(path), "steer_node": str(Path(node).resolve())}
 
 
 def _steer_setup(action: str, config: dict[str, Any]) -> str:
@@ -354,6 +358,7 @@ async def status() -> dict[str, str]:
         raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "Codex はローカル MCP を使っていません")
     if not (state_root() / STEER_PROFILE).is_file():
         raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "call-bridge-setup enable を再実行してください")
+    check_steer_version(current_steer_cli(config))
     steer = _steer_setup("status", config)
     restart = restart_required(config) or steer == "restart_required"
     return {"status": "restart_required" if restart else "ready",
@@ -370,8 +375,14 @@ async def disable() -> dict[str, str]:
     transport = existing["transport"]
     if transport.get("type") != "stdio" or "call_bridge.local" not in str(transport.get("args", [])):
         raise DeliveryError("CODEX_MCP_CONFIG_CONFLICT", "call-bridge の登録が別製品へ変更されています")
+    # CLI が消えていても Node を入れ替えていても、call-bridge の設定は元へ戻す。
+    warning = None
     if (state_root() / STEER_PROFILE).is_file():
-        _steer_setup("disable", config)
+        try:
+            _steer_setup("disable", config)
+        except DeliveryError as exc:
+            warning = (f"Steer の hook を外せませんでした（{exc}）。aiterm-steer-delivery を入れ直して "
+                       f"aiterm-steer-delivery --profile {state_root() / STEER_PROFILE} codex setup disable を実行してください")
     home = codex_home()
     _backup_codex_config(home)
     await _merge_hooks(home / "hooks.json", None, config["hook_command"])
@@ -383,7 +394,8 @@ async def disable() -> dict[str, str]:
         raise
     _write_json(config_file, {**config, "enabled": False})
     (state_root() / "auth.json").unlink(missing_ok=True)
-    return {"status": "restart_required", "mcp": name}
+    result = {"status": "restart_required", "mcp": name}
+    return {**result, "warning": warning} if warning else result
 
 
 def main() -> None:

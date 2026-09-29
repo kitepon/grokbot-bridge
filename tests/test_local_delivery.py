@@ -69,6 +69,20 @@ sys.exit({exit_code})
     return lambda: [json.loads(row) for row in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
 
 
+def fake_package(root: Path, version: str, *, windows_shim: bool = False) -> Path:
+    """npm の全体導入と同じ並びで、版だけを持つパッケージを置く。シムか dist/cli.js を返す。"""
+    package = root / "node_modules" / "aiterm-steer-delivery"
+    (package / "dist").mkdir(parents=True)
+    (package / "dist" / "cli.js").write_text("", encoding="utf-8")
+    (package / "package.json").write_text(json.dumps({"name": "aiterm-steer-delivery", "version": version}),
+                                          encoding="utf-8")
+    if not windows_shim:
+        return package / "dist" / "cli.js"
+    shim = root / "aiterm-steer-delivery.cmd"
+    shim.write_text("@node %~dp0node_modules\\aiterm-steer-delivery\\dist\\cli.js %*", encoding="utf-8")
+    return shim
+
+
 class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -611,6 +625,7 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(setup, "_merge_hooks", return_value=False), \
                  patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
                  patch.object(setup, "_steer_runtime", return_value={"steer_cli": "/cli.js", "steer_node": "/node"}), \
+                 patch.object(setup, "check_steer_version"), \
                  patch.object(setup, "_steer_setup", return_value="unsupported") as steer:
                 self.assertEqual(await setup.enable(), {"status": "restart_required", "mcp": "call-bridge",
                                                         "steer": "unsupported"})
@@ -633,8 +648,53 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
             with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "CODEX_HOME": root}), \
                  patch.object(setup, "_existing", return_value=transport), \
                  patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
+                 patch.object(setup, "check_steer_version"), \
                  patch.object(setup, "_steer_setup", return_value="restart_required"):
                 self.assertEqual((await setup.status())["status"], "restart_required")
+
+    def _installed_config(self, state: Path) -> None:
+        setup._write_json(state / "config.json", {
+            "enabled": True, "mcp_name": "call-bridge", "mcp_url": "https://example.com/mcp",
+            "token_env": "CALL_BRIDGE_TOKEN", "hook_command": "hook", "stale_processes": []})
+        setup._write_json(state / "steer-profile.json", {})
+
+    async def test_status_rejects_package_older_than_0_1_1(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / "state"
+            state.mkdir()
+            self._installed_config(state)
+            cli = fake_package(Path(root), "0.1.0")
+            transport = {"transport": {"type": "stdio", "args": ["-m", "call_bridge.local"]}}
+            with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "CODEX_HOME": root,
+                                      "AITERM_STEER_DELIVERY": str(cli)}), \
+                 patch.object(setup, "_existing", return_value=transport), \
+                 patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
+                 patch.object(setup, "_steer_setup", return_value="ready") as steer:
+                with self.assertRaisesRegex(codex_delivery.DeliveryError, "STEER_DELIVERY_OUTDATED"):
+                    await setup.status()
+            steer.assert_not_called()
+
+    async def test_disable_restores_codex_even_when_the_package_is_gone(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / "state"
+            state.mkdir()
+            self._installed_config(state)
+            (state / "auth.json").write_text("{}", encoding="utf-8")
+            transport = {"transport": {"type": "stdio", "args": ["-m", "call_bridge.local"]}}
+            with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "CODEX_HOME": root,
+                                      "AITERM_STEER_DELIVERY": str(Path(root) / "missing" / "cli.js")}), \
+                 patch.object(setup, "_existing", return_value=transport), \
+                 patch.object(setup, "_backup_codex_config"), \
+                 patch.object(setup, "_merge_hooks", new_callable=AsyncMock) as merge, \
+                 patch.object(setup, "_replace_mcp", new_callable=AsyncMock) as replace:
+                result = await setup.disable()
+            self.assertEqual(result["status"], "restart_required")
+            self.assertIn("codex setup disable", result["warning"])
+            merge.assert_awaited_once()
+            replace.assert_awaited_once_with("call-bridge", {"url": "https://example.com/mcp",
+                                                             "bearer_token_env_var": "CALL_BRIDGE_TOKEN"})
+            self.assertFalse(json.loads((state / "config.json").read_text())["enabled"])
+            self.assertFalse((state / "auth.json").exists())
 
 
 class SetupTest(unittest.IsolatedAsyncioTestCase):
@@ -704,6 +764,52 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(hooks["Stop"], [{"hooks": [{"type": "command", "command": "package-hook"}]}])
                 self.assertEqual([entry["command"] for group in hooks["UserPromptSubmit"] for entry in group["hooks"]],
                                  [old])
+
+    def test_windows_shim_resolves_to_the_package_script(self):
+        with tempfile.TemporaryDirectory() as temp:
+            shim = fake_package(Path(temp), "0.1.1", windows_shim=True)
+            script = codex_delivery.resolve_steer_cli(str(shim))
+            self.assertEqual(script, (Path(temp) / "node_modules" / "aiterm-steer-delivery" / "dist" / "cli.js").resolve())
+            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.1")
+
+    def test_package_version_is_checked(self):
+        for version, expected in (("0.1.0", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
+            with tempfile.TemporaryDirectory() as temp:
+                script = fake_package(Path(temp), version)
+                if expected:
+                    with self.assertRaisesRegex(codex_delivery.DeliveryError, expected):
+                        codex_delivery.check_steer_version(script)
+                else:
+                    self.assertEqual(codex_delivery.check_steer_version(script), version)
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(codex_delivery.DeliveryError, "STEER_DELIVERY_UNAVAILABLE"):
+                codex_delivery.check_steer_version(Path(temp) / "dist" / "cli.js")
+
+    async def test_unknown_approval_key_stops_before_writing(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "hooks.json"
+            original = json.dumps({"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "old"}]},
+                {"hooks": [{"type": "command", "command": "other"}]}]}})
+            file.write_text(original, encoding="utf-8")
+            source = str(file.resolve())
+            writes = []
+
+            class FakeRPC:
+                def __init__(self, *_args, **_kwargs): pass
+                async def __aenter__(self): return self
+                async def __aexit__(self, *_args): pass
+                async def request(self, method, params):
+                    if method == "hooks/list":
+                        return {"data": [{"hooks": [{"sourcePath": source, "key": f"{source}|stop|1|0"}]}]}
+                    writes.append(method)
+                    return {"config": {}}
+
+            with patch.object(setup, "CodexRPC", FakeRPC):
+                with self.assertRaisesRegex(codex_delivery.DeliveryError, "CODEX_HOOK_LIST_INVALID"):
+                    await setup._merge_hooks(file, None, "old")
+            self.assertEqual(file.read_text(encoding="utf-8"), original)
+            self.assertEqual(writes, [])
 
     async def test_reenable_keeps_own_hook_in_place(self):
         with tempfile.TemporaryDirectory() as temp:

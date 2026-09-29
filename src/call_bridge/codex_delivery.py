@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,7 @@ from typing import Any
 import psutil
 
 STEER_PROFILE = "steer-profile.json"
+STEER_MIN_VERSION = (0, 1, 1)
 _STEER_TIMEOUT = 60
 
 
@@ -238,11 +240,44 @@ def steer_profile(mcp_server: str) -> dict[str, Any]:
     }
 
 
-def _steer_command(config: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+def resolve_steer_cli(cli: str) -> Path:
+    """npm のシム（Windows の .cmd など）を、同じ場所にあるパッケージの dist/cli.js へ解決する。
+
+    シムを経由すると、Windows ではパスの & % ^ を cmd.exe が解釈してしまう。
+    """
+    path = Path(cli).resolve()
+    if path.suffix.lower() in (".js", ".mjs"):
+        return path
+    script = Path(cli).parent / "node_modules" / "aiterm-steer-delivery" / "dist" / "cli.js"
+    return script.resolve() if script.is_file() else path
+
+
+def current_steer_cli(config: dict[str, Any]) -> Path:
     cli = os.environ.get("AITERM_STEER_DELIVERY") or config.get("steer_cli") or shutil.which("aiterm-steer-delivery")
     if not cli:
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE",
                             "aiterm-steer-delivery が見つかりません。npm install -g aiterm-steer-delivery を実行してください")
+    return resolve_steer_cli(cli)
+
+
+def check_steer_version(cli: Path) -> str:
+    """dist/cli.js の隣の package.json で版を確かめる。0.1.1 より前は verify が thread を返さない。"""
+    try:
+        package = json.loads((cli.parent.parent / "package.json").read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        package = None
+    version = package.get("version") if isinstance(package, dict) and package.get("name") == "aiterm-steer-delivery" else None
+    match = re.fullmatch(r"(\d+)\.(\d+)\.(\d+)(?:[-+].*)?", version) if isinstance(version, str) else None
+    if match is None:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", f"aiterm-steer-delivery の版を確認できません: {cli}")
+    if tuple(map(int, match.groups())) < STEER_MIN_VERSION:
+        raise DeliveryError("STEER_DELIVERY_OUTDATED",
+                            f"aiterm-steer-delivery {version} は古いです。npm install -g aiterm-steer-delivery@^0.1.1 を実行してください")
+    return version
+
+
+def _steer_command(config: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
+    cli = str(current_steer_cli(config))
     env = dict(os.environ)
     command = [cli]
     node = config.get("steer_node")
