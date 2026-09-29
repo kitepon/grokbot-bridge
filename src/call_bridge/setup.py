@@ -1,4 +1,8 @@
-"""ローカル Codex 受信口と公式 hook を登録する。"""
+"""ローカル Codex 受信口と公式 hook を登録する。
+
+継続型の親への Steer の hook は aiterm-steer-delivery の codex setup が登録する。
+call-bridge が登録するのは codex exec の親へ返信を渡す UserPromptSubmit hook だけ。
+"""
 
 from __future__ import annotations
 
@@ -16,8 +20,9 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from .codex_delivery import (CodexRPC, DeliveryError, codex_binary, codex_command, codex_home,
-                             codex_processes, owned_hooks, restart_required, state_root)
+from .codex_delivery import (STEER_PROFILE, CodexRPC, DeliveryError, codex_binary, codex_command,
+                             codex_home, codex_processes, owned_hooks, restart_required, state_root,
+                             steer_profile, steer_sync)
 
 _NAMES = ("call-bridge", "grokbot-bridge")
 
@@ -81,15 +86,10 @@ def _merge_hooks(file: Path, command: str | None, previous_command: str | None =
             )]
             if entries:
                 kept.append({**group, "hooks": entries})
-        if command is not None:
-            entry: dict[str, Any] = {"type": "command", "command": command, "timeout": 20}
-            group = {"hooks": [entry]}
-            if event == "PostToolUse":
-                group["matcher"] = ".*"
-                entry["additionalContextLimit"] = 0
-            if event == "UserPromptSubmit":
-                entry["additionalContextLimit"] = 0
-            kept.append(group)
+        # 旧版が登録した PostToolUse／Stop は外すだけ。Steer はパッケージの hook が受け持つ。
+        if command is not None and event == "UserPromptSubmit":
+            kept.append({"hooks": [{"type": "command", "command": command, "timeout": 20,
+                                    "additionalContextLimit": 0}]})
         if kept:
             hooks[event] = kept
         else:
@@ -178,8 +178,31 @@ async def _replace_mcp(name: str, registration: dict[str, Any]) -> None:
             })
 
 
+def _steer_runtime() -> dict[str, str | None]:
+    cli = os.environ.get("AITERM_STEER_DELIVERY") or shutil.which("aiterm-steer-delivery")
+    if not cli:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE",
+                            "aiterm-steer-delivery が見つかりません。npm install -g aiterm-steer-delivery を実行してください")
+    path = Path(cli).resolve()
+    node = shutil.which("node") if path.suffix.lower() in (".js", ".mjs") else None
+    if path.suffix.lower() in (".js", ".mjs") and not node:
+        raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery の Node 実行ファイルが見つかりません")
+    return {"steer_cli": str(path), "steer_node": str(Path(node).resolve()) if node else None}
+
+
+def _steer_setup(action: str, config: dict[str, Any]) -> str:
+    """パッケージの Steer hook を操作する。Linux など対応外の OS は unsupported を返す。"""
+    result = steer_sync(["setup", action], config)
+    status = result.get("status")
+    if status not in ("ready", "disabled", "restart_required", "unsupported"):
+        raise DeliveryError("CODEX_STEER_SETUP_FAILED", str(result.get("reason_code") or status))
+    return status
+
+
 async def enable() -> dict[str, str]:
     name, existing = _find_existing()
+    # 設定を書き換える前に、Steer の配送に使うパッケージが呼べることを確かめる。
+    steer_runtime = _steer_runtime()
     running_before = codex_processes()
     config_file = state_root() / "config.json"
     already_local = existing["transport"].get("type") == "stdio"
@@ -228,9 +251,13 @@ async def enable() -> dict[str, str]:
         "hook_command": command,
         "stale_processes": (running_before if changed or not already_local or
                             "stale_processes" not in previous else previous["stale_processes"]),
+        **steer_runtime,
     }
+    _write_json(state_root() / STEER_PROFILE, steer_profile(name))
     _write_json(state_root() / "config.json", next_config)
-    return {"status": "restart_required" if restart_required(next_config) else "ready", "mcp": name}
+    steer = _steer_setup("enable", next_config)
+    restart = restart_required(next_config) or steer == "restart_required"
+    return {"status": "restart_required" if restart else "ready", "mcp": name, "steer": steer}
 
 
 async def status() -> dict[str, str]:
@@ -247,8 +274,12 @@ async def status() -> dict[str, str]:
     existing = _existing(name)
     if existing["transport"].get("type") != "stdio":
         raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "Codex はローカル MCP を使っていません")
-    return {"status": "restart_required" if restart_required(config) else "ready",
-            "mcp": name, "remote": config["mcp_url"]}
+    if not (state_root() / STEER_PROFILE).is_file():
+        raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "call-bridge-setup enable を再実行してください")
+    steer = _steer_setup("status", config)
+    restart = restart_required(config) or steer == "restart_required"
+    return {"status": "restart_required" if restart else "ready",
+            "mcp": name, "remote": config["mcp_url"], "steer": steer}
 
 
 async def disable() -> dict[str, str]:
@@ -261,6 +292,8 @@ async def disable() -> dict[str, str]:
     transport = existing["transport"]
     if transport.get("type") != "stdio" or "call_bridge.local" not in str(transport.get("args", [])):
         raise DeliveryError("CODEX_MCP_CONFIG_CONFLICT", "call-bridge の登録が別製品へ変更されています")
+    if (state_root() / STEER_PROFILE).is_file():
+        _steer_setup("disable", config)
     home = codex_home()
     _backup_codex_config(home)
     _merge_hooks(home / "hooks.json", None, config["hook_command"])

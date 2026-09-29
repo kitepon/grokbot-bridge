@@ -3,9 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import json
 import os
+import sys
 import tempfile
 import unittest
 import uuid
@@ -43,6 +43,30 @@ class FakeHTTP:
         else:
             body = {"ok": True, "status": "hungup", "messages": []}
         return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+
+def fake_steer(test: unittest.TestCase, response: dict | None, *, exit_code: int = 0):
+    """aiterm-steer-delivery の代わりに、引数と標準入力を記録して決めた1行を返す。"""
+    root = Path(tempfile.mkdtemp())
+    test.addCleanup(lambda: __import__("shutil").rmtree(root, ignore_errors=True))
+    log = root / "calls.jsonl"
+    script = root / "aiterm-steer-delivery"
+    line = json.dumps(response, ensure_ascii=False) if response is not None else "壊れた応答"
+    script.write_text(f"""#!{sys.executable}
+import json, sys
+text = sys.stdin.read() if not sys.stdin.isatty() else ""
+with open({str(log)!r}, "a", encoding="utf-8") as handle:
+    handle.write(json.dumps({{"argv": sys.argv[1:], "stdin": text}}, ensure_ascii=False) + "\\n")
+print({line!r})
+sys.exit({exit_code})
+""", encoding="utf-8")
+    script.chmod(0o700)
+    state = Path(os.environ["CALL_BRIDGE_STATE"])
+    (state / "steer-profile.json").write_text("{}", encoding="utf-8")
+    env = patch.dict(os.environ, {"AITERM_STEER_DELIVERY": str(script)})
+    env.start()
+    test.addCleanup(env.stop)
+    return lambda: [json.loads(row) for row in log.read_text(encoding="utf-8").splitlines()] if log.exists() else []
 
 
 class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
@@ -418,12 +442,15 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         store.add(session_id, thread_id, Path(self.temp.name), "ラピ")
         delivery_id, _ = store.reserve(session_id, 1)
         store.submitted(session_id, 1)
-        claim = Path(self.temp.name) / "codex-inputs" / thread_id / "claims" / f"{delivery_id}.json"
-        codex_delivery._write_json(claim, {"state": "unknown", "text": "GrokBot の返事"})
-        status = store.status(session_id)
+        self.assertEqual((await store.delivery_status(session_id))["deliveries"][0]["state"], "submitted")
+        (Path(self.temp.name) / "codex-parent-hooks" / "inputs").mkdir(parents=True)
+        calls = fake_steer(self, {"ok": True, "state": "unknown"})
+        status = await store.delivery_status(session_id)
         self.assertEqual(status["deliveries"][0]["state"], "unknown")
         self.assertEqual(status["deliveries"][0]["error"], "CODEX_HOOK_DELIVERY_UNCONFIRMED")
         self.assertEqual(status["after_seq"], 1)
+        self.assertEqual(calls()[0]["argv"][2:], ["codex", "state", "--thread", thread_id, "--delivery", delivery_id,
+                                                  "--codex-home", self.temp.name])
 
 
 class HookTest(unittest.IsolatedAsyncioTestCase):
@@ -463,7 +490,7 @@ class HookTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([method for method, _ in calls[:3]],
                          ["thread/read", "thread/resume", "thread/inject_items"])
         self.assertEqual(calls[2][1]["items"][0]["content"][0]["text"], "返信本文")
-        self.assertFalse((codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json").exists())
+        self.assertFalse((Path(self.temp.name) / "codex-parent-hooks").exists(), "exec は公式キューを使わない")
 
     async def test_busy_exec_writer_defers_before_any_injection_attempt(self):
         thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
@@ -492,109 +519,55 @@ class HookTest(unittest.IsolatedAsyncioTestCase):
         marker = Path(self.temp.name) / "codex-inputs" / thread_id / "injections" / f"{delivery_id}.json"
         self.assertFalse(marker.exists())
 
-    async def test_hook_claims_only_its_own_queued_reply(self):
-        thread_id = str(uuid.uuid4())
-        delivery_id = str(uuid.uuid4())
-        body = "GrokBot の返事"
-        source = codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json"
-        codex_delivery._write_json_once(source, {
-            "thread_id": thread_id, "delivery_id": delivery_id,
-            "text_sha256": hashlib.sha256(body.encode()).hexdigest(),
-        })
-        entries = [
-            {"id": "foreign", "clientUserMessageId": str(uuid.uuid4()),
-             "input": [{"type": "text", "text": "他の入力"}]},
-            {"id": "ours", "clientUserMessageId": delivery_id,
-             "input": [{"type": "text", "text": body}]},
-        ]
+    async def test_queue_reply_is_submitted_once_through_the_shared_package(self):
+        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
+        calls = fake_steer(self, {"ok": True, "queued_submission_id": "queued-1"})
 
         class FakeRPC:
-            def __init__(self, *_args, **_kwargs):
-                self.deleted = []
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *_args):
-                pass
-
-            async def request(self, method, params):
-                if method == "thread/queue/list":
-                    return {"data": entries, "nextCursor": None}
-                self.deleted.append(params["queuedSubmissionId"])
-                return {"deleted": True}
-
-        with patch.object(codex_delivery, "CodexRPC", FakeRPC):
-            output, claims = await codex_delivery.claim_hook_replies({
-                "session_id": thread_id, "turn_id": "turn-1", "hook_event_name": "PostToolUse",
-            })
-        self.assertEqual(output["hookSpecificOutput"]["additionalContext"], body)
-        self.assertEqual(len(claims), 1)
-        self.assertFalse(source.exists())
-
-    async def test_idle_queue_consumption_cleans_settled_owner(self):
-        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
-        pending = codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json"
-        settled = pending.parent.parent / "settled" / pending.name
-        codex_delivery._write_json_once(pending, {"delivery_id": delivery_id})
-        codex_delivery._write_json(settled, {"delivery_id": delivery_id})
-
-        class EmptyRPC:
-            def __init__(self, *_args, **_kwargs): pass
-            async def __aenter__(self): return self
-            async def __aexit__(self, *_args): pass
-            async def request(self, _method, _params): return {"data": [], "nextCursor": None}
-
-        with patch.object(codex_delivery, "CodexRPC", EmptyRPC):
-            output, claims = await codex_delivery.claim_hook_replies({
-                "session_id": thread_id, "turn_id": "turn-1", "hook_event_name": "PostToolUse",
-            })
-        self.assertEqual((output, claims), ({}, []))
-        self.assertFalse(pending.exists())
-        self.assertFalse(settled.exists())
-
-    async def test_interrupted_queue_claim_is_unknown_and_keeps_body(self):
-        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
-        body = "GrokBot の返事"
-        source = codex_delivery._pending_dir(thread_id) / f"{delivery_id}.json"
-        codex_delivery._write_json_once(source, {
-            "thread_id": thread_id, "delivery_id": delivery_id,
-            "text_sha256": hashlib.sha256(body.encode()).hexdigest(),
-        })
-
-        class FailingRPC:
             def __init__(self, *_args, **_kwargs): pass
             async def __aenter__(self): return self
             async def __aexit__(self, *_args): pass
             async def request(self, method, _params):
-                if method == "thread/queue/list":
-                    return {"data": [{"id": "queued", "clientUserMessageId": delivery_id,
-                                      "input": [{"type": "text", "text": body}]}], "nextCursor": None}
-                raise codex_delivery.DeliveryError("CODEX_REQUEST_TIMEOUT", "削除結果が不明")
+                return {"thread": {"id": thread_id, "source": "vscode"}}
 
-        with patch.object(codex_delivery, "CodexRPC", FailingRPC):
-            with self.assertRaisesRegex(codex_delivery.DeliveryError, "CODEX_REQUEST_TIMEOUT"):
-                await codex_delivery.claim_hook_replies({
-                    "session_id": thread_id, "turn_id": "turn-1", "hook_event_name": "Stop",
-                })
-        claim = source.parent.parent / "claims" / source.name
-        self.assertEqual(json.loads(claim.read_text())["text"], body)
-        self.assertEqual(codex_delivery.hook_delivery_state(thread_id, delivery_id), "unknown")
+        with patch.object(codex_delivery, "CodexRPC", FakeRPC):
+            self.assertEqual(await codex_delivery.submit_reply(
+                thread_id, Path(self.temp.name), delivery_id, "GrokBot の返事"), "queued-1")
+        [call] = calls()
+        self.assertEqual(call["argv"][:2], ["--profile", str(Path(self.temp.name) / "steer-profile.json")])
+        self.assertEqual(call["argv"][2:], ["codex", "submit", "--thread", thread_id, "--delivery", delivery_id,
+                                            "--text-file", "-", "--codex-home", self.temp.name])
+        self.assertEqual(call["stdin"], "GrokBot の返事")
 
-    async def test_interrupted_hook_process_is_reported_unknown(self):
-        thread_id, delivery_id = str(uuid.uuid4()), str(uuid.uuid4())
-        claim = codex_delivery._pending_dir(thread_id).parent / "claims" / f"{delivery_id}.json"
-        process = psutil.Process()
-        codex_delivery._write_json(claim, {
-            "state": "deleting", "pid": process.pid, "create_time": process.create_time(),
-            "text": "GrokBot の返事",
-        })
-        self.assertEqual(codex_delivery.hook_delivery_state(thread_id, delivery_id), "sending")
-        codex_delivery._write_json(claim, {
-            "state": "deleting", "pid": process.pid, "create_time": process.create_time() - 1,
-            "text": "GrokBot の返事",
-        })
-        self.assertEqual(codex_delivery.hook_delivery_state(thread_id, delivery_id), "unknown")
+    async def test_package_failure_keeps_its_code_and_unknown_outcome(self):
+        fake_steer(self, {"ok": False, "code": "CODEX_RECEIVER_TIMEOUT",
+                          "message": "CODEX_RECEIVER_TIMEOUT: thread/queue/addの応答を確認できません",
+                          "outcome_unknown": True}, exit_code=1)
+        with self.assertRaises(codex_delivery.DeliveryError) as caught:
+            await codex_delivery.steer(["submit"], text="本文", sends=True)
+        self.assertEqual(caught.exception.code, "CODEX_RECEIVER_TIMEOUT")
+        self.assertTrue(caught.exception.outcome_unknown)
+        self.assertEqual(str(caught.exception), "CODEX_RECEIVER_TIMEOUT: thread/queue/addの応答を確認できません")
+
+    async def test_unreadable_package_answer_is_unknown_only_for_a_send(self):
+        fake_steer(self, None, exit_code=1)
+        for sends in (True, False):
+            with self.assertRaises(codex_delivery.DeliveryError) as caught:
+                await codex_delivery.steer(["submit"], text="本文", sends=sends)
+            self.assertEqual(caught.exception.code, "STEER_DELIVERY_INVALID")
+            self.assertEqual(caught.exception.outcome_unknown, sends)
+
+    async def test_missing_profile_asks_for_setup(self):
+        with patch.dict(os.environ, {"AITERM_STEER_DELIVERY": "/bin/true"}):
+            with self.assertRaisesRegex(codex_delivery.DeliveryError, "call-bridge-setup enable"):
+                await codex_delivery.steer(["verify"])
+
+    async def test_legacy_steer_hook_event_does_nothing(self):
+        stdin = __import__("io").StringIO(json.dumps({"hook_event_name": "Stop", "session_id": str(uuid.uuid4())}))
+        stdout = __import__("io").StringIO()
+        with patch.object(sys, "stdin", stdin), patch.object(sys, "stdout", stdout):
+            codex_delivery.hook_main()
+        self.assertEqual(json.loads(stdout.getvalue()), {})
 
 
 class ProcessTest(unittest.IsolatedAsyncioTestCase):
@@ -636,10 +609,32 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(setup, "codex_processes", return_value=[current]), \
                  patch.object(setup, "_backup_codex_config"), \
                  patch.object(setup, "_merge_hooks", return_value=False), \
-                 patch.object(setup, "_verify_hooks", new_callable=AsyncMock):
-                self.assertEqual((await setup.enable())["status"], "restart_required")
+                 patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
+                 patch.object(setup, "_steer_runtime", return_value={"steer_cli": "/cli.js", "steer_node": "/node"}), \
+                 patch.object(setup, "_steer_setup", return_value="unsupported") as steer:
+                self.assertEqual(await setup.enable(), {"status": "restart_required", "mcp": "call-bridge",
+                                                        "steer": "unsupported"})
                 self.assertEqual((await setup.status())["status"], "restart_required")
-            self.assertEqual(json.loads((state / "config.json").read_text())["stale_processes"], [current])
+            self.assertEqual([call.args[0] for call in steer.call_args_list], ["enable", "status"])
+            saved = json.loads((state / "config.json").read_text())
+            self.assertEqual(saved["stale_processes"], [current])
+            self.assertEqual(saved["steer_cli"], "/cli.js")
+            self.assertEqual(json.loads((state / "steer-profile.json").read_text())["mcp_server"], "call-bridge")
+
+    async def test_package_steer_restart_is_reported(self):
+        with tempfile.TemporaryDirectory() as root:
+            state = Path(root) / "state"
+            state.mkdir()
+            setup._write_json(state / "config.json", {
+                "enabled": True, "mcp_name": "call-bridge", "mcp_url": "https://example.com/mcp",
+                "token_env": "CALL_BRIDGE_TOKEN", "hook_command": "hook", "stale_processes": []})
+            setup._write_json(state / "steer-profile.json", {})
+            transport = {"transport": {"type": "stdio", "args": ["-m", "call_bridge.local"]}}
+            with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "CODEX_HOME": root}), \
+                 patch.object(setup, "_existing", return_value=transport), \
+                 patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
+                 patch.object(setup, "_steer_setup", return_value="restart_required"):
+                self.assertEqual((await setup.status())["status"], "restart_required")
 
 
 class SetupTest(unittest.TestCase):
@@ -668,6 +663,23 @@ class SetupTest(unittest.TestCase):
                 value = json.loads(file.read_text(encoding="utf-8"))
                 self.assertEqual(value["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "other-hook")
                 self.assertFalse(setup._merge_hooks(file, "python -m call_bridge.codex_delivery"))
+
+    def test_hook_merge_leaves_steer_to_the_shared_package(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with patch.dict(os.environ, {"CALL_BRIDGE_STATE": temp}):
+                file = Path(temp) / "hooks.json"
+                old = "python -m call_bridge.codex_delivery"
+                file.write_text(json.dumps({"hooks": {
+                    event: [{"hooks": [{"type": "command", "command": old}]}]
+                    for event in ("PostToolUse", "Stop", "UserPromptSubmit")
+                } | {"Stop": [{"hooks": [{"type": "command", "command": old}]},
+                              {"hooks": [{"type": "command", "command": "package-hook"}]}]}}), encoding="utf-8")
+                self.assertTrue(setup._merge_hooks(file, old))
+                hooks = json.loads(file.read_text(encoding="utf-8"))["hooks"]
+                self.assertNotIn("PostToolUse", hooks)
+                self.assertEqual(hooks["Stop"], [{"hooks": [{"type": "command", "command": "package-hook"}]}])
+                self.assertEqual([entry["command"] for group in hooks["UserPromptSubmit"] for entry in group["hooks"]],
+                                 [old])
 
 
 if __name__ == "__main__":
