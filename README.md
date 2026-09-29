@@ -85,7 +85,7 @@ macOS／Windowsの公式Codex Desktopでは、進行中ならパッケージの 
 
 ```bash
 python -m pip install git+https://github.com/kitepon/grokbot-bridge.git
-npm install -g aiterm-steer-delivery
+npm install -g aiterm-steer-delivery@^0.1.1
 call-bridge-setup enable
 # Codex を完全終了して再起動
 call-bridge-setup status
@@ -98,6 +98,7 @@ Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ�
 また、`codex exec` の親へ返信を渡す本製品専用の `UserPromptSubmit` hook を登録・承認し、
 `aiterm-steer-delivery codex setup enable` でパッケージの Steer hook を登録する。他製品の hook は保持する。
 旧版が登録した本製品の `PostToolUse`／`Stop` hook は外す。
+hook を外したり置き換えたりして他の hook の位置が動く時は、Codex が位置ごとに持つ承認をその hook の新しい位置へ写す。そのため、後ろにある他製品の hook の承認が外れることはない。
 `aiterm-steer-delivery` の場所（`AITERM_STEER_DELIVERY` か PATH）と Node の絶対パスは製品設定へ保存し、パッケージへ渡す識別情報は state directory の `steer-profile.json` に置く。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
 元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。

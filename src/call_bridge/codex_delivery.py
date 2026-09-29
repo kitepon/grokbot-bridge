@@ -340,13 +340,11 @@ async def verify_parent(thread_id: str, home: Path) -> str | None:
     if not isinstance(command, str):
         raise DeliveryError("CODEX_HOOK_UNAVAILABLE", "配送 hook の設定がありません")
     # 親の確認と、Steer の hook が有効ならその登録の確認はパッケージが行う。
-    await steer(["verify", "--thread", thread_id, "--codex-home", str(home)])
+    thread = (await steer(["verify", "--thread", thread_id, "--codex-home", str(home)])).get("thread")
+    if not isinstance(thread, dict) or thread.get("thread_id") != thread_id:
+        raise DeliveryError("STEER_DELIVERY_OUTDATED", "aiterm-steer-delivery を 0.1.1 以降へ更新してください")
+    source = thread.get("source")
     async with CodexRPC(home) as rpc:
-        result = await rpc.request("thread/read", {"threadId": thread_id, "includeTurns": False})
-        thread = result.get("thread")
-        if not isinstance(thread, dict) or thread.get("id") != thread_id:
-            raise DeliveryError("CODEX_PARENT_UNAVAILABLE", "同じ Codex 環境に親タスクがありません")
-        source = thread.get("source")
         hooks = await rpc.request("hooks/list", {"cwds": [thread.get("cwd") or str(home)]})
         ours = owned_hooks(hooks, command, home)
         if any(not row.get("enabled") or row.get("trustStatus") not in ("trusted", "managed") for row in ours):

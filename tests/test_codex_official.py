@@ -113,6 +113,44 @@ bearer_token_env_var = "TEST_TOKEN"
                 "command": "python", "args": ["-m", "call_bridge.local"],
             })
 
+    async def test_removing_old_hooks_keeps_later_hooks_trusted(self):
+        with tempfile.TemporaryDirectory() as root:
+            home = Path(root) / "codex"
+            home.mkdir()
+            old = "python -m call_bridge.codex_delivery"
+            other = "echo other-product"
+            (home / "hooks.json").write_text(json.dumps({"hooks": {
+                "Stop": [{"hooks": [{"type": "command", "command": old}]},
+                         {"hooks": [{"type": "command", "command": other}]}],
+                "UserPromptSubmit": [{"hooks": [{"type": "command", "command": old}]},
+                                     {"hooks": [{"type": "command", "command": other}]}],
+            }}), encoding="utf-8")
+            with patch.dict(os.environ, {"CODEX_HOME": str(home), "CALL_BRIDGE_STATE": str(Path(root) / "state"),
+                                      "CODEX_CLI_PATH": os.environ["CALL_BRIDGE_TEST_CODEX_BINARY"]}):
+                async def trust(approve: bool) -> list[dict]:
+                    async with CodexRPC(home) as rpc:
+                        rows = (await rpc.request("hooks/list", {"cwds": [str(home)]}))["data"][0]["hooks"]
+                        if approve:
+                            edits = []
+                            for row in rows:
+                                key = f"hooks.state.{json.dumps(row['key'])}"
+                                edits += [{"keyPath": f"{key}.trusted_hash", "value": row["currentHash"],
+                                           "mergeStrategy": "replace"},
+                                          {"keyPath": f"{key}.enabled", "value": True, "mergeStrategy": "replace"}]
+                            await rpc.request("config/batchWrite", {"edits": edits,
+                                                                    "filePath": str(home / "config.toml")})
+                            rows = (await rpc.request("hooks/list", {"cwds": [str(home)]}))["data"][0]["hooks"]
+                        return rows
+
+                self.assertEqual({row["trustStatus"] for row in await trust(True)}, {"trusted"})
+                self.assertTrue(await _merge_hooks(home / "hooks.json", old))
+                rows = await trust(False)
+            others = [row for row in rows if row["command"] == other]
+            self.assertEqual(sorted((row["eventName"], row["trustStatus"], row["enabled"]) for row in others),
+                             [("stop", "trusted", True), ("userPromptSubmit", "trusted", True)])
+            [ours] = [row for row in rows if row["command"] == old]
+            self.assertEqual(ours["eventName"], "userPromptSubmit")
+
     async def test_active_parent_receives_reply_once_in_same_turn(self):
         with tempfile.TemporaryDirectory() as root:
             base = Path(root)
@@ -147,7 +185,7 @@ stream_max_retries = 0
             try:
                 with patch.dict(os.environ, env):
                     command = _command()
-                    _merge_hooks(home / "hooks.json", command)
+                    await _merge_hooks(home / "hooks.json", command)
                     await _verify_hooks(command, approve=True)
                     runtime = await _install_package_steer_hook(home, base / "state", env["CODEX_CLI_PATH"])
                     _write_json(base / "state" / "config.json", {

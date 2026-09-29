@@ -62,7 +62,12 @@ def _backup_codex_config(home: Path) -> Path:
     return backup
 
 
-def _merge_hooks(file: Path, command: str | None, previous_command: str | None = None) -> bool:
+_HOOK_EVENTS = ("PostToolUse", "Stop", "UserPromptSubmit")
+
+
+def _plan_hooks(file: Path, command: str | None,
+                previous_command: str | None = None) -> tuple[dict[str, Any], dict[str, Any], list[tuple]]:
+    """自製品の hook を置き換えた後の hooks.json と、位置が動く他の hook を計算する（書き込まない）。"""
     if file.is_symlink():
         raise DeliveryError("CODEX_HOOK_CONFIG_INVALID", "hooks.json の symlink は変更できません")
     current = json.loads(file.read_text(encoding="utf-8")) if file.exists() else {}
@@ -71,12 +76,15 @@ def _merge_hooks(file: Path, command: str | None, previous_command: str | None =
     next_value = dict(current)
     hooks = dict(current.get("hooks", {}))
     owned_commands = {value for value in (command, previous_command) if value is not None}
-    for event in ("PostToolUse", "Stop", "UserPromptSubmit"):
+    moves: list[tuple] = []
+    for event in _HOOK_EVENTS:
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
             raise DeliveryError("CODEX_HOOK_CONFIG_INVALID", f"{event} の形式が不正です")
+        before: list[tuple[Any, tuple[int, int]]] = []
         kept = []
-        for group in groups:
+        insertion: int | None = None
+        for g, group in enumerate(groups):
             if not isinstance(group, dict) or not isinstance(group.get("hooks"), list):
                 raise DeliveryError("CODEX_HOOK_CONFIG_INVALID", f"{event} の形式が不正です")
             entries = [entry for entry in group["hooks"] if not (
@@ -84,20 +92,90 @@ def _merge_hooks(file: Path, command: str | None, previous_command: str | None =
                 isinstance(entry.get("command"), str) and
                 entry["command"] in owned_commands
             )]
+            before.extend((entry, (g, h)) for h, entry in enumerate(group["hooks"]) if any(entry is e for e in entries))
+            if len(entries) != len(group["hooks"]) and insertion is None:
+                insertion = len(kept)
             if entries:
                 kept.append({**group, "hooks": entries})
         # 旧版が登録した PostToolUse／Stop は外すだけ。Steer はパッケージの hook が受け持つ。
+        # 自分の hook は元の位置に置く。末尾へ移すと、後ろの hook の位置と承認がずれる。
         if command is not None and event == "UserPromptSubmit":
-            kept.append({"hooks": [{"type": "command", "command": command, "timeout": 20,
+            kept.insert(len(kept) if insertion is None else insertion,
+                        {"hooks": [{"type": "command", "command": command, "timeout": 20,
                                     "additionalContextLimit": 0}]})
+        after = [(entry, (g, h)) for g, group in enumerate(kept) for h, entry in enumerate(group["hooks"])]
+        for entry, source in before:
+            target = next((position for other, position in after if other is entry), None)
+            if target != source:
+                moves.append((event, source, target))
         if kept:
             hooks[event] = kept
         else:
             hooks.pop(event, None)
     next_value["hooks"] = hooks
+    return current, next_value, moves
+
+
+def _snake(event: str) -> str:
+    return "".join(f"_{char.lower()}" if char.isupper() and index else char.lower()
+                   for index, char in enumerate(event))
+
+
+async def _merge_hooks(file: Path, command: str | None, previous_command: str | None = None) -> bool:
+    """hooks.json を書き換える。位置が動く他の hook は、Codex が位置の鍵で持つ承認を新しい位置へ写す。
+
+    承認を新たに与えたり外したりはしない（aiterm-steer-delivery 0.1.1 と同じ扱い）。
+    """
+    current, next_value, moves = _plan_hooks(file, command, previous_command)
     if next_value == current:
         return False
-    _write_json(file, next_value)
+    if not moves:
+        _write_json(file, next_value)
+        return True
+    home = file.parent
+    async with CodexRPC(home) as rpc:
+        listed = await rpc.request("hooks/list", {"cwds": [str(home)]})
+        rows = listed.get("data")
+        source = str(file.resolve())
+        sample = next((row for row in (rows[0].get("hooks", []) if isinstance(rows, list) and rows and
+                                       isinstance(rows[0], dict) else [])
+                       if isinstance(row, dict) and row.get("sourcePath") == source and
+                       isinstance(row.get("key"), str)), None)
+        if sample is None:
+            raise DeliveryError("CODEX_HOOK_LIST_INVALID", "hook の承認の鍵を確認できません")
+        prefix = ":".join(sample["key"].split(":")[:-3])
+
+        def key(event: str, position: tuple[int, int]) -> str:
+            return f"{prefix}:{_snake(event)}:{position[0]}:{position[1]}"
+
+        config = (await rpc.request("config/read", {"includeLayers": False})).get("config") or {}
+        state = (config.get("hooks") or {}).get("state") or {}
+        config_file = str(home / "config.toml")
+        edits = []
+        for event, old, new in moves:
+            if new is None:
+                continue
+            saved, target = state.get(key(event, old)), key(event, new)
+            if isinstance(saved, dict):
+                edits += [{"keyPath": f"hooks.state.{json.dumps(target)}.trusted_hash",
+                           "value": saved.get("trusted_hash"), "mergeStrategy": "replace"},
+                          {"keyPath": f"hooks.state.{json.dumps(target)}.enabled",
+                           "value": saved.get("enabled"), "mergeStrategy": "replace"}]
+            else:
+                edits.append({"keyPath": f"hooks.state.{json.dumps(target)}", "value": None,
+                              "mergeStrategy": "replace"})
+        if edits:
+            await rpc.request("config/batchWrite", {"edits": edits, "filePath": config_file})
+        _write_json(file, next_value)
+        used = {key(event, (g, h)) for event in _HOOK_EVENTS
+                for g, group in enumerate(next_value["hooks"].get(event, []))
+                for h, _entry in enumerate(group["hooks"])}
+        vacated = {key(event, old) for event, old, _new in moves} - used
+        vacated = [name for name in sorted(vacated) if name in state]
+        if vacated:
+            await rpc.request("config/batchWrite", {"edits": [
+                {"keyPath": f"hooks.state.{json.dumps(name)}", "value": None, "mergeStrategy": "replace"}
+                for name in vacated], "filePath": config_file})
     return True
 
 
@@ -223,7 +301,7 @@ async def enable() -> dict[str, str]:
     home = codex_home()
     command = _command()
     _backup_codex_config(home)
-    changed = _merge_hooks(home / "hooks.json", command,
+    changed = await _merge_hooks(home / "hooks.json", command,
                            previous.get("hook_command") if already_local else None)
     await _verify_hooks(command, approve=True)
     auth_file = state_root() / "auth.json"
@@ -296,7 +374,7 @@ async def disable() -> dict[str, str]:
         _steer_setup("disable", config)
     home = codex_home()
     _backup_codex_config(home)
-    _merge_hooks(home / "hooks.json", None, config["hook_command"])
+    await _merge_hooks(home / "hooks.json", None, config["hook_command"])
     try:
         await _replace_mcp(name, {"url": config["mcp_url"],
                                   "bearer_token_env_var": config["token_env"]})

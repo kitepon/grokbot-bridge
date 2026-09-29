@@ -637,7 +637,7 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual((await setup.status())["status"], "restart_required")
 
 
-class SetupTest(unittest.TestCase):
+class SetupTest(unittest.IsolatedAsyncioTestCase):
     def test_node_codex_uses_recorded_runtime_with_minimal_path(self):
         with tempfile.TemporaryDirectory() as root:
             state = Path(root) / "state"
@@ -652,19 +652,19 @@ class SetupTest(unittest.TestCase):
             with patch.dict(os.environ, {"CALL_BRIDGE_STATE": str(state), "PATH": root}, clear=True):
                 self.assertEqual(codex_delivery.codex_command(), [str(node), str(script)])
 
-    def test_hook_merge_preserves_other_products(self):
+    async def test_hook_merge_preserves_other_products(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"CALL_BRIDGE_STATE": temp}):
                 file = Path(temp) / "hooks.json"
                 file.write_text(json.dumps({"hooks": {
                     "PostToolUse": [{"matcher": "Bash", "hooks": [{"type": "command", "command": "other-hook"}]}],
                 }}), encoding="utf-8")
-                self.assertTrue(setup._merge_hooks(file, "python -m call_bridge.codex_delivery"))
+                self.assertTrue(await setup._merge_hooks(file, "python -m call_bridge.codex_delivery"))
                 value = json.loads(file.read_text(encoding="utf-8"))
                 self.assertEqual(value["hooks"]["PostToolUse"][0]["hooks"][0]["command"], "other-hook")
-                self.assertFalse(setup._merge_hooks(file, "python -m call_bridge.codex_delivery"))
+                self.assertFalse(await setup._merge_hooks(file, "python -m call_bridge.codex_delivery"))
 
-    def test_hook_merge_leaves_steer_to_the_shared_package(self):
+    async def test_hook_merge_leaves_steer_to_the_shared_package(self):
         with tempfile.TemporaryDirectory() as temp:
             with patch.dict(os.environ, {"CALL_BRIDGE_STATE": temp}):
                 file = Path(temp) / "hooks.json"
@@ -674,12 +674,48 @@ class SetupTest(unittest.TestCase):
                     for event in ("PostToolUse", "Stop", "UserPromptSubmit")
                 } | {"Stop": [{"hooks": [{"type": "command", "command": old}]},
                               {"hooks": [{"type": "command", "command": "package-hook"}]}]}}), encoding="utf-8")
-                self.assertTrue(setup._merge_hooks(file, old))
+                source = str(file.resolve())
+                state = {f"{source}:stop:1:0": {"trusted_hash": "sha256:package", "enabled": True},
+                         f"{source}:stop:0:0": {"trusted_hash": "sha256:old", "enabled": True}}
+                writes = []
+
+                class FakeRPC:
+                    def __init__(self, *_args, **_kwargs): pass
+                    async def __aenter__(self): return self
+                    async def __aexit__(self, *_args): pass
+                    async def request(self, method, params):
+                        if method == "hooks/list":
+                            return {"data": [{"hooks": [{"sourcePath": source, "key": f"{source}:stop:1:0"}]}]}
+                        if method == "config/read":
+                            return {"config": {"hooks": {"state": state}}}
+                        writes.append([(edit["keyPath"], edit["value"]) for edit in params["edits"]])
+                        return {}
+
+                with patch.object(setup, "CodexRPC", FakeRPC):
+                    self.assertTrue(await setup._merge_hooks(file, old))
+                # 後ろの他製品の hook は位置が前へずれるので、承認を写してから古い位置を消す。
+                self.assertEqual(writes, [
+                    [(f'hooks.state.{json.dumps(f"{source}:stop:0:0")}.trusted_hash', "sha256:package"),
+                     (f'hooks.state.{json.dumps(f"{source}:stop:0:0")}.enabled', True)],
+                    [(f'hooks.state.{json.dumps(f"{source}:stop:1:0")}', None)],
+                ])
                 hooks = json.loads(file.read_text(encoding="utf-8"))["hooks"]
                 self.assertNotIn("PostToolUse", hooks)
                 self.assertEqual(hooks["Stop"], [{"hooks": [{"type": "command", "command": "package-hook"}]}])
                 self.assertEqual([entry["command"] for group in hooks["UserPromptSubmit"] for entry in group["hooks"]],
                                  [old])
+
+    async def test_reenable_keeps_own_hook_in_place(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "hooks.json"
+            ours = {"hooks": [{"type": "command", "command": "new", "timeout": 20, "additionalContextLimit": 0}]}
+            file.write_text(json.dumps({"hooks": {"UserPromptSubmit": [
+                {"hooks": [{"type": "command", "command": "old"}]},
+                {"hooks": [{"type": "command", "command": "other"}]},
+            ]}}), encoding="utf-8")
+            current, planned, moves = setup._plan_hooks(file, "new", "old")
+            self.assertEqual(planned["hooks"]["UserPromptSubmit"][0], ours)
+            self.assertEqual(moves, [])
 
 
 if __name__ == "__main__":
