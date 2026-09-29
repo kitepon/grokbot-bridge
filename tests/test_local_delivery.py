@@ -697,6 +697,31 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse((state / "auth.json").exists())
 
 
+class CodexHomeProcessTest(unittest.TestCase):
+    @unittest.skipUnless(sys.platform == "linux", "他 process の環境を読めるのは Linux だけ")
+    def test_codex_in_another_codex_home_is_not_counted(self):
+        home = Path(tempfile.mkdtemp())
+        self.addCleanup(lambda: __import__("shutil").rmtree(home, ignore_errors=True))
+        created = psutil.Process().create_time()
+
+        def process(pid, env):
+            item = SimpleNamespace(pid=pid, info={"name": "codex", "exe": "/usr/bin/codex", "create_time": created})
+            if isinstance(env, Exception):
+                def environ():
+                    raise env
+                item.environ = environ
+            else:
+                item.environ = lambda: env
+            return item
+
+        rows = [process(1, {"CODEX_HOME": str(home)}), process(2, {"HOME": str(home.parent / "other")}),
+                process(3, psutil.AccessDenied(3)), process(4, {"HOME": str(home.parent), "CODEX_HOME": ""})]
+        with patch.object(codex_delivery, "_same_pid_namespace", return_value=True), \
+             patch.object(codex_delivery.psutil, "process_iter", return_value=rows):
+            self.assertEqual([row["pid"] for row in codex_delivery.codex_processes(home)], [1, 3])
+            self.assertEqual([row["pid"] for row in codex_delivery.codex_processes()], [1, 2, 3, 4])
+
+
 class SetupTest(unittest.IsolatedAsyncioTestCase):
     def test_node_codex_uses_recorded_runtime_with_minimal_path(self):
         with tempfile.TemporaryDirectory() as root:
@@ -767,13 +792,13 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
 
     def test_windows_shim_resolves_to_the_package_script(self):
         with tempfile.TemporaryDirectory() as temp:
-            shim = fake_package(Path(temp), "0.1.3", windows_shim=True)
+            shim = fake_package(Path(temp), "0.1.5", windows_shim=True)
             script = codex_delivery.resolve_steer_cli(str(shim))
             self.assertEqual(script, (Path(temp) / "node_modules" / "aiterm-steer-delivery" / "dist" / "cli.js").resolve())
-            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.3")
+            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.5")
 
     def test_package_version_is_checked(self):
-        for version, expected in (("0.1.2", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
+        for version, expected in (("0.1.4", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
             with tempfile.TemporaryDirectory() as temp:
                 script = fake_package(Path(temp), version)
                 if expected:
@@ -828,6 +853,48 @@ for line in sys.stdin:
                     result = await rpc.request("config/read", {"includeLayers": False})
             self.assertEqual(len(result["config"]["large"]), 200000)
 
+    async def test_removed_own_hook_leaves_no_trust_record(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "hooks.json"
+            file.write_text(json.dumps({"hooks": {"Stop": [
+                {"hooks": [{"type": "command", "command": "other"}]},
+                {"hooks": [{"type": "command", "command": "old"}]}]}}), encoding="utf-8")
+            source = str(file.resolve())
+            state = {f"{source}:stop:0:0": {"trusted_hash": "sha256:other", "enabled": True},
+                     f"{source}:stop:1:0": {"trusted_hash": "sha256:old", "enabled": True},
+                     f"/elsewhere/hooks.json:stop:1:0": {"trusted_hash": "sha256:x", "enabled": True}}
+            writes = []
+
+            class FakeRPC:
+                def __init__(self, *_args, **_kwargs): pass
+                async def __aenter__(self): return self
+                async def __aexit__(self, *_args): pass
+                async def request(self, method, params):
+                    if method == "config/read":
+                        return {"config": {"hooks": {"state": state}}}
+                    writes.append([(edit["keyPath"], edit["value"]) for edit in params["edits"]])
+                    return {}
+
+            with patch.object(setup, "CodexRPC", FakeRPC):
+                self.assertTrue(await setup._merge_hooks(file, None, "old"))
+            # 他の hook は動かない。自分が居た位置の記録だけを消し、別の file の記録は触らない。
+            self.assertEqual(writes, [[(f'hooks.state.{json.dumps(f"{source}:stop:1:0")}', None)]])
+
+    async def test_trust_cleanup_failure_does_not_stop_the_rewrite(self):
+        with tempfile.TemporaryDirectory() as temp:
+            file = Path(temp) / "hooks.json"
+            file.write_text(json.dumps({"hooks": {"Stop": [{"hooks": [{"type": "command", "command": "old"}]}]}}),
+                            encoding="utf-8")
+
+            class BrokenRPC:
+                def __init__(self, *_args, **_kwargs): pass
+                async def __aenter__(self): raise codex_delivery.DeliveryError("CODEX_UNAVAILABLE", "起動できません")
+                async def __aexit__(self, *_args): pass
+
+            with patch.object(setup, "CodexRPC", BrokenRPC):
+                self.assertTrue(await setup._merge_hooks(file, None, "old"))
+            self.assertEqual(json.loads(file.read_text(encoding="utf-8")), {"hooks": {}})
+
     async def test_reenable_keeps_own_hook_in_place(self):
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / "hooks.json"
@@ -836,7 +903,7 @@ for line in sys.stdin:
                 {"hooks": [{"type": "command", "command": "old"}]},
                 {"hooks": [{"type": "command", "command": "other"}]},
             ]}}), encoding="utf-8")
-            current, planned, moves = setup._plan_hooks(file, "new", "old")
+            current, planned, moves, _owned = setup._plan_hooks(file, "new", "old")
             self.assertEqual(planned["hooks"]["UserPromptSubmit"][0], ours)
             self.assertEqual(moves, [])
 

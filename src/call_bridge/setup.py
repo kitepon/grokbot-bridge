@@ -66,8 +66,9 @@ _HOOK_EVENTS = ("PostToolUse", "Stop", "UserPromptSubmit")
 
 
 def _plan_hooks(file: Path, command: str | None,
-                previous_command: str | None = None) -> tuple[dict[str, Any], dict[str, Any], list[tuple]]:
-    """自製品の hook を置き換えた後の hooks.json と、位置が動く他の hook を計算する（書き込まない）。"""
+                previous_command: str | None = None
+                ) -> tuple[dict[str, Any], dict[str, Any], list[tuple], list[tuple[str, tuple[int, int]]]]:
+    """自製品の hook を置き換えた後の hooks.json と、位置が動く他の hook、自製品の hook が居た位置を計算する。"""
     if file.is_symlink():
         raise DeliveryError("CODEX_HOOK_CONFIG_INVALID", "hooks.json の symlink は変更できません")
     current = json.loads(file.read_text(encoding="utf-8")) if file.exists() else {}
@@ -77,6 +78,7 @@ def _plan_hooks(file: Path, command: str | None,
     hooks = dict(current.get("hooks", {}))
     owned_commands = {value for value in (command, previous_command) if value is not None}
     moves: list[tuple] = []
+    owned: list[tuple[str, tuple[int, int]]] = []
     for event in _HOOK_EVENTS:
         groups = hooks.get(event, [])
         if not isinstance(groups, list):
@@ -93,6 +95,7 @@ def _plan_hooks(file: Path, command: str | None,
                 entry["command"] in owned_commands
             )]
             before.extend((entry, (g, h)) for h, entry in enumerate(group["hooks"]) if any(entry is e for e in entries))
+            owned.extend((event, (g, h)) for h, entry in enumerate(group["hooks"]) if not any(entry is e for e in entries))
             if len(entries) != len(group["hooks"]) and insertion is None:
                 insertion = len(kept)
             if entries:
@@ -113,7 +116,7 @@ def _plan_hooks(file: Path, command: str | None,
         else:
             hooks.pop(event, None)
     next_value["hooks"] = hooks
-    return current, next_value, moves
+    return current, next_value, moves, owned
 
 
 def _snake(event: str) -> str:
@@ -126,11 +129,17 @@ async def _merge_hooks(file: Path, command: str | None, previous_command: str | 
 
     承認を新たに与えたり外したりはしない（aiterm-steer-delivery 0.1.1 と同じ扱い）。
     """
-    current, next_value, moves = _plan_hooks(file, command, previous_command)
+    current, next_value, moves, owned = _plan_hooks(file, command, previous_command)
     if next_value == current:
         return False
     if not moves:
         _write_json(file, next_value)
+        if owned:
+            # 外した位置の承認記録の後片付けができなくても、hook の書き換えそのものは止めない。
+            try:
+                await _clean_vacated_trust(file, next_value, owned)
+            except Exception as exc:
+                print(f"call-bridge: 外した hook の承認記録を消せませんでした（{exc}）", file=sys.stderr)
         return True
     home = file.parent
     async with CodexRPC(home) as rpc:
@@ -175,13 +184,51 @@ async def _merge_hooks(file: Path, command: str | None, previous_command: str | 
         used = {key(event, (g, h)) for event in _HOOK_EVENTS
                 for g, group in enumerate(next_value["hooks"].get(event, []))
                 for h, _entry in enumerate(group["hooks"])}
-        vacated = {key(event, old) for event, old, _new in moves} - used
+        vacated = ({key(event, old) for event, old, _new in moves} | {key(event, at) for event, at in owned}) - used
         vacated = [name for name in sorted(vacated) if name in state]
         if vacated:
             await rpc.request("config/batchWrite", {"edits": [
                 {"keyPath": f"hooks.state.{json.dumps(name)}", "value": None, "mergeStrategy": "replace"}
                 for name in vacated], "filePath": config_file})
     return True
+
+
+def _used_positions(next_value: dict[str, Any]) -> set[tuple[str, int, int]]:
+    return {(_snake(event), g, h) for event in _HOOK_EVENTS
+            for g, group in enumerate(next_value["hooks"].get(event, []))
+            for h, _entry in enumerate(group["hooks"])}
+
+
+def _same_path(stored: str, source: Path) -> bool:
+    if stored == str(source):
+        return True
+    try:
+        return Path(stored).resolve() == source
+    except OSError:
+        return os.name == "nt" and stored.lower() == str(source).lower()
+
+
+async def _clean_vacated_trust(file: Path, next_value: dict[str, Any],
+                               owned: list[tuple[str, tuple[int, int]]]) -> None:
+    """自製品の hook が居て、ほかの hook が入らずに空いた位置の承認記録を消す（aiterm-steer-delivery 0.1.4 と同じ）。"""
+    wanted = {(_snake(event), g, h) for event, (g, h) in owned} - _used_positions(next_value)
+    if not wanted:
+        return
+    source = file.resolve()
+    async with CodexRPC(file.parent) as rpc:
+        config = (await rpc.request("config/read", {"includeLayers": False})).get("config") or {}
+        state = (config.get("hooks") or {}).get("state") or {}
+        vacated = []
+        for stored in state:
+            parts = stored.rsplit(":", 3)
+            if len(parts) != 4 or not parts[2].isdigit() or not parts[3].isdigit():
+                continue
+            if (parts[1], int(parts[2]), int(parts[3])) in wanted and _same_path(parts[0], source):
+                vacated.append(stored)
+        if vacated:
+            await rpc.request("config/batchWrite", {"edits": [
+                {"keyPath": f"hooks.state.{json.dumps(name)}", "value": None, "mergeStrategy": "replace"}
+                for name in vacated], "filePath": str(file.parent / "config.toml")})
 
 
 async def _verify_hooks(command: str, approve: bool) -> None:
@@ -285,7 +332,7 @@ async def enable() -> dict[str, str]:
     name, existing = _find_existing()
     # 設定を書き換える前に、Steer の配送に使うパッケージが呼べることを確かめる。
     steer_runtime = _steer_runtime()
-    running_before = codex_processes()
+    running_before = codex_processes(codex_home())
     config_file = state_root() / "config.json"
     already_local = existing["transport"].get("type") == "stdio"
     if already_local:

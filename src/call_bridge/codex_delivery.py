@@ -22,7 +22,7 @@ from typing import Any
 import psutil
 
 STEER_PROFILE = "steer-profile.json"
-STEER_MIN_VERSION = (0, 1, 3)
+STEER_MIN_VERSION = (0, 1, 5)
 # App Server の応答は1行の JSON。config/read は設定全体を返すので、既定の 64KiB では足りない端末がある。
 _RPC_LINE_LIMIT = 64 * 1024 * 1024
 _STEER_TIMEOUT = 60
@@ -78,8 +78,28 @@ def codex_command() -> list[str]:
     return [node, binary]
 
 
-def codex_processes() -> list[dict[str, int | float]]:
-    """Codex 本体の PID と生成時刻を保存し、PID 再利用と区別する。"""
+def _uses_other_codex_home(process: psutil.Process, home: Path) -> bool:
+    """Linux では process の環境から CODEX_HOME（無ければ HOME/.codex）を読む。読めなければ同じ場所として数える。"""
+    if sys.platform != "linux":
+        return False
+    try:
+        env = process.environ()
+    except psutil.Error:
+        return False
+    used = env.get("CODEX_HOME") or (str(Path(env["HOME"]) / ".codex") if env.get("HOME") else None)
+    if not used:
+        return False
+    try:
+        return Path(used).resolve() != home.resolve()
+    except OSError:
+        return False
+
+
+def codex_processes(home: Path | None = None) -> list[dict[str, int | float]]:
+    """Codex 本体の PID と生成時刻を保存し、PID 再利用と区別する。
+
+    home を渡すと、Linux では別の CODEX_HOME で動く Codex（同じ端末の他の利用者や Bot）を数えない。
+    """
     processes = []
     try:
         for process in psutil.process_iter(["name", "exe", "create_time"], ad_value=None):
@@ -88,6 +108,8 @@ def codex_processes() -> list[dict[str, int | float]]:
             if name not in ("codex", "codex.exe") and executable not in ("codex", "codex.exe"):
                 continue
             if not _same_pid_namespace(process.pid):
+                continue
+            if home is not None and _uses_other_codex_home(process, home):
                 continue
             created = process.info["create_time"]
             if not isinstance(created, (int, float)):
@@ -267,6 +289,7 @@ def check_steer_version(cli: Path) -> str:
     """dist/cli.js の隣の package.json で版を確かめる。
 
     0.1.1 より前は verify が thread を返さない。0.1.3 より前は Desktop の無い Codex と Linux で Steer を使えない。
+    0.1.4 より前は解除した位置の承認記録が残り、0.1.5 より前は Linux で別の CODEX_HOME の Codex も再起動待ちに数える。
     """
     try:
         package = json.loads((cli.parent.parent / "package.json").read_text(encoding="utf-8"))
@@ -278,7 +301,7 @@ def check_steer_version(cli: Path) -> str:
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", f"aiterm-steer-delivery の版を確認できません: {cli}")
     if tuple(map(int, match.groups())) < STEER_MIN_VERSION:
         raise DeliveryError("STEER_DELIVERY_OUTDATED",
-                            f"aiterm-steer-delivery {version} は古いです。npm install -g aiterm-steer-delivery@^0.1.3 を実行してください")
+                            f"aiterm-steer-delivery {version} は古いです。npm install -g aiterm-steer-delivery@^0.1.5 を実行してください")
     return version
 
 
@@ -383,7 +406,7 @@ async def verify_parent(thread_id: str, home: Path) -> str | None:
     # 親の確認と、Steer の hook が有効ならその登録の確認はパッケージが行う。
     thread = (await steer(["verify", "--thread", thread_id, "--codex-home", str(home)])).get("thread")
     if not isinstance(thread, dict) or thread.get("thread_id") != thread_id:
-        raise DeliveryError("STEER_DELIVERY_OUTDATED", "aiterm-steer-delivery を 0.1.3 以降へ更新してください")
+        raise DeliveryError("STEER_DELIVERY_OUTDATED", "aiterm-steer-delivery を 0.1.5 以降へ更新してください")
     source = thread.get("source")
     async with CodexRPC(home) as rpc:
         hooks = await rpc.request("hooks/list", {"cwds": [thread.get("cwd") or str(home)]})
