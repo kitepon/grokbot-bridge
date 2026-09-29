@@ -115,6 +115,9 @@ bearer_token_env_var = "TEST_TOKEN"
                 self.assertEqual({row["trustStatus"] for row in await trust(True)}, {"trusted"})
                 self.assertTrue(await _merge_hooks(home / "hooks.json", old))
                 rows = await trust(False)
+            import tomllib
+            state = tomllib.loads((home / "config.toml").read_text(encoding="utf-8"))["hooks"]["state"]
+            self.assertEqual(set(state), {row["key"] for row in rows}, "空いた位置の承認記録を残さない")
             others = [row for row in rows if row["command"] == other]
             self.assertEqual(sorted((row["eventName"], row["trustStatus"], row["enabled"]) for row in others),
                              [("stop", "trusted", True), ("userPromptSubmit", "trusted", True)])

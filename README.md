@@ -85,7 +85,7 @@ hook が起動する Codex は、公式 Desktop 同梱の CLI（macOS／Windows�
 
 ```bash
 python -m pip install git+https://github.com/kitepon/grokbot-bridge.git
-npm install -g aiterm-steer-delivery@^0.1.3
+npm install -g aiterm-steer-delivery@^0.1.5
 call-bridge-setup enable
 # Codex を完全終了して再起動
 call-bridge-setup status
@@ -97,7 +97,7 @@ call-bridge-setup status
 
 ```bash
 uv tool upgrade grokbot-bridge            # pip の場合は pip install -U git+https://github.com/kitepon/grokbot-bridge.git
-npm install -g aiterm-steer-delivery@^0.1.3
+npm install -g aiterm-steer-delivery@^0.1.5
 call-bridge-setup enable
 # Codex を完全終了して再起動
 call-bridge-setup status
@@ -114,7 +114,7 @@ Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ�
 `aiterm-steer-delivery codex setup enable` でパッケージの Steer hook を登録する。他製品の hook は保持する。
 旧版が登録した本製品の `PostToolUse`／`Stop` hook は外す。
 hook を外したり置き換えたりして他の hook の位置が動く時は、Codex が位置ごとに持つ承認をその hook の新しい位置へ写す。そのため、後ろにある他製品の hook の承認が外れることはない。
-`aiterm-steer-delivery` の場所（`AITERM_STEER_DELIVERY` か PATH）と Node の絶対パスは製品設定へ保存し（npm のシムではなく、同じ場所にあるパッケージの `dist/cli.js` を Node で直接起動する。`enable` と `status` は 0.1.3 以上かを確かめる）、パッケージへ渡す識別情報は state directory の `steer-profile.json` に置く。
+`aiterm-steer-delivery` の場所（`AITERM_STEER_DELIVERY` か PATH）と Node の絶対パスは製品設定へ保存し（npm のシムではなく、同じ場所にあるパッケージの `dist/cli.js` を Node で直接起動する。`enable` と `status` は 0.1.5 以上かを確かめる）、パッケージへ渡す識別情報は state directory の `steer-profile.json` に置く。
 設定変更前の `hooks.json` と `config.toml` は製品の state directory に tar で保存する。
 元の HTTP MCP へ戻すときは `call-bridge-setup disable` を実行して Codex を再起動する。
 `aiterm-steer-delivery` が消えていても `disable` は call-bridge の設定を元へ戻す。その場合、Steer hook を外せなかったことを結果の `warning` で知らせる。
