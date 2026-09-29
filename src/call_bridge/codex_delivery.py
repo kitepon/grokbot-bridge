@@ -22,7 +22,7 @@ from typing import Any
 import psutil
 
 STEER_PROFILE = "steer-profile.json"
-STEER_MIN_VERSION = (0, 1, 1)
+STEER_MIN_VERSION = (0, 1, 3)
 # App Server の応答は1行の JSON。config/read は設定全体を返すので、既定の 64KiB では足りない端末がある。
 _RPC_LINE_LIMIT = 64 * 1024 * 1024
 _STEER_TIMEOUT = 60
@@ -264,7 +264,10 @@ def current_steer_cli(config: dict[str, Any]) -> Path:
 
 
 def check_steer_version(cli: Path) -> str:
-    """dist/cli.js の隣の package.json で版を確かめる。0.1.1 より前は verify が thread を返さない。"""
+    """dist/cli.js の隣の package.json で版を確かめる。
+
+    0.1.1 より前は verify が thread を返さない。0.1.3 より前は Desktop の無い Codex と Linux で Steer を使えない。
+    """
     try:
         package = json.loads((cli.parent.parent / "package.json").read_text(encoding="utf-8"))
     except (OSError, ValueError):
@@ -275,7 +278,7 @@ def check_steer_version(cli: Path) -> str:
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", f"aiterm-steer-delivery の版を確認できません: {cli}")
     if tuple(map(int, match.groups())) < STEER_MIN_VERSION:
         raise DeliveryError("STEER_DELIVERY_OUTDATED",
-                            f"aiterm-steer-delivery {version} は古いです。npm install -g aiterm-steer-delivery@^0.1.1 を実行してください")
+                            f"aiterm-steer-delivery {version} は古いです。npm install -g aiterm-steer-delivery@^0.1.3 を実行してください")
     return version
 
 
@@ -380,7 +383,7 @@ async def verify_parent(thread_id: str, home: Path) -> str | None:
     # 親の確認と、Steer の hook が有効ならその登録の確認はパッケージが行う。
     thread = (await steer(["verify", "--thread", thread_id, "--codex-home", str(home)])).get("thread")
     if not isinstance(thread, dict) or thread.get("thread_id") != thread_id:
-        raise DeliveryError("STEER_DELIVERY_OUTDATED", "aiterm-steer-delivery を 0.1.1 以降へ更新してください")
+        raise DeliveryError("STEER_DELIVERY_OUTDATED", "aiterm-steer-delivery を 0.1.3 以降へ更新してください")
     source = thread.get("source")
     async with CodexRPC(home) as rpc:
         hooks = await rpc.request("hooks/list", {"cwds": [thread.get("cwd") or str(home)]})

@@ -767,13 +767,13 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
 
     def test_windows_shim_resolves_to_the_package_script(self):
         with tempfile.TemporaryDirectory() as temp:
-            shim = fake_package(Path(temp), "0.1.1", windows_shim=True)
+            shim = fake_package(Path(temp), "0.1.3", windows_shim=True)
             script = codex_delivery.resolve_steer_cli(str(shim))
             self.assertEqual(script, (Path(temp) / "node_modules" / "aiterm-steer-delivery" / "dist" / "cli.js").resolve())
-            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.1")
+            self.assertEqual(codex_delivery.check_steer_version(script), "0.1.3")
 
     def test_package_version_is_checked(self):
-        for version, expected in (("0.1.0", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
+        for version, expected in (("0.1.2", "STEER_DELIVERY_OUTDATED"), ("0.2.0", None), ("1.0.0-beta.1", None)):
             with tempfile.TemporaryDirectory() as temp:
                 script = fake_package(Path(temp), version)
                 if expected:
