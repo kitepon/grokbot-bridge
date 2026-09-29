@@ -811,6 +811,23 @@ class SetupTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(file.read_text(encoding="utf-8"), original)
             self.assertEqual(writes, [])
 
+    async def test_large_app_server_answer_is_read(self):
+        # 設定の大きい端末では config/read の応答が 64KiB を超える（2026-09-29 MacBook）。
+        with tempfile.TemporaryDirectory() as temp:
+            script = Path(temp) / "codex"
+            script.write_text(f"""#!{sys.executable}
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if "id" in request:
+        print(json.dumps({{"id": request["id"], "result": {{"config": {{"large": "x" * 200000}}}}}}), flush=True)
+""", encoding="utf-8")
+            script.chmod(0o700)
+            with patch.dict(os.environ, {"CODEX_CLI_PATH": str(script), "CALL_BRIDGE_STATE": temp}):
+                async with codex_delivery.CodexRPC(Path(temp)) as rpc:
+                    result = await rpc.request("config/read", {"includeLayers": False})
+            self.assertEqual(len(result["config"]["large"]), 200000)
+
     async def test_reenable_keeps_own_hook_in_place(self):
         with tempfile.TemporaryDirectory() as temp:
             file = Path(temp) / "hooks.json"

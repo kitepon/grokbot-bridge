@@ -23,6 +23,8 @@ import psutil
 
 STEER_PROFILE = "steer-profile.json"
 STEER_MIN_VERSION = (0, 1, 1)
+# App Server の応答は1行の JSON。config/read は設定全体を返すので、既定の 64KiB では足りない端末がある。
+_RPC_LINE_LIMIT = 64 * 1024 * 1024
 _STEER_TIMEOUT = 60
 
 
@@ -169,6 +171,7 @@ class CodexRPC:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 env={**os.environ, "CODEX_HOME": str(self.home)},
+                limit=_RPC_LINE_LIMIT,
             )
         except OSError as exc:
             raise DeliveryError("CODEX_UNAVAILABLE", "Codex App Server を起動できません") from exc
