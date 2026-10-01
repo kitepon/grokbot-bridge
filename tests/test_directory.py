@@ -765,3 +765,25 @@ class DirectoryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class GoneListTests(unittest.TestCase):
+    def test_gone_ids_are_left_out(self) -> None:
+        import tempfile
+        from call_bridge.directory import build_members_from_profiles
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "agents"
+            for agent_id, name in (("keep-1", "Keep"), ("gone-1", "Gone")):
+                (root / agent_id).mkdir(parents=True)
+                (root / agent_id / "profile.json").write_text(
+                    json.dumps({"name": name}), encoding="utf-8"
+                )
+            gone = Path(tmp) / "gone.txt"
+            gone.write_text("# deleted\ngone-1  # old seat\n", encoding="utf-8")
+            with mock.patch.dict(os.environ, {"CALL_BRIDGE_DIRECTORY_GONE": str(gone)}):
+                names = [m["name"] for m in build_members_from_profiles(root)]
+            self.assertEqual(names, ["Keep"])
+            with mock.patch.dict(os.environ, {"CALL_BRIDGE_DIRECTORY_GONE": str(Path(tmp) / "missing")}):
+                names = sorted(m["name"] for m in build_members_from_profiles(root))
+            self.assertEqual(names, ["Gone", "Keep"])
