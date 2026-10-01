@@ -150,10 +150,37 @@ def _snapshot_paths() -> list[Path]:
     return paths
 
 
+def gone_agent_ids() -> set[str]:
+    """Agent ids of deleted bots whose seat folder is still on the box.
+
+    Grok Bot keeps ``agents/<id>/`` after a bot is deleted and writes no
+    deletion marker. The phone operator compares the book with Grok Bot's
+    live member list on every call and records ids that are gone in the file
+    named by ``CALL_BRIDGE_DIRECTORY_GONE`` (one id per line, ``#`` comments).
+    The file is re-read on every build, so no restart is needed.
+    """
+    raw = os.environ.get("CALL_BRIDGE_DIRECTORY_GONE", "").strip()
+    if not raw:
+        return set()
+    try:
+        text = Path(raw).read_text(encoding="utf-8")
+    except OSError:
+        return set()
+    ids: set[str] = set()
+    for line in text.splitlines():
+        value = line.split("#", 1)[0].strip()
+        if value:
+            ids.add(value)
+    return ids
+
+
 def build_members_from_profiles(root: Path) -> list[dict[str, Any]]:
     members: list[dict[str, Any]] = []
+    gone = gone_agent_ids()
     for d in sorted(root.iterdir()):
         if not d.is_dir():
+            continue
+        if d.name in gone:
             continue
         pj = d / "profile.json"
         if not pj.is_file():
