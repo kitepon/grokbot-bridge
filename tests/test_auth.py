@@ -224,6 +224,26 @@ class HttpIdentityTest(unittest.TestCase):
         self.assertEqual(opened["local_id"], "bot-a", opened)
         return opened["session_id"]
 
+    def test_a_session_id_from_before_a_restart_still_works(self) -> None:
+        """Cursor keeps its old Mcp-Session-Id after the bridge restarts and never
+        re-initializes. The call must go through, as the caller of this request."""
+        sid = self._open_as_bot_a()
+        body = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                "params": {"name": "call_info", "arguments": {"session_id": sid}}}
+
+        def call(caller_id: str) -> dict:
+            response = httpx.post(f"{self.base}/mcp", json=body, timeout=10, headers={
+                **_headers(BELLTEAM, caller_id),
+                "Accept": "application/json, text/event-stream",
+                "Mcp-Session-Id": "0123456789abcdef0123456789abcdef",
+            })
+            self.assertEqual(response.status_code, 200, response.text)
+            data = next(line for line in response.text.splitlines() if line.startswith("data: "))
+            return json.loads(json.loads(data[6:])["result"]["content"][0]["text"])
+
+        self.assertEqual(call("bot-a")["session_id"], sid)
+        self.assertEqual(call("bot-b")["error"], "forbidden")
+
     def test_open_rejects_a_caller_claiming_another_identity(self) -> None:
         other_bot = self._tool(_headers(BELLTEAM, "bot-a"), "call_open", local_id="bot-b",
                                local_label="B", member_name="マリアン", local_system="bellteam")
