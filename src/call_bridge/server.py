@@ -68,12 +68,17 @@ except AuthError as _e:
 
 store = CallStore(DB_PATH)
 
+# Stateless: every tool reads its caller from the request itself, so there is
+# nothing to keep per MCP session. With sessions, a restart invalidated every
+# client's Mcp-Session-Id and clients that do not re-initialize on 404
+# (Cursor) kept failing with "Session not found" until they were restarted.
 mcp = FastMCP(
     "grokbot-bridge",
     instructions=_INSTRUCTIONS,
     host=HOST,
     port=PORT,
     streamable_http_path="/mcp",
+    stateless_http=True,
 )
 
 
