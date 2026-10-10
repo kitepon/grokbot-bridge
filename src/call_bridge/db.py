@@ -241,16 +241,18 @@ class CallStore:
                 conn.execute("UPDATE sessions SET local_seen_at = ? WHERE session_id = ?", (_utcnow(), session_id))
             # Messages FROM the other party, after after_seq
             other = "member" if party == "local" else "local"
+            # fetched: whether an earlier poll already marked the message delivered to this party.
+            flag = "delivered_to_local" if party == "local" else "delivered_to_member"
             rows = conn.execute(
-                """
-                SELECT seq, from_party, body AS message, created_at
+                f"""
+                SELECT seq, from_party, body AS message, created_at, {flag} AS fetched
                 FROM messages
                 WHERE session_id = ? AND from_party = ? AND seq > ?
                 ORDER BY seq ASC
                 """,
                 (session_id, other, after_seq),
             ).fetchall()
-            messages = [dict(r) for r in rows]
+            messages = [{**dict(r), "fetched": bool(r["fetched"])} for r in rows]
             if mark_delivered and messages:
                 col = (
                     "delivered_to_local"

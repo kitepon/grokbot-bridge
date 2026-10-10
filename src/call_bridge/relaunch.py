@@ -64,12 +64,13 @@ def seat_lock(name: str) -> Iterator[None]:
 
 
 async def hand_over(store: Any, subscription: dict[str, Any], texts: list[str], reason: str,
-                    connect: Callable[[], AsyncContextManager[Any]] = aiterm.connect) -> str:
+                    connect: Callable[[], AsyncContextManager[Any]] | None = None) -> str:
     """止まった会話の通話を、担当フォルダの席へ渡す。席の名前を返す。
 
     RELAUNCH_BUSY は、何もしていない（後でもう一度試せる）。
     文が席へ入ったか確かめられない失敗は outcome_unknown。その時は立て直さず、送り直さない。
     """
+    connect = connect or aiterm.connect
     harness, cwd = subscription["harness"], subscription.get("cwd")
     if harness not in aiterm.HARNESSES:
         raise DeliveryError("RELAUNCH_HARNESS_UNSUPPORTED", f"{harness} の席は立てられません")

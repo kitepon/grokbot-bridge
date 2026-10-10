@@ -508,7 +508,8 @@ class Watchers:
                             return
                         if outcome != "next":
                             break
-                        subscription["after_seq"] = message["seq"]
+                        # この返信で席へ付け替えた時は、続きの返信をその席へ送る。
+                        subscription = self.store.subscription(session_id)
                 await self._confirm_queued(session_id, _Reporter(client, headers, session_id))
                 if value.get("status") == "hungup" and not self.store.unconfirmed(session_id):
                     # 終わった通話に新しい返信は来ない。渡し終えたか、届けられないと決まった時に見張りを閉じる。
@@ -571,7 +572,9 @@ class Watchers:
             following = talk.successor(subscription["thread_id"], await talk.handoff_operations())
             if following:
                 # Throughline が続きの会話へ乗り換えている。同じ会話に付いた通話ごと、そこへ付け替える。
+                # この返信は、次に取りに行った時に続きの会話へ入れる。
                 self.store.follow(subscription["thread_id"], following)
+                self.store.defer(session_id, seq)
                 return "wait"
             if found.exists and found.idle_seconds < _INTERRUPT_SETTLE_SECONDS:
                 self.store.defer(session_id, seq)
