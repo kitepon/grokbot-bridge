@@ -99,6 +99,61 @@ class ReceiverPlanTest(unittest.TestCase):
         self.assertEqual(set(watched), {first, later})
 
 
+class ReceiverLimitsTest(unittest.TestCase):
+    def test_file_limit_is_raised_and_never_lowered(self) -> None:
+        import resource
+        calls: list[tuple[int, int]] = []
+        with patch.object(resource, "getrlimit", return_value=(256, resource.RLIM_INFINITY)), \
+             patch.object(resource, "setrlimit", side_effect=lambda _kind, value: calls.append(value)):
+            receiver.raise_file_limit()
+        self.assertEqual(calls, [(4096, resource.RLIM_INFINITY)])
+        calls.clear()
+        with patch.object(resource, "getrlimit", return_value=(256, 1024)), \
+             patch.object(resource, "setrlimit", side_effect=lambda _kind, value: calls.append(value)):
+            receiver.raise_file_limit()
+        self.assertEqual(calls, [(1024, 1024)])
+        calls.clear()
+        with patch.object(resource, "getrlimit", return_value=(65536, 65536)), \
+             patch.object(resource, "setrlimit", side_effect=lambda _kind, value: calls.append(value)):
+            receiver.raise_file_limit()
+        self.assertEqual(calls, [])
+
+    def test_store_closes_its_connection_after_each_use(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = local.LocalStore(Path(tmp))
+            with store.connect() as db:
+                db.execute("SELECT 1").fetchone()
+            with self.assertRaises(Exception):
+                db.execute("SELECT 1")  # 閉じた接続は使えない
+
+    def test_receiver_survives_a_round_in_which_the_store_cannot_be_read(self) -> None:
+        import sqlite3
+        rounds = {"n": 0}
+
+        class Store:
+            def __init__(self, _root):
+                pass
+
+            def active(self):
+                rounds["n"] += 1
+                if rounds["n"] == 1:
+                    raise sqlite3.OperationalError("unable to open database file")
+                return []
+
+        class Quiet:
+            def __init__(self, _store, receiver=False):
+                pass
+
+            async def close(self):
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"CALL_BRIDGE_STATE": tmp}), \
+             patch.object(local, "LocalStore", Store), patch.object(local, "Watchers", Quiet), \
+             patch.object(receiver, "_SCAN_SECONDS", 0.01):
+            asyncio.run(receiver.run(scans=2))
+        self.assertEqual(rounds["n"], 2)
+
+
 class HarnessSetupTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()

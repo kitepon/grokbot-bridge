@@ -10,6 +10,7 @@ import asyncio
 import logging
 import os
 import plistlib
+import sqlite3
 import subprocess
 import sys
 import time
@@ -27,6 +28,8 @@ TASK = "call-bridge-receiver"
 _SCAN_SECONDS = 5.0
 # 登録して起こした後、動き出したかを見る長さ。
 _START_WAIT_SECONDS = 10.0
+# 受け取り係が開けるファイルの数。通話1本につき鍵1つと接続1つ、席を立てる時は子の process の管が加わる。
+_FILE_LIMIT = 4096
 
 
 def _claim() -> int | None:
@@ -45,6 +48,24 @@ def _claim() -> int | None:
     return fd
 
 
+def raise_file_limit() -> None:
+    """開けるファイルの数の上限を上げる。macOS の常駐は 256 で始まり、通話の数と席を立てる時の子で足りなくなる。
+
+    2026-10-10 に Mac で、通話 48 本を見ながら席を4つ同時に立てた時に、控えを開けず落ちた。
+    """
+    try:
+        import resource
+    except ImportError:  # Windows にはこの上限が無い
+        return
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    wanted = _FILE_LIMIT if hard == resource.RLIM_INFINITY else min(_FILE_LIMIT, hard)
+    if soft < wanted:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (wanted, hard))
+        except (ValueError, OSError) as exc:
+            log.warning("file limit stays at %s: %s", soft, exc)
+
+
 async def run(scans: int | None = None) -> None:
     """生きている通話を見張り続ける。scans は試験用（見回る回数）。"""
     from . import local
@@ -53,9 +74,13 @@ async def run(scans: int | None = None) -> None:
     watchers = local.Watchers(store, receiver=True)
     try:
         while scans is None or scans > 0:
-            for session_id in store.active():
-                if store.subscription(session_id)["delivery_mode"] != "exec":
-                    watchers.start(session_id)
+            try:
+                for session_id in store.active():
+                    if store.subscription(session_id)["delivery_mode"] != "exec":
+                        watchers.start(session_id)
+            except sqlite3.Error as exc:
+                # 控えを一時的に読めない時に、見張っている通話ごと落ちない。次の見回りで読み直す。
+                log.warning("subscriptions were not read this round: %s", exc)
             if scans is not None:
                 scans -= 1
             await asyncio.sleep(_SCAN_SECONDS)
@@ -70,6 +95,7 @@ def main() -> None:
     if fd is None:
         log.info("receiver is already running")
         return
+    raise_file_limit()
     try:
         asyncio.run(run())
     finally:
