@@ -575,16 +575,20 @@ class Watchers:
         session_id, home = subscription["session_id"], Path(subscription["codex_home"])
         found = await codex_conversation(subscription["thread_id"], home)
         if not found.exists or found.turn == "interrupted":
-            following = talk.successor(subscription["thread_id"], await talk.handoff_operations())
-            if following:
+            handoff = await talk.handoff_state(subscription["thread_id"])
+            if handoff.current:
                 # Throughline が続きの会話へ乗り換えている。同じ会話に付いた通話ごと、そこへ付け替える。
                 # この返信は、次に取りに行った時に続きの会話へ入れる。
-                self.store.follow(subscription["thread_id"], following)
+                self.store.follow(subscription["thread_id"], handoff.current)
                 self.store.defer(session_id, seq)
                 return "wait"
-            if found.exists and found.idle_seconds < _INTERRUPT_SETTLE_SECONDS:
+            if handoff.in_flight or (found.exists and found.idle_seconds < _INTERRUPT_SETTLE_SECONDS):
+                # 続きを作っている途中。出来上がるのを待つ（席を立てると、続きが2つになる）。
                 self.store.defer(session_id, seq)
                 return self._later(session_id)
+            if handoff.stopped:
+                # 引き継ぎが途中で止まっている。Throughline がやり直せば続きが出来るので、席は立てない。
+                raise DeliveryError("HANDOFF_STOPPED", f"Throughline の引き継ぎが止まっています（{handoff.stopped}）")
             reason = "途中で止められていて、続きの会話がありません" if found.exists else "会話が見つかりません"
             return await self._hand_over({**subscription, "cwd": subscription["cwd"] or found.cwd}, seq, [text],
                                          reason, report)
@@ -656,6 +660,11 @@ class Watchers:
                     self._later(session_id)  # 番の終わりにキューが渡す。中断の直後は、続きの会話を待つ
                     return
                 # 寝たまま起きない・途中で止められた。このキューは人が入力するまで動かない。
+                handoff = (await talk.handoff_state(thread_id) if found.turn == "interrupted" or not found.exists
+                           else talk.Handoff())
+                if handoff.in_flight:
+                    self._later(session_id)  # 続きを作っている途中。キューの文は Throughline が扱う
+                    return
                 withdrawn = await codex_withdraw(thread_id, home, delivery_id)
                 if withdrawn == "gone":  # 見ている間に番になった
                     self.store.confirm(session_id, seq)
@@ -665,13 +674,15 @@ class Watchers:
                     raise DeliveryError("CODEX_QUEUE_WITHDRAW_UNCONFIRMED", "キューからの取り消しを確かめられません",
                                         outcome_unknown=True)
                 text = reply_text(subscription, seq, await fetch_body(session_id, seq))
-                following = talk.successor(thread_id, await talk.handoff_operations())
-                if following:
-                    self.store.follow(thread_id, following)
-                    await submit_reply(following, home, delivery_id, text)
+                if handoff.current:
+                    self.store.follow(thread_id, handoff.current)
+                    await submit_reply(handoff.current, home, delivery_id, text)
                     self.store.submitted(session_id, seq, "submitted", confirmed=False)
-                    await report(seq, "submitted", "引き継ぎ先の会話へ入れ直しました", f"codex:{following}")
+                    await report(seq, "submitted", "引き継ぎ先の会話へ入れ直しました", f"codex:{handoff.current}")
                     return
+                if handoff.stopped:
+                    raise DeliveryError("HANDOFF_STOPPED",
+                                        f"Throughline の引き継ぎが止まっています（{handoff.stopped}）")
                 reason = ("途中で止められていて、続きの会話がありません" if found.turn == "interrupted"
                           else "会話が寝たままで、起こせませんでした")
                 seat = await relaunch.hand_over(self.store, {**subscription, "cwd": subscription["cwd"] or found.cwd},

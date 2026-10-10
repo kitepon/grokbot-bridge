@@ -108,6 +108,28 @@ class ConversationTest(unittest.IsolatedAsyncioTestCase):
                 {"source_thread_id": "q", "target_thread_id": "p", "state": "continued"}]
         self.assertEqual(conversation.successor("p", loop), "q")
 
+    async def test_handoff_state_uses_the_successor_command_and_falls_back_to_the_list(self) -> None:
+        def answer(value):
+            async def run(args):
+                return value if args[1] == "successor" else {"operations": [
+                    {"source_thread_id": "a", "target_thread_id": "old-list", "state": "continued"}]}
+            return run
+
+        schema = "throughline.codex_auto_handoff_successor.v1"
+        cases = (
+            ({"schema": schema, "thread_id": "a", "current_thread_id": "c", "pending": None}, conversation.Handoff(current="c")),
+            ({"schema": schema, "thread_id": "a", "current_thread_id": "a", "pending": None}, conversation.Handoff()),
+            ({"schema": schema, "thread_id": "a", "current_thread_id": "a",
+              "pending": {"handoff_id": "h-1", "in_flight": True}}, conversation.Handoff(in_flight=True)),
+            ({"schema": schema, "thread_id": "a", "current_thread_id": "a",
+              "pending": {"handoff_id": "h-1", "in_flight": False, "error_code": "x"}},
+             conversation.Handoff(stopped="handoff_id=h-1 error_code=x")),
+            (None, conversation.Handoff(current="old-list")),  # successor の無い版
+        )
+        for value, expected in cases:
+            with patch.object(conversation, "_throughline_json", answer(value)):
+                self.assertEqual(await conversation.handoff_state("a"), expected)
+
     async def test_handoff_operations_reads_the_public_command_and_survives_its_absence(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             script = Path(tmp) / "throughline"
@@ -220,8 +242,13 @@ class StoppedConversationTest(unittest.IsolatedAsyncioTestCase):
                     "handoff_operations": AsyncMock(return_value=[])}
         defaults.update(patches)
         operations = defaults.pop("handoff_operations")
+        handoff = defaults.pop("handoff_state", None)
+
+        async def from_operations(thread_id):
+            return conversation.Handoff(current=conversation.successor(thread_id, await operations()))
+
         with patch.object(local.httpx, "AsyncClient", return_value=bridge), \
-             patch.object(local.talk, "handoff_operations", operations):
+             patch.object(local.talk, "handoff_state", handoff or from_operations):
             for name, value in defaults.items():
                 patcher = patch.object(local, name, value)
                 patcher.start()
@@ -290,6 +317,19 @@ class StoppedConversationTest(unittest.IsolatedAsyncioTestCase):
                           codex_conversation=AsyncMock(return_value=_conversation("interrupted", idle=5.0)))
         self.assertEqual((self.submit.await_count, self.terminal.launched, bridge.receipts), (0, [], []))
         self.assertEqual(self.store.status(session_id)["deliveries"][0]["state"], "waiting")
+
+    async def test_handoff_still_being_made_is_waited_for_and_a_stopped_one_is_reported_not_replaced(self):
+        session_id = self._call("thread-a", cwd=str(self.folder))
+        answers = [conversation.Handoff(in_flight=True), conversation.Handoff(in_flight=True),
+                   conversation.Handoff(stopped="handoff_id=h-1 error_code=handoff_thread_mismatch")]
+        asked = AsyncMock(side_effect=lambda _thread: answers.pop(0) if len(answers) > 1 else answers[0])
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge, handoff_state=asked,
+                          codex_conversation=AsyncMock(return_value=_conversation("interrupted")))
+        self.assertEqual((self.submit.await_count, self.terminal.launched), (0, []))  # 席は立てない
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "failed")])
+        self.assertIn("handoff_id=h-1 error_code=handoff_thread_mismatch", bridge.receipts[0]["detail"])
+        self.assertEqual(asked.await_count, 3)
 
     async def test_missing_conversation_uses_the_folder_recorded_when_the_call_was_opened(self):
         session_id = self._call("thread-a", cwd=str(self.folder))
