@@ -11,9 +11,9 @@ import subprocess
 import sys
 import time
 import uuid
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from pathlib import Path
-from typing import Any, AsyncIterator, Literal
+from typing import Any, AsyncIterator, Iterator, Literal
 from urllib.parse import urlsplit, urlunsplit
 from urllib.request import url2pathname
 
@@ -208,10 +208,16 @@ class LocalStore:
             if "at" not in columns:
                 db.execute("ALTER TABLE deliveries ADD COLUMN at REAL")
 
-    def connect(self) -> sqlite3.Connection:
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        """1回の用事ごとに開いて、確定して、閉じる。開いたままにすると、通話の数だけファイルの口を使い続ける。"""
         db = sqlite3.connect(self.path)
         db.row_factory = sqlite3.Row
-        return db
+        try:
+            with db:
+                yield db
+        finally:
+            db.close()
 
     def add(self, session_id: str, thread_id: str, home: Path, member_name: str,
             delivery_mode: str = "queue", member_system: str | None = None,
