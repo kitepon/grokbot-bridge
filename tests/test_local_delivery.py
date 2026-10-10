@@ -23,6 +23,7 @@ class FakeHTTP:
     def __init__(self, *_args, **_kwargs):
         self.polls: list[int] = []
         self.tokens: list[str] = []
+        self.receipts: list[dict] = []
         self.on_poll = None
 
     async def __aenter__(self):
@@ -43,6 +44,21 @@ class FakeHTTP:
         else:
             body = {"ok": True, "status": "hungup", "messages": []}
         return httpx.Response(200, json=body, request=httpx.Request("GET", url))
+
+    async def post(self, url, headers=None, json=None):
+        self.receipts.append(json)
+        return httpx.Response(200, json={"ok": True}, request=httpx.Request("POST", url))
+
+
+def healthy_codex(test: unittest.TestCase) -> None:
+    """会話は普通に終わっていて、入れた文はキューから出ている（番になった）ものとして答える。"""
+    found = local.talk.Conversation("thread", True, "vscode", None, "completed")
+    for name, value in (("codex_conversation", AsyncMock(return_value=found)),
+                        ("codex_queued", AsyncMock(return_value=(False, found))),
+                        ("_CONFIRM_AFTER_SECONDS", 0.0)):
+        patcher = patch.object(local, name, value)
+        patcher.start()
+        test.addCleanup(patcher.stop)
 
 
 def fake_steer(test: unittest.TestCase, response: dict | None, *, exit_code: int = 0):
@@ -94,6 +110,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         })
         self.env.start()
         self.addCleanup(self.env.stop)
+        healthy_codex(self)
 
     async def test_two_replies_are_delivered_in_order_then_watch_closes(self):
         store = local.LocalStore(Path(self.temp.name))
@@ -306,6 +323,8 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("member_system", tool.inputSchema["properties"])
         self.assertIn("local_system", tool.inputSchema["properties"])
         with patch.object(local, "_parent", return_value=(thread_id, Path(self.temp.name))), \
+             patch.object(local, "_parent_harness", return_value="codex"), \
+             patch.object(local, "_codex_folder", new_callable=AsyncMock, return_value="/work"), \
              patch.object(local, "verify_parent", new_callable=AsyncMock), \
              patch.object(local, "_remote_tool", new_callable=AsyncMock,
                           return_value={"session_id": session_id, "status": "ringing"}) as remote, \
@@ -319,7 +338,7 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
             "purpose": "相談", "member_system": "bellteam", "local_system": "grokbot",
         })
         add.assert_called_once_with(session_id, thread_id, Path(self.temp.name), "bot-1", "queue",
-                                    "bellteam")
+                                    "bellteam", "codex", "/work")
         start.assert_called_once_with(session_id)
         self.assertEqual(result["parent_delivery"]["state"], "watching")
 
@@ -327,6 +346,8 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
         session_id, thread_id = str(uuid.uuid4()), str(uuid.uuid4())
         store = local.LocalStore(Path(self.temp.name))
         with patch.object(local, "_parent", return_value=(thread_id, Path(self.temp.name))), \
+             patch.object(local, "_parent_harness", return_value="codex"), \
+             patch.object(local, "_codex_folder", new_callable=AsyncMock, return_value="/work"), \
              patch.object(local, "verify_parent", new_callable=AsyncMock, return_value="exec"), \
              patch.object(local, "_remote_tool", new_callable=AsyncMock,
                           return_value={"session_id": session_id}), \
@@ -372,6 +393,8 @@ class LocalDeliveryTest(unittest.IsolatedAsyncioTestCase):
     async def test_call_open_keeps_grokbot_default_and_leaves_local_system_to_the_bridge(self):
         session_id = str(uuid.uuid4())
         with patch.object(local, "_parent", return_value=(str(uuid.uuid4()), Path(self.temp.name))), \
+             patch.object(local, "_parent_harness", return_value="codex"), \
+             patch.object(local, "_codex_folder", new_callable=AsyncMock, return_value=None), \
              patch.object(local, "verify_parent", new_callable=AsyncMock), \
              patch.object(local, "_remote_tool", new_callable=AsyncMock,
                           return_value={"session_id": session_id}) as remote, \

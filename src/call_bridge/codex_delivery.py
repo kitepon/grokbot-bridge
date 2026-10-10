@@ -249,6 +249,12 @@ class CodexRPC:
                                 outcome_unknown=outcome_unknown) from exc
 
 
+def conversation_missing(error: Exception) -> bool:
+    """App Server が「その会話は無い」と答えた時だけ真。通信の失敗や時間切れは、無いとは決めない。"""
+    return (isinstance(error, DeliveryError) and error.code == "CODEX_REQUEST_REJECTED"
+            and any(text in str(error) for text in ("thread not loaded", "thread not found", "no rollout found")))
+
+
 def steer_profile(mcp_server: str) -> dict[str, Any]:
     """aiterm-steer-delivery へ渡す call-bridge の識別情報。置き場は state directory にまとめる。"""
     root = str(state_root().resolve())
