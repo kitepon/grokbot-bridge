@@ -183,10 +183,15 @@ def _run(command: list[str], accept: tuple[int, ...] = (0,)) -> subprocess.Compl
 
 
 def _windows_user() -> str:
-    domain, name = os.environ.get("USERDOMAIN"), os.environ.get("USERNAME")
+    """タスクの持ち主にする利用者（<端末名>\\<名前>）。
+
+    ssh の session の USERDOMAIN はワークグループ名で、端末の利用者を指さない（fox で WORKGROUP になっていた）。
+    whoami の答えを使う。
+    """
+    name = _run(["whoami"]).stdout.strip()
     if not name:
         raise DeliveryError("RECEIVER_SETUP_FAILED", "利用者名を確認できません")
-    return f"{domain}\\{name}" if domain else name
+    return name
 
 
 def install(platform: str = sys.platform) -> dict[str, Any]:
