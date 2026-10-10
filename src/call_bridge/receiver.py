@@ -89,8 +89,11 @@ async def run(scans: int | None = None) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # 窓の無い起動（Windows の pythonw）には、書き出す先が無い。その時は控えの置き場へ書く。
+    target: dict[str, Any] = ({"stream": sys.stderr} if sys.stderr is not None
+                              else {"filename": str(state_root() / "receiver.log"), "encoding": "utf-8"})
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", **target)
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # 2秒おきの取りに行く記録で埋めない
     fd = _claim()
     if fd is None:
         log.info("receiver is already running")
@@ -173,7 +176,9 @@ def windows_task(user: str) -> str:
 
 def _run(command: list[str], accept: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        # 読めない文字があっても、命令の成否は終了コードで決める（Windows の命令の出力は端末の文字コード）。
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=60,
+                                stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DeliveryError("RECEIVER_SETUP_FAILED", f"{command[0]} を実行できません: {exc}") from exc
     if result.returncode not in accept:
@@ -183,10 +188,15 @@ def _run(command: list[str], accept: tuple[int, ...] = (0,)) -> subprocess.Compl
 
 
 def _windows_user() -> str:
-    domain, name = os.environ.get("USERDOMAIN"), os.environ.get("USERNAME")
+    """タスクの持ち主にする利用者（<端末名>\\<名前>）。
+
+    ssh の session の USERDOMAIN はワークグループ名で、端末の利用者を指さない（fox で WORKGROUP になっていた）。
+    whoami の答えを使う。
+    """
+    name = _run(["whoami"]).stdout.strip()
     if not name:
         raise DeliveryError("RECEIVER_SETUP_FAILED", "利用者名を確認できません")
-    return f"{domain}\\{name}" if domain else name
+    return name
 
 
 def install(platform: str = sys.platform) -> dict[str, Any]:

@@ -133,30 +133,66 @@ def _throughline() -> str | None:
     return os.environ.get("CALL_BRIDGE_THROUGHLINE") or shutil.which("throughline")
 
 
-async def handoff_operations(host: str = "codex") -> list[dict[str, Any]]:
-    """Throughline の引き継ぎの一覧。Throughline が無い・読めない時は空。"""
+async def _throughline_json(args: list[str]) -> Any:
+    """Throughline の読み取りの命令を1回流して、JSON の答えを返す。無い・失敗・読めない時は None。"""
     binary = _throughline()
     if not binary:
-        return []
-    args = ["auto-handoff", "status", "--json"] + (["--host", host] if host != "codex" else [])
+        return None
     try:
         process = await asyncio.create_subprocess_exec(
             binary, *args, stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
     except OSError:
-        return []
+        return None
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), _THROUGHLINE_TIMEOUT)
     except asyncio.TimeoutError:
         process.kill()
         await process.wait()
-        return []
+        return None
+    if process.returncode:
+        return None
     try:
-        value = json.loads(stdout.decode("utf-8", "replace"))
+        return json.loads(stdout.decode("utf-8", "replace"))
     except ValueError:
-        return []
+        return None
+
+
+async def handoff_operations(host: str = "codex") -> list[dict[str, Any]]:
+    """Throughline の引き継ぎの一覧（新しい物から20件まで）。Throughline が無い・読めない時は空。"""
+    value = await _throughline_json(["auto-handoff", "status", "--json"] + (["--host", host] if host != "codex" else []))
     rows = value.get("operations") if isinstance(value, dict) else None
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
+
+
+@dataclass(frozen=True)
+class Handoff:
+    """止められた Codex の会話の、引き継ぎの状態。"""
+
+    # 残っている一番先の続きの会話。無ければ None。
+    current: str | None = None
+    # 止めた直後で、Throughline が続きをまだ作っている。
+    in_flight: bool = False
+    # 引き継ぎが途中で止まっている時の、引き継ぎ ID と理由。Throughline の担当が resume でやり直す。
+    stopped: str | None = None
+
+
+async def handoff_state(thread_id: str) -> Handoff:
+    """会話の続きを Throughline に尋ねる。
+
+    0.16.15 以降の `throughline auto-handoff successor --thread <id> --json` を使う（件数の上限が無く、
+    消された続きは数えず、作っている途中も分かる）。無い版では、一覧（20件まで）からたどる。
+    """
+    value = await _throughline_json(["auto-handoff", "successor", "--thread", thread_id, "--json"])
+    if isinstance(value, dict) and value.get("schema") == "throughline.codex_auto_handoff_successor.v1":
+        current, pending = value.get("current_thread_id"), value.get("pending")
+        following = current if isinstance(current, str) and current and current != thread_id else None
+        if isinstance(pending, dict) and following is None:
+            if pending.get("in_flight") is True:
+                return Handoff(in_flight=True)
+            return Handoff(stopped=f"handoff_id={pending.get('handoff_id')} error_code={pending.get('error_code')}")
+        return Handoff(current=following)
+    return Handoff(current=successor(thread_id, await handoff_operations()))
 
 
 def successor(thread_id: str, operations: list[dict[str, Any]]) -> str | None:
