@@ -27,8 +27,10 @@ def _local_command() -> list[str]:
 
 
 def _run(command: list[str]) -> "subprocess.CompletedProcess[str]":
+    # 利用者の設定だけを見る場所で動かす。プロジェクトのフォルダで動かすと、そのフォルダだけの登録が先に見える。
     try:
-        return subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        return subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL,
+                              cwd=state_root())
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DeliveryError("HARNESS_SETUP_FAILED", f"{command[0]} を実行できません: {exc}") from exc
 

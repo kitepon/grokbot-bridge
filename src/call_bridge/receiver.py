@@ -12,6 +12,7 @@ import os
 import plistlib
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
@@ -24,6 +25,8 @@ UNIT = "call-bridge-receiver.service"
 TASK = "call-bridge-receiver"
 # 受け取り係が動き出した後に開かれた通話を見つける間隔。
 _SCAN_SECONDS = 5.0
+# 登録して起こした後、動き出したかを見る長さ。
+_START_WAIT_SECONDS = 10.0
 
 
 def _claim() -> int | None:
@@ -183,7 +186,11 @@ def install(platform: str = sys.platform) -> dict[str, Any]:
         _run(["systemctl", "--user", "restart", UNIT])
     else:
         raise DeliveryError("RECEIVER_UNSUPPORTED", f"{platform} の常駐の登録には対応していません")
-    return state(platform)
+    # 起こした直後は、まだ鍵を取っていない。動き出すのを少し待ってから答える。
+    deadline = time.monotonic() + _START_WAIT_SECONDS
+    while not (current := state(platform))["running"] and time.monotonic() < deadline:
+        time.sleep(0.5)
+    return current
 
 
 def uninstall(platform: str = sys.platform) -> dict[str, Any]:
