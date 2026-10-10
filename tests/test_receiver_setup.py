@@ -99,6 +99,57 @@ class ReceiverPlanTest(unittest.TestCase):
         self.assertEqual(set(watched), {first, later})
 
 
+class StateAccessTest(unittest.TestCase):
+    """置き場は、同じ利用者の普段の権限の process から開けなければならない。"""
+
+    def test_windows_folder_is_made_without_the_owner_only_mode(self) -> None:
+        from call_bridge import codex_delivery
+        with tempfile.TemporaryDirectory() as tmp:
+            modes: list[dict] = []
+            real = Path.mkdir
+
+            def mkdir(self, *args, **kwargs):
+                if self.name == "state" and kwargs.get("parents"):  # 親をたどった後の、内側の呼び直しは数えない
+                    modes.append(kwargs)
+                return real(self, *args, **kwargs)
+
+            with patch.object(Path, "mkdir", mkdir):
+                codex_delivery.private_dir(Path(tmp) / "win" / "state", windows=True)
+                codex_delivery.private_dir(Path(tmp) / "posix" / "state", windows=False)
+        self.assertEqual(modes, [{"parents": True, "exist_ok": True}, {"mode": 0o700, "parents": True, "exist_ok": True}])
+
+    def test_setup_grants_the_current_user_the_whole_state_folder_on_windows_only(self) -> None:
+        from call_bridge import codex_delivery
+        calls: list[list[str]] = []
+
+        def run(command, **_kwargs):
+            calls.append(command)
+            return subprocess.CompletedProcess(command, 0, "fox\\kite_\n" if command[0] == "whoami" else "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(codex_delivery.subprocess, "run", run):
+            self.assertIsNone(codex_delivery.grant_user_access(Path(tmp), windows=False))
+            self.assertEqual(calls, [])
+            self.assertEqual(codex_delivery.grant_user_access(Path(tmp), windows=True), "fox\\kite_")
+            self.assertEqual(calls, [["whoami"], ["icacls", tmp, "/grant", "fox\\kite_:(OI)(CI)F", "/T", "/C", "/Q"]])
+
+        def refused(command, **_kwargs):
+            return subprocess.CompletedProcess(command, 0 if command[0] == "whoami" else 5,
+                                               "fox\\kite_\n" if command[0] == "whoami" else "", "Access is denied.")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.object(codex_delivery.subprocess, "run", refused):
+            with self.assertRaises(DeliveryError) as caught:
+                codex_delivery.grant_user_access(Path(tmp), windows=True)
+        self.assertEqual(caught.exception.code, "STATE_ACCESS_FAILED")
+
+    def test_local_mcp_says_what_to_do_when_its_state_cannot_be_opened(self) -> None:
+        import sqlite3
+        with patch.object(local, "LocalStore", side_effect=sqlite3.OperationalError("unable to open database file")):
+            with self.assertRaises(SystemExit) as caught:
+                local._open_store()
+        self.assertIn("call-bridge-setup enable", str(caught.exception))
+        self.assertIn("unable to open database file", str(caught.exception))
+
+
 class ReceiverReloadTest(unittest.TestCase):
     def test_macos_reinstall_waits_for_the_old_agent_to_be_gone_before_registering(self) -> None:
         calls: list[str] = []
