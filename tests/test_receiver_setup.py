@@ -109,7 +109,7 @@ class StateAccessTest(unittest.TestCase):
             real = Path.mkdir
 
             def mkdir(self, *args, **kwargs):
-                if self.name == "state":  # 親をたどって作る分は数えない
+                if self.name == "state" and kwargs.get("parents"):  # 親をたどった後の、内側の呼び直しは数えない
                     modes.append(kwargs)
                 return real(self, *args, **kwargs)
 
