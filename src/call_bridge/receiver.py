@@ -89,8 +89,11 @@ async def run(scans: int | None = None) -> None:
 
 
 def main() -> None:
-    logging.basicConfig(level=logging.INFO, stream=sys.stderr,
-                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    # 窓の無い起動（Windows の pythonw）には、書き出す先が無い。その時は控えの置き場へ書く。
+    target: dict[str, Any] = ({"stream": sys.stderr} if sys.stderr is not None
+                              else {"filename": str(state_root() / "receiver.log"), "encoding": "utf-8"})
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s", **target)
+    logging.getLogger("httpx").setLevel(logging.WARNING)  # 2秒おきの取りに行く記録で埋めない
     fd = _claim()
     if fd is None:
         log.info("receiver is already running")

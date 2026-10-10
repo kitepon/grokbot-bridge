@@ -5,11 +5,14 @@ BellTeam がコンテナの席を起こすのと同じ道具（agent_launch／pt
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import shutil
+import subprocess
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, AsyncIterator
 
 from mcp import ClientSession, StdioServerParameters
@@ -21,6 +24,9 @@ from .codex_delivery import DeliveryError, state_root
 HARNESSES = {"codex": "codex-cli", "claude-code": "claude-code", "cursor": "cursor-cli", "grok": "grok-cli"}
 # Aiterm が「打つ前に断った」時に必ず付ける文。これがあれば、その文は席へ入っていない。
 _NOT_SENT = "文字列は送信していません"
+# 席を立てる呼び出しは、CLI が入力を受け付けるまで待つ。
+_DIRECT_TIMEOUT = 300
+_DIRECT_LINE_LIMIT = 16 * 1024 * 1024
 
 
 class AitermError(DeliveryError):
@@ -111,9 +117,111 @@ class Aiterm:
         await self._call("pty_close", {"session_id": session_id})
 
 
+class _Result:
+    """MCP の道具の結果のうち、ここで使う3つだけ。"""
+
+    def __init__(self, value: dict[str, Any]):
+        self.isError = value.get("isError") is True
+        self.structuredContent = value.get("structuredContent")
+        rows = value.get("content")
+        self.content = [SimpleNamespace(type=row.get("type"), text=row.get("text", ""))
+                        for row in (rows if isinstance(rows, list) else []) if isinstance(row, dict)]
+
+
+class _DirectSession:
+    """Aiterm と、標準入出力の JSON-RPC（MCP）で直接話す。
+
+    Windows で使う。mcp の stdio client は、起こした process を「閉じる時に子ごと止める」ジョブへ入れる。
+    Aiterm が立てた席（psmux の端末）もその子なので、接続を閉じた時に席ごと止まっていた
+    （2026-10-10 に fox で、立てた席が数秒で消えた）。ここでは、ジョブへ入れずに起こす。
+    """
+
+    def __init__(self, process: asyncio.subprocess.Process):
+        self.process = process
+        self.sequence = 0
+
+    async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+        assert self.process.stdin is not None and self.process.stdout is not None
+        self.sequence += 1
+        request_id = self.sequence
+        self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": request_id, "method": method,
+                                             "params": params}).encode() + b"\n")
+        await self.process.stdin.drain()
+        while True:
+            line = await asyncio.wait_for(self.process.stdout.readline(), _DIRECT_TIMEOUT)
+            if not line:
+                raise AitermError("AITERM_TRANSPORT_CLOSED", "Aiterm との接続が終了しました", sent=None)
+            try:
+                message = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(message, dict):
+                continue
+            if "method" in message and "id" in message:
+                # Aiterm からの問い合わせには対応していない、と答える。
+                self.process.stdin.write(json.dumps({"jsonrpc": "2.0", "id": message["id"], "error": {
+                    "code": -32601, "message": "not supported"}}).encode() + b"\n")
+                await self.process.stdin.drain()
+                continue
+            if message.get("id") != request_id:
+                continue
+            if "error" in message:
+                raise AitermError("AITERM_REQUEST_REJECTED", str(message["error"]), sent=None)
+            result = message.get("result")
+            return result if isinstance(result, dict) else {}
+
+    async def call_tool(self, name: str, arguments: dict[str, Any]) -> _Result:
+        try:
+            return _Result(await self.request("tools/call", {"name": name, "arguments": arguments}))
+        except asyncio.TimeoutError as exc:
+            raise AitermError("AITERM_REQUEST_TIMEOUT", f"{name} が時間内に返りませんでした", sent=None) from exc
+
+
+@asynccontextmanager
+async def _connect_direct(command: list[str]) -> AsyncIterator[Aiterm]:
+    flags = subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP
+    process = None
+    # 受け取り係がタスクのジョブの中に居る時は、そこからも出す。出られない設定のジョブなら、そのまま起こす。
+    for extra in (subprocess.CREATE_BREAKAWAY_FROM_JOB, 0):
+        try:
+            process = await asyncio.create_subprocess_exec(
+                *command, stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.DEVNULL, limit=_DIRECT_LINE_LIMIT, creationflags=flags | extra)
+            break
+        except OSError as exc:
+            failure = exc
+    if process is None:
+        raise AitermError("AITERM_UNAVAILABLE", f"aiterm-mcp を起動できません: {failure}", sent=False)
+    session = _DirectSession(process)
+    try:
+        try:
+            await session.request("initialize", {
+                "protocolVersion": "2025-06-18", "capabilities": {},
+                "clientInfo": {"name": "call-bridge", "version": "1"}})
+        except asyncio.TimeoutError as exc:
+            raise AitermError("AITERM_UNAVAILABLE", "aiterm-mcp が応答しません", sent=False) from exc
+        assert process.stdin is not None
+        process.stdin.write(b'{"jsonrpc":"2.0","method":"notifications/initialized"}\n')
+        await process.stdin.drain()
+        yield Aiterm(session)  # type: ignore[arg-type]
+    finally:
+        # 入力を閉じて、Aiterm が自分で終わるのを待つ。終わらない時も、止めるのはこの process だけ（席は残す）。
+        if process.stdin is not None:
+            process.stdin.close()
+        try:
+            await asyncio.wait_for(process.wait(), 5)
+        except asyncio.TimeoutError:
+            process.terminate()
+            await process.wait()
+
+
 @asynccontextmanager
 async def connect() -> AsyncIterator[Aiterm]:
     command = aiterm_command()
+    if os.name == "nt":
+        async with _connect_direct(command) as terminal:
+            yield terminal
+        return
     parameters = StdioServerParameters(command=command[0], args=command[1:], env=dict(os.environ))
     async with stdio_client(parameters) as (read, write):
         async with ClientSession(read, write) as session:
