@@ -63,14 +63,45 @@ call-bridge-setup harness grok enable
 
 各 CLI の利用者の設定へ、ローカル MCP（`python -m call_bridge.local`）を `call-bridge` の1項目だけ書く。合言葉は、この端末の `auth.json`（Codex で `enable` 済み）か、環境変数から受け取って `auth.json` に置く。席から通話へ返すにも、この登録が要る。
 
-### 確かめた範囲（2026-10-10）
+### Windows で入れ直す時
+
+`uv tool install --force` は、動いている process が掴んでいるフォルダを消せずに途中で止まり、入っていた版が壊れた状態で残る。先に名前を変えてから入れる。
+
+```powershell
+schtasks /End /TN call-bridge-receiver
+Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -like "*call_bridge.receiver*" } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+Rename-Item "$env:APPDATA\uv\tools\grokbot-bridge" "grokbot-bridge.old-$(Get-Date -Format yyyyMMdd-HHmmss)"
+uv tool install git+https://github.com/kitepon/grokbot-bridge.git
+$env:CALL_BRIDGE_TOKEN = (Get-Content "$HOME\.grokbot-bridge\auth.json" | ConvertFrom-Json).token
+call-bridge-setup enable
+```
+
+古いフォルダは、掴んでいる process（Codex が起こしたローカル MCP）が終わってから消す。`enable` は、aiterm-steer-delivery と node が PATH に見える所で流す。`enable` が配送の hook を登録し直した時は `restart_required` になり、Codex を起こし直すまで、動いている Codex の会話は新しい通話を開けない。
+
+### 続きの会話（Throughline）
+
+Throughline 0.16.15 以降では `throughline auto-handoff successor --thread <id> --json` で続きを引く（件数の上限が無く、消された続きは数えない）。続きを作っている途中（`pending.in_flight`）は待つ。引き継ぎが途中で止まっている時は、引き継ぎ ID と理由を付けて `failed` にし、席は立てない（`throughline auto-handoff resume` が正しい入口）。それより古い版では、`auto-handoff status --json` の一覧（20件まで）からたどる。
+
+### 確かめた範囲（2026-10-10、本番の通話）
+
+席が立つ → 通話を付け替える → member が `call_info` で結果を読める → 席が `call_send` で同じ通話へ返す、を実物で通した。
 
 | | Linux | macOS | Windows |
 |---|---|---|---|
-| 席を立てる・付け替える・2通目を席へ送る | Codex・Claude Code・Cursor・Grok とも実物で通した（コンテナ） | 未確認 | 未確認 |
-| 常駐の登録 | 登録の中身の試験だけ。実物は未確認 | 同じ | 同じ |
-| 席から通話へ返す | 未確認 | 未確認 | 未確認 |
-| Codex：続きの会話へ付け替え、キューの確かめ・取り消し | 試験だけ（App Server の応答の形は実物で見た） | 未確認 | 未確認 |
+| Codex | 通った | 通った | 通った |
+| Claude Code | 通った | 通った | 通った |
+| Cursor | 通った | 通った | 通った |
+| Grok | 通った | 通った | 通っていない（席は立ち、文は入った。Grok の `user_prompt_submit` の hook が時間切れになり、その後 Grok が答えなかった） |
+
+常駐の受け取り係は、3つの OS とも登録して動かした（systemd のユーザー単位、LaunchAgent、ログオン時のタスク）。
+
+確かめていない事：
+
+- 各ハーネスの会話の中から `call_open` する所（親の見分け、フォルダの読み取り）。試験では、端末で通話を開いて結び付けを直接作った。
+- Codex で、止められた会話あての返信が続きの会話へ届く所（続きを引く所だけ、本物の記録で見た）。キューへ入れた後の確かめと取り消し。
+- 常駐が、ログアウト・ログイン・再起動の後に戻る所。
+
+席は、承認を聞かない形で立つ（Claude Code は bypass permissions、Cursor は Run Everything、Grok は always-approve）。立った席は、その端末でほぼ何でも実行できる。
 
 Codex のアプリの会話として新しく立てる道は、入っていない（立つのは端末の中の席）。`codex exec` の親は今までどおりで、次のプロンプトまで返信を待つ。
 
