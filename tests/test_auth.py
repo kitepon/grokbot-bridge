@@ -181,7 +181,7 @@ class HttpIdentityTest(unittest.TestCase):
         cls.patches = [
             mock.patch.object(server, "AUTH", Authenticator(SHARED, _write_tokens(cls.tmp.name))),
             mock.patch.object(server, "store", CallStore(Path(cls.tmp.name) / "calls.db")),
-            mock.patch.object(server, "notify_wake", return_value={"status": "ok", "detail": "test"}),
+            mock.patch("call_bridge.deliver.notify_ring", return_value={"status": "ok", "detail": "test"}),
             mock.patch.object(server, "resolve_member_agent_id",
                               return_value={"ok": True, "id": "g-1", "name": "マリアン"}),
             mock.patch("call_bridge.deliver.send_delivery"),

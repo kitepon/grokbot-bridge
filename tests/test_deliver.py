@@ -1,4 +1,4 @@
-"""Local call_send wakes Marian's webhook with the message body."""
+"""Local call_send stores the text and rings through Marian's webhook with no body."""
 
 from __future__ import annotations
 
@@ -142,7 +142,7 @@ class DeliverTests(unittest.TestCase):
         dispatch.assert_called_once_with(server.store, "sess", "local", "hello", False)
         self.assertEqual(result, sentinel)
 
-    def test_local_send_posts_session_message_and_stores(self) -> None:
+    def test_local_send_rings_without_the_body_and_stores(self) -> None:
         webhook = self._webhook(204)
         gateway = self._gateway()
         self._use_webhook(webhook)
@@ -165,15 +165,15 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(req["content_type"], "application/json")
         body = json.loads(req["body"].decode("utf-8"))
         self.assertEqual(body["schema"], "grokbot.call.v0")
-        self.assertEqual(body["event"], "session.message")
+        self.assertEqual(body["event"], "session.opened")
         self.assertEqual(body["session_id"], session["session_id"])
         self.assertEqual(body["member_name"], "ラピ")
         self.assertEqual(body["member_agent_id"], "rapi-agent")
         self.assertEqual(body["local_id"], "local-1")
         self.assertEqual(body["local_label"], "Cursor")
-        self.assertEqual(body["message"], "状況を教えてください")
-        self.assertIs(body["reply_required"], True)
-        self.assertNotIn("状況を教えてください\n", body["message"])
+        self.assertNotIn("message", body)
+        self.assertNotIn("reply_required", body)
+        self.assertNotIn("状況を教えてください", req["body"].decode("utf-8"))
         self.assertNotIn("wake-secret-do-not-log", req["body"].decode("utf-8"))
         self.assertNotIn("gw-token-do-not-log", req["body"].decode("utf-8"))
         stored = self.store.poll_messages(session["session_id"], "member", mark_delivered=False)
@@ -196,10 +196,76 @@ class DeliverTests(unittest.TestCase):
         self.assertIsNone(os.environ.get("GROKBOT_GATEWAY_URL"))
         self.assertIsNone(os.environ.get("GROKBOT_GATEWAY_TOKEN"))
         body = json.loads(self._captured(webhook)["body"].decode("utf-8"))
-        self.assertEqual(body["event"], "session.message")
+        self.assertEqual(body["event"], "session.opened")
         self.assertEqual(body["member_agent_id"], "rapi-agent")
 
-    def test_notice_sets_reply_required_false(self) -> None:
+    def test_second_send_before_the_member_polls_does_not_ring_again(self) -> None:
+        webhook = self._webhook(204)
+        self._use_webhook(webhook)
+        self._profiles({"rapi-agent": "ラピ"})
+        session = self.store.open_session("local-1", "Cursor", "ラピ")
+        sid = session["session_id"]
+
+        first = dispatch_send(self.store, sid, "local", "one", False)
+        webhook.captured = None  # type: ignore[attr-defined]
+        second = dispatch_send(self.store, sid, "local", "two", False)
+
+        self.assertEqual(first["delivery"], {"status": "delivered", "detail": "http 204"})
+        self.assertEqual(
+            second["delivery"], {"status": "delivered", "detail": "queued behind an earlier ring"}
+        )
+        self.assertIsNone(webhook.captured)  # type: ignore[attr-defined]
+        polled = self.store.poll_messages(sid, "member")
+        self.assertEqual([item["message"] for item in polled["messages"]], ["one", "two"])
+
+    def test_send_after_the_member_polled_rings_again(self) -> None:
+        webhook = self._webhook(204)
+        self._use_webhook(webhook)
+        self._profiles({"rapi-agent": "ラピ"})
+        session = self.store.open_session("local-1", "Cursor", "ラピ")
+        sid = session["session_id"]
+
+        dispatch_send(self.store, sid, "local", "one", False)
+        self.store.poll_messages(sid, "member")
+        webhook.captured = None  # type: ignore[attr-defined]
+        again = dispatch_send(self.store, sid, "local", "two", False)
+
+        self.assertEqual(again["delivery"], {"status": "delivered", "detail": "http 204"})
+        body = json.loads(self._captured(webhook)["body"].decode("utf-8"))
+        self.assertEqual(body["event"], "session.opened")
+        self.assertEqual(body["status"], "open")
+
+    def test_unread_older_than_the_rering_window_rings_again(self) -> None:
+        webhook = self._webhook(204)
+        self._use_webhook(webhook)
+        self._profiles({"rapi-agent": "ラピ"})
+        session = self.store.open_session("local-1", "Cursor", "ラピ")
+        sid = session["session_id"]
+
+        dispatch_send(self.store, sid, "local", "one", False)
+        webhook.captured = None  # type: ignore[attr-defined]
+        with mock.patch.dict(os.environ, {"CALL_BRIDGE_RERING_SECONDS": "0"}):
+            again = dispatch_send(self.store, sid, "local", "two", False)
+
+        self.assertEqual(again["delivery"], {"status": "delivered", "detail": "http 204"})
+        self.assertIsNotNone(webhook.captured)  # type: ignore[attr-defined]
+
+    def test_failed_re_ring_does_not_store(self) -> None:
+        webhook = self._webhook(204)
+        self._use_webhook(webhook)
+        self._profiles({"rapi-agent": "ラピ"})
+        session = self.store.open_session("local-1", "Cursor", "ラピ")
+        sid = session["session_id"]
+
+        dispatch_send(self.store, sid, "local", "one", False)
+        self.store.poll_messages(sid, "member")
+        os.environ["CALL_BRIDGE_WAKE_WEBHOOK_URL"] = self._url(self._webhook(502))
+        failed = dispatch_send(self.store, sid, "local", "two", False)
+
+        self.assertEqual(failed["error"], "error")
+        self.assertEqual(self.store.session_info(sid)["message_count"], 1)
+
+    def test_notice_is_stored_without_the_reply_request(self) -> None:
         webhook = self._webhook(204)
         self._use_webhook(webhook)
         self._profiles({"rapi-agent": "ラピ"})
@@ -211,10 +277,9 @@ class DeliverTests(unittest.TestCase):
 
         self.assertEqual(result["message"], "共有だけです")
         body = json.loads(self._captured(webhook)["body"].decode("utf-8"))
-        self.assertEqual(body["message"], "共有だけです")
-        self.assertIs(body["reply_required"], False)
-        self.assertNotIn("返信不要", body["message"])
-        self.assertNotIn("返信が必要です", body["message"])
+        self.assertNotIn("message", body)
+        polled = self.store.poll_messages(session["session_id"], "member")
+        self.assertEqual([item["message"] for item in polled["messages"]], ["共有だけです"])
 
     def test_member_send_does_not_call_the_webhook(self) -> None:
         webhook = self._webhook(204)
@@ -259,7 +324,7 @@ class DeliverTests(unittest.TestCase):
 
         body = json.loads(self._captured(webhook)["body"].decode("utf-8"))
         self.assertEqual(body["member_agent_id"], "live-agent-id")
-        self.assertEqual(body["event"], "session.message")
+        self.assertEqual(body["event"], "session.opened")
 
     def test_remote_agent_id_field_and_id_fallback(self) -> None:
         webhook = self._webhook(204)

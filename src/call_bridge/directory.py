@@ -196,7 +196,7 @@ def build_members_from_profiles(root: Path) -> list[dict[str, Any]]:
             continue
         # Grok Bot's agent id is the seat directory name. profile.json itself
         # has name / title / description only; local call_send needs the id
-        # on the directory entry for the session.message relay.
+        # on the directory entry for the ring.
         entry: dict[str, Any] = {"name": name, "id": d.name}
         title = (p.get("title") or "").strip()
         role = (p.get("description") or "").strip()
