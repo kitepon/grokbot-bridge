@@ -18,7 +18,7 @@ from pathlib import Path
 from typing import Any
 from xml.sax.saxutils import escape
 
-from .codex_delivery import DeliveryError, state_root
+from .codex_delivery import DeliveryError, grant_user_access, state_root
 
 log = logging.getLogger("call_bridge.receiver")
 LABEL = "dev.kitepon.call-bridge.receiver"
@@ -218,6 +218,7 @@ def install(platform: str = sys.platform) -> dict[str, Any]:
     elif platform == "win32":
         task = state_root() / "receiver-task.xml"
         task.write_text(windows_task(_windows_user()), encoding="utf-16")
+        grant_user_access()  # 受け取り係は普段の権限で動く。管理者の権限の端末から登録しても、控えを開けるようにする
         _run(["schtasks", "/Create", "/TN", TASK, "/XML", str(task), "/F"])
         _run(["schtasks", "/Run", "/TN", TASK])
     elif platform.startswith("linux"):

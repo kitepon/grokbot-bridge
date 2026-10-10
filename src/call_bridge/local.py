@@ -26,7 +26,7 @@ from . import aiterm
 from . import conversation as talk
 from . import relaunch
 from .codex_delivery import (CodexRPC, DeliveryError, codex_home, conversation_missing, hook_delivery_state,
-                             state_root, submit_reply, verify_parent)
+                             private_dir, state_root, submit_reply, verify_parent)
 
 log = logging.getLogger("call_bridge.local")
 _DELIVERY_NAMESPACE = uuid.UUID("ddf85db7-8d27-4c57-8ba5-9ad498cd64c9")
@@ -719,13 +719,23 @@ class _Reporter:
             log.warning("receipt for %s seq=%s was not stored: %s", self.session_id, seq, exc)
 
 
-store = LocalStore(state_root())
+def _open_store() -> LocalStore:
+    try:
+        return LocalStore(state_root())
+    except (sqlite3.Error, OSError) as exc:
+        # 控えを開けないと、合言葉も読めない。何が要るかを、起こした側の記録に残してから終わる。
+        raise SystemExit(
+            f"call-bridge: この端末の控え（{Path(os.environ.get('CALL_BRIDGE_STATE', '~/.grokbot-bridge')).expanduser()}）"
+            f"を開けません（{exc}）。call-bridge-setup enable を流し直すと、今の利用者が開けるように直します。") from exc
+
+
+store = _open_store()
 watchers = Watchers(store)
 
 
 def _launch_exec_watcher(session_id: str) -> None:
     directory = state_root() / "workers"
-    directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private_dir(directory)
     log_path = directory / f"{session_id}.log"
     options: dict[str, Any] = {"stdin": subprocess.DEVNULL,
                                "env": {**os.environ, "CALL_BRIDGE_STATE": str(state_root())}}

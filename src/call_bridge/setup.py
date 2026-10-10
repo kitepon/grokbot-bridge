@@ -22,8 +22,8 @@ from typing import Any
 
 from . import harness_setup, receiver
 from .codex_delivery import (STEER_PROFILE, CodexRPC, DeliveryError, check_steer_version, codex_binary,
-                             codex_command, codex_home, codex_processes, current_steer_cli, owned_hooks,
-                             restart_required, state_root, steer_profile, steer_sync)
+                             codex_command, codex_home, codex_processes, current_steer_cli, grant_user_access,
+                             owned_hooks, private_dir, restart_required, state_root, steer_profile, steer_sync)
 
 _NAMES = ("call-bridge", "grokbot-bridge")
 
@@ -38,7 +38,7 @@ def _command() -> str:
 
 
 def _write_json(file: Path, value: dict[str, Any]) -> None:
-    file.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    private_dir(file.parent)
     fd, temporary = tempfile.mkstemp(prefix=file.name + ".", dir=file.parent)
     try:
         if hasattr(os, "fchmod"):
@@ -388,6 +388,8 @@ async def enable() -> dict[str, str]:
     _write_json(state_root() / STEER_PROFILE, steer_profile(name))
     _write_json(state_root() / "config.json", next_config)
     steer = _steer_setup("enable", next_config)
+    # ここまでに書いた物を、この利用者の普段の権限の process（Codex・Claude Code・常駐）が開けるようにする。
+    grant_user_access()
     restart = restart_required(next_config) or steer == "restart_required"
     return {"status": "restart_required" if restart else "ready", "mcp": name, "steer": steer,
             "receiver": _receiver("install")}

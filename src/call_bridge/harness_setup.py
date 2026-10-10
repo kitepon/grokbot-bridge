@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from .codex_delivery import DeliveryError, state_root
+from .codex_delivery import DeliveryError, grant_user_access, state_root
 
 NAME = "call-bridge"
 HARNESSES = ("claude-code", "cursor", "grok")
@@ -104,6 +104,7 @@ def enable(harness: str, run: Runner = _run) -> dict[str, str]:
                     else [cli, "mcp", "add", "--scope", "user", NAME, command[0], "--", *command[1:]])
         if added.returncode:
             raise DeliveryError("HARNESS_SETUP_FAILED", (added.stderr or added.stdout).strip()[-300:])
+    grant_user_access()  # 登録した CLI は普段の権限で動く。控えをその権限で開けるようにする
     return status(harness, run)
 
 

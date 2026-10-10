@@ -35,10 +35,47 @@ class DeliveryError(RuntimeError):
         self.outcome_unknown = outcome_unknown
 
 
+def private_dir(path: Path, windows: bool = os.name == "nt") -> Path:
+    """本人だけが読める置き場を作る。
+
+    Windows では mode=0o700 を渡さない。Python 3.12.4 以降は、0o700 の mkdir が「作った process の持ち主だけ」の
+    許可を付ける。管理者の権限で動く端末（ssh など）から作ると持ち主が Administrators になり、
+    同じ利用者の普段の process（管理者の権限なし）から開けなくなる。渡さなければ、利用者のフォルダの許可
+    （本人・SYSTEM・Administrators）を引き継ぐ。
+    """
+    if windows:
+        path.mkdir(parents=True, exist_ok=True)
+    else:
+        path.mkdir(mode=0o700, parents=True, exist_ok=True)
+    return path
+
+
 def state_root() -> Path:
-    root = Path(os.environ.get("CALL_BRIDGE_STATE", "~/.grokbot-bridge")).expanduser()
-    root.mkdir(mode=0o700, parents=True, exist_ok=True)
-    return root
+    return private_dir(Path(os.environ.get("CALL_BRIDGE_STATE", "~/.grokbot-bridge")).expanduser())
+
+
+def grant_user_access(root: Path | None = None, windows: bool = os.name == "nt") -> str | None:
+    """Windows で、置き場とその中身を、今の利用者が普段の権限で開けるようにする。直した時は利用者名を返す。
+
+    前の版が管理者の権限の端末から作った置き場は、持ち主（Administrators）しか開けない。その端末の
+    Claude Code・Codex・常駐の受け取り係は普段の権限で動くので、控えを開けずに起動で落ちる
+    （2026-10-10 に fox で、再起動の後から起きた）。設定の入口（enable など）で毎回そろえる。
+    """
+    if not windows:
+        return None
+    root = root or state_root()
+    try:
+        user = subprocess.run(["whoami"], capture_output=True, text=True, errors="replace", timeout=30,
+                              stdin=subprocess.DEVNULL).stdout.strip()
+        if not user:
+            raise DeliveryError("STATE_ACCESS_FAILED", "利用者名を確認できません")
+        done = subprocess.run(["icacls", str(root), "/grant", f"{user}:(OI)(CI)F", "/T", "/C", "/Q"],
+                              capture_output=True, text=True, errors="replace", timeout=120, stdin=subprocess.DEVNULL)
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise DeliveryError("STATE_ACCESS_FAILED", f"置き場の許可を直せません: {exc}") from exc
+    if done.returncode:
+        raise DeliveryError("STATE_ACCESS_FAILED", f"置き場の許可を直せません: {(done.stderr or done.stdout).strip()[-200:]}")
+    return user
 
 
 def codex_home() -> Path:
@@ -423,7 +460,7 @@ async def verify_parent(thread_id: str, home: Path) -> str | None:
 
 
 def _write_json_once(path: Path, value: dict[str, Any]) -> None:
-    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    private_dir(path.parent)
     with open(path, "x", encoding="utf-8", opener=lambda p, f: os.open(p, f, 0o600)) as handle:
         json.dump(value, handle, ensure_ascii=False)
         handle.write("\n")
