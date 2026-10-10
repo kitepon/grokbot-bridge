@@ -16,6 +16,64 @@ BellTeam宛ての開始例。`member_name`は名前またはBot IDを指定で�
 
 GrokBot宛ての通話は従来どおりマリアンのWebhookで取り次ぐ。GrokBotのAIがレート制限中でも、電話帳、BellTeam宛ての直通、保存済み返信の取得は独立して動く。Webhookの2xxとBellTeamの受付は、相手Botの読了を示さない。
 
+## 端末の会話が止まっている時
+
+端末（local）が開いた通話へ member が返した時、結び付いた会話が返信を受け取れない状態なら、端末の側が担当フォルダの席へ渡す。通話の `session_id` は変わらないので、member は今までどおり同じ通話へ返せばよい。
+
+- 席は Aiterm の session で、端末・ハーネス・フォルダごとに1つ（名前は `cb-<ハーネス>-<フォルダ名>-<8桁>`）。動いていればそこへ送り、無ければ立てる。止まった会話に付いていた通話は、その席へ付け替える。
+- Codex の会話は、キューへ入れる前に状態を読む。会話が無い・途中で止められている時は、Throughline の続きの会話（`throughline auto-handoff status --json`）があればそこへ付け替え、無ければ席へ渡す。中断から120秒以内は待つ。
+- キューへ入れた返信は、50秒後にキューから出たかを確かめる。番が走っていれば待つ。寝たまま・止められたままなら、キューから取り消したのを確かめてから席へ渡す。確かめられない時は `unknown` で止め、渡さない。
+- Claude Code・Cursor・Grok の会話は、返信を自分で `call_poll` する（`call_open` の結果の `parent_delivery.state` が `manual`）。会話が生きている間は、その会話の MCP が通話の鍵を持つ。会話が終わった後に届いた返信は、常駐の受け取り係が席へ渡す。
+- 確かに届けていない失敗（席が起動の画面で止まった、フォルダが分からない等）では見張りを止めず、同じ通話に新しい返信が来た時に、その返信からやり直す。時間で繰り返す再試行はしない。
+- 立てた結果・送った結果が分からない時は、立て直さない・送り直さない。本文は通話に残る。
+
+member から見える物：
+
+- `call_send(from_party="member")` の結果。相手が BellTeam 以外なら `delivery.status=stored` と、相手が最後に取りに来た時刻（`local_seen_at`）。`stored` は受領を表さない。
+- `call_info` の `local_delivery`。seq ごとに `submitted`（会話のキューか席へ入れた）、`started`（会話が番を始めた）、`fetched`（会話が自分で取りに来た）、`relaunched`（席へ渡した。`detail` に理由）、`failed`、`unknown`。`conversation` は `codex:<会話>` か `hosted:<席>`。
+- `call_history`。両方の発言を seq の順に読む（既読にしない）。席は、これで前のやりとりを読む。
+
+端末の側の道具：`call_adopt(session_id)` は、新しい Codex の会話が通話を自分へ付け替える。
+
+### 常駐の受け取り係
+
+Codex が1つも動いていない時と、Claude Code・Cursor・Grok の会話が終わった後に、返信を受け取る。ログイン中だけ動き、端末に1つ。`call-bridge-setup enable` が登録して起こし、`disable` が外す。
+
+| OS | 登録先 | 動く場所 |
+|---|---|---|
+| macOS | `~/Library/LaunchAgents/dev.kitepon.call-bridge.receiver.plist` | 画面のある session（Aqua） |
+| Linux | `~/.config/systemd/user/call-bridge-receiver.service` | 利用者の session（linger は設定しない） |
+| Windows | タスク スケジューラの `call-bridge-receiver`（ログオン時） | 利用者の画面のある session |
+
+```bash
+call-bridge-setup receiver status      # {"receiver": "running" | "registered" | "not_registered" | "failed: …"}
+call-bridge-setup receiver install
+call-bridge-setup receiver uninstall
+```
+
+席を立てるには、その端末に `aiterm-mcp`、tmux（Windows は psmux）、使うハーネスの CLI が要る。寝ている Codex アプリの会話を起こすのは aiterm-steer-delivery 0.4.1 以上（macOS・Windows）。
+
+### Claude Code・Cursor・Grok への登録
+
+```bash
+call-bridge-setup harness claude-code enable   # status／disable も同じ形
+call-bridge-setup harness cursor enable
+call-bridge-setup harness grok enable
+```
+
+各 CLI の利用者の設定へ、ローカル MCP（`python -m call_bridge.local`）を `call-bridge` の1項目だけ書く。合言葉は、この端末の `auth.json`（Codex で `enable` 済み）か、環境変数から受け取って `auth.json` に置く。席から通話へ返すにも、この登録が要る。
+
+### 確かめた範囲（2026-10-10）
+
+| | Linux | macOS | Windows |
+|---|---|---|---|
+| 席を立てる・付け替える・2通目を席へ送る | Codex・Claude Code・Cursor・Grok とも実物で通した（コンテナ） | 未確認 | 未確認 |
+| 常駐の登録 | 登録の中身の試験だけ。実物は未確認 | 同じ | 同じ |
+| 席から通話へ返す | 未確認 | 未確認 | 未確認 |
+| Codex：続きの会話へ付け替え、キューの確かめ・取り消し | 試験だけ（App Server の応答の形は実物で見た） | 未確認 | 未確認 |
+
+Codex のアプリの会話として新しく立てる道は、入っていない（立つのは端末の中の席）。`codex exec` の親は今までどおりで、次のプロンプトまで返信を待つ。
+
 Shared **phone-call bridge** MCP for **[Grok Bot](https://grok.x.ai/)** agent meshes (streamable HTTP).
 
 A local coding agent (Claude Code, Codex, Cursor, …) calls either system through this MCP. Calls to GrokBot use Marian's webhook. Calls to BellTeam use its UNIX socket. Member replies remain in the call history; replies to a BellTeam caller are also delivered to that Bot.
@@ -174,7 +232,9 @@ Grok Bot member ──call_send──▶ grokbot-bridge (stored for the local si
 | `call_poll` | Fetch new messages for your party |
 | `call_list` | List / filter sessions |
 | `call_hangup` | End the call |
-| `call_info` | Session details |
+| `call_info` | Session details, with `local_delivery` (what the local side did with each member message) |
+| `call_history` | Both parties' messages in order, without marking them delivered |
+| `call_receipt` | Local side reports what it did with a member message |
 
 Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 

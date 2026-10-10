@@ -397,7 +397,7 @@ async def health(_request: Request) -> Response:
             "ok": True,
             "service": "call-bridge",
             "status": "up",
-            "version": "0.1.2",
+            "version": "0.2.0",
         }
     )
 
