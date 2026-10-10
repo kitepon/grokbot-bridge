@@ -51,6 +51,8 @@ call-bridge-setup receiver install
 call-bridge-setup receiver uninstall
 ```
 
+Windows の常駐は console を持たない（`pythonw`）。動いている間に起こす子の process（Codex の App Server、aiterm-steer-delivery、Throughline、Aiterm）は、端末の窓を出さない指定で起こす。指定が無いと、起こすたびに端末の窓が 0.2〜0.4 秒出る（2026-10-10 に fox で測った）。
+
 席を立てるには、その端末に `aiterm-mcp`、tmux（Windows は psmux）、使うハーネスの CLI が要る。寝ている Codex アプリの会話を起こすのは aiterm-steer-delivery 0.4.1 以上（macOS・Windows）。
 
 ### Claude Code・Cursor・Grok への登録
