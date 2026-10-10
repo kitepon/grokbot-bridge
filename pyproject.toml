@@ -21,6 +21,7 @@ call-bridge = "call_bridge.server:main"
 grokbot-bridge = "call_bridge.server:main"
 call-bridge-local = "call_bridge.local:main"
 call-bridge-setup = "call_bridge.setup:main"
+call-bridge-receiver = "call_bridge.receiver:main"
 
 [build-system]
 requires = ["hatchling"]

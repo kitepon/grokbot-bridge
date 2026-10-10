@@ -651,7 +651,7 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(setup, "check_steer_version"), \
                  patch.object(setup, "_steer_setup", return_value="unsupported") as steer:
                 self.assertEqual(await setup.enable(), {"status": "restart_required", "mcp": "call-bridge",
-                                                        "steer": "unsupported"})
+                                                        "steer": "unsupported", "receiver": "running"})
                 self.assertEqual((await setup.status())["status"], "restart_required")
             self.assertEqual([call.args[0] for call in steer.call_args_list], ["enable", "status"])
             saved = json.loads((state / "config.json").read_text())
