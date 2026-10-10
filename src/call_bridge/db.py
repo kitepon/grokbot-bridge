@@ -12,6 +12,12 @@ from typing import Any, Iterator
 
 _lock = threading.RLock()
 
+# What the local side did with a member message, as the local side reports it.
+# submitted = placed in the conversation's queue or terminal, started = the
+# conversation began a turn on it, fetched = the conversation polled it itself,
+# relaunched = handed to a new task because the bound conversation was stopped.
+RECEIPT_STATES = ("submitted", "started", "fetched", "relaunched", "failed", "unknown")
+
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
@@ -85,6 +91,17 @@ class CallStore:
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, seq);
+
+                CREATE TABLE IF NOT EXISTS receipts (
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    state TEXT NOT NULL,
+                    detail TEXT,
+                    conversation TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, seq),
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+                );
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
@@ -94,6 +111,8 @@ class CallStore:
                 conn.execute("ALTER TABLE sessions ADD COLUMN member_id TEXT")
             if "local_system" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN local_system TEXT NOT NULL DEFAULT 'local'")
+            if "local_seen_at" not in columns:
+                conn.execute("ALTER TABLE sessions ADD COLUMN local_seen_at TEXT")
 
     def open_session(
         self,
@@ -217,18 +236,23 @@ class CallStore:
             ).fetchone()
             if sess is None:
                 raise KeyError(f"session not found: {session_id}")
+            if party == "local":
+                # The local side fetches by polling; this is the only sign that it is listening.
+                conn.execute("UPDATE sessions SET local_seen_at = ? WHERE session_id = ?", (_utcnow(), session_id))
             # Messages FROM the other party, after after_seq
             other = "member" if party == "local" else "local"
+            # fetched: whether an earlier poll already marked the message delivered to this party.
+            flag = "delivered_to_local" if party == "local" else "delivered_to_member"
             rows = conn.execute(
-                """
-                SELECT seq, from_party, body AS message, created_at
+                f"""
+                SELECT seq, from_party, body AS message, created_at, {flag} AS fetched
                 FROM messages
                 WHERE session_id = ? AND from_party = ? AND seq > ?
                 ORDER BY seq ASC
                 """,
                 (session_id, other, after_seq),
             ).fetchall()
-            messages = [dict(r) for r in rows]
+            messages = [{**dict(r), "fetched": bool(r["fetched"])} for r in rows]
             if mark_delivered and messages:
                 col = (
                     "delivered_to_local"
@@ -295,4 +319,56 @@ class CallStore:
             **sess,
             "message_count": count["c"],
             "max_seq": count["max_seq"],
+            "local_delivery": self.receipts(session_id),
         }
+
+    def record_receipt(self, session_id: str, seq: int, state: str,
+                       detail: str | None = None, conversation: str | None = None) -> dict[str, Any]:
+        """Store what the local side did with one member message. The last report wins."""
+        if state not in RECEIPT_STATES:
+            raise ValueError(f"state must be one of {', '.join(RECEIPT_STATES)}")
+        with self._conn() as conn:
+            if conn.execute("SELECT 1 FROM sessions WHERE session_id = ?", (session_id,)).fetchone() is None:
+                raise KeyError(f"session not found: {session_id}")
+            row = conn.execute("SELECT from_party FROM messages WHERE session_id = ? AND seq = ?",
+                               (session_id, seq)).fetchone()
+            if row is None or row["from_party"] != "member":
+                raise ValueError("seq is not a member message of this session")
+            now = _utcnow()
+            conn.execute(
+                """
+                INSERT INTO receipts (session_id, seq, state, detail, conversation, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(session_id, seq) DO UPDATE SET
+                    state = excluded.state, detail = excluded.detail,
+                    conversation = excluded.conversation, updated_at = excluded.updated_at
+                """,
+                (session_id, seq, state, detail, conversation, now),
+            )
+        return {"session_id": session_id, "seq": seq, "state": state, "detail": detail,
+                "conversation": conversation, "updated_at": now}
+
+    def receipts(self, session_id: str) -> list[dict[str, Any]]:
+        with self._conn() as conn:
+            rows = conn.execute(
+                "SELECT seq, state, detail, conversation, updated_at FROM receipts "
+                "WHERE session_id = ? ORDER BY seq", (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def history(self, session_id: str, after_seq: int = 0, limit: int = 50) -> dict[str, Any]:
+        """Both parties' messages in order. Reading does not mark anything delivered."""
+        if limit < 1 or limit > 200:
+            raise ValueError("limit must be between 1 and 200")
+        with self._conn() as conn:
+            sess = conn.execute("SELECT status FROM sessions WHERE session_id = ?", (session_id,)).fetchone()
+            if sess is None:
+                raise KeyError(f"session not found: {session_id}")
+            rows = conn.execute(
+                "SELECT seq, from_party, body AS message, created_at FROM messages "
+                "WHERE session_id = ? AND seq > ? ORDER BY seq ASC LIMIT ?",
+                (session_id, after_seq, limit + 1),
+            ).fetchall()
+        messages = [dict(row) for row in rows[:limit]]
+        return {"session_id": session_id, "status": sess["status"], "messages": messages,
+                "latest_seq": messages[-1]["seq"] if messages else after_seq, "more": len(rows) > limit}

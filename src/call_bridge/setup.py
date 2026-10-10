@@ -20,6 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from . import harness_setup, receiver
 from .codex_delivery import (STEER_PROFILE, CodexRPC, DeliveryError, check_steer_version, codex_binary,
                              codex_command, codex_home, codex_processes, current_steer_cli, owned_hooks,
                              restart_required, state_root, steer_profile, steer_sync)
@@ -380,13 +381,27 @@ async def enable() -> dict[str, str]:
         "hook_command": command,
         "stale_processes": (running_before if changed or not already_local or
                             "stale_processes" not in previous else previous["stale_processes"]),
+        # 止まった会話の返信を渡す席は、Aiterm が立てる。無い端末では、立てる時に AITERM_UNAVAILABLE で知らせる。
+        "aiterm_mcp": shutil.which("aiterm-mcp"),
         **steer_runtime,
     }
     _write_json(state_root() / STEER_PROFILE, steer_profile(name))
     _write_json(state_root() / "config.json", next_config)
     steer = _steer_setup("enable", next_config)
     restart = restart_required(next_config) or steer == "restart_required"
-    return {"status": "restart_required" if restart else "ready", "mcp": name, "steer": steer}
+    return {"status": "restart_required" if restart else "ready", "mcp": name, "steer": steer,
+            "receiver": _receiver("install")}
+
+
+def _receiver(action: str) -> str:
+    """常駐の受け取り係。登録できない環境（常駐の仕組みが無いコンテナなど）でも、Codex の設定は通す。"""
+    try:
+        state = getattr(receiver, action)() if action != "status" else receiver.state()
+    except DeliveryError as exc:
+        return f"failed: {exc}"
+    if state.get("running"):
+        return "running"
+    return "registered" if state.get("registered") else "not_registered"
 
 
 async def status() -> dict[str, str]:
@@ -409,7 +424,7 @@ async def status() -> dict[str, str]:
     steer = _steer_setup("status", config)
     restart = restart_required(config) or steer == "restart_required"
     return {"status": "restart_required" if restart else "ready",
-            "mcp": name, "remote": config["mcp_url"], "steer": steer}
+            "mcp": name, "remote": config["mcp_url"], "steer": steer, "receiver": _receiver("status")}
 
 
 async def disable() -> dict[str, str]:
@@ -441,16 +456,33 @@ async def disable() -> dict[str, str]:
         raise
     _write_json(config_file, {**config, "enabled": False})
     (state_root() / "auth.json").unlink(missing_ok=True)
-    result = {"status": "restart_required", "mcp": name}
+    result = {"status": "restart_required", "mcp": name, "receiver": _receiver("uninstall")}
     return {**result, "warning": warning} if warning else result
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=("enable", "status", "disable"), default="status", nargs="?")
-    action = parser.parse_args().action
+    parser = argparse.ArgumentParser(
+        description="call-bridge の端末の側を設定する。引数なしは Codex の status。")
+    parser.add_argument("action", choices=("enable", "status", "disable", "receiver", "harness"),
+                        default="status", nargs="?")
+    parser.add_argument("target", nargs="?",
+                        help="receiver: install／status／uninstall。harness: claude-code／cursor／grok")
+    parser.add_argument("operation", nargs="?", choices=("enable", "status", "disable"), default="status",
+                        help="harness の時の操作")
+    args = parser.parse_args()
     try:
-        result = asyncio.run(enable() if action == "enable" else disable() if action == "disable" else status())
+        if args.action == "receiver":
+            operation = args.target or "status"
+            if operation not in ("install", "status", "uninstall"):
+                parser.error("receiver は install／status／uninstall のどれかです")
+            result: dict[str, Any] = {"receiver": _receiver(operation)}
+        elif args.action == "harness":
+            if args.target not in harness_setup.HARNESSES:
+                parser.error("harness は claude-code／cursor／grok のどれかです")
+            result = getattr(harness_setup, args.operation)(args.target)
+        else:
+            result = asyncio.run(enable() if args.action == "enable" else disable() if args.action == "disable"
+                                 else status())
         print(json.dumps(result, ensure_ascii=False))
     except DeliveryError as exc:
         print(json.dumps({"status": "failed", "error": exc.code, "detail": str(exc)}, ensure_ascii=False), file=sys.stderr)

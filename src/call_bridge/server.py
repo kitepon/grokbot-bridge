@@ -49,6 +49,9 @@ BellTeam宛てはcall_sendがBellTeamへ直接届ける。マリアンは通ら�
 - call_directory … 電話帳。要求のたびに席プロフィールから組み立てる（UNIX ソケット優先。定期同期や手動 push は不要）
 - call_open 以降 / call_open / call_send / call_poll / call_list / call_hangup / call_info
 - from_party / party は 'local' または 'member'
+- call_history … 両方の発言を順に読む（既読にしない）。会話が替わった時の引き継ぎに使う
+- call_info の local_delivery … 端末の側が member の発言をどう扱ったか（submitted／started／fetched／relaunched／failed／unknown）。端末の側が call_receipt で知らせる
+- member の call_send は、相手が端末（BellTeam 以外）の時は保存だけで、delivery.status=stored と相手が最後に取りに来た時刻を返す。stored は受領を表さない
 - local の call_send は配送先の受付成功時に保存する。BellTeamへの送信後に受付結果を確認できなければdelivery.status=unknownで保存し、二重配送を避けるため自動再送しない。deliveredは受付を表し、相手の読了を表さない。返信不要の通知だけ reply_required=false
 """
 
@@ -225,12 +228,13 @@ def call_poll(
     return _poll(_principal(ctx), session_id, party, after_seq)
 
 
-def _poll(principal: Principal, session_id: str, party: str, after_seq: int) -> dict[str, Any]:
+def _poll(principal: Principal, session_id: str, party: str, after_seq: int,
+          peek: bool = False) -> dict[str, Any]:
     denied = _party_denied(principal, session_id, party)
     if denied:
         return denied
     try:
-        return store.poll_messages(session_id, party, after_seq=after_seq, mark_delivered=True)
+        return store.poll_messages(session_id, party, after_seq=after_seq, mark_delivered=not peek)
     except KeyError as e:
         return {"error": "not_found", "detail": str(e)}
     except ValueError as e:
@@ -298,6 +302,54 @@ def call_info(session_id: str, ctx: Context | None = None) -> dict[str, Any]:
 
 @mcp.tool(
     description=(
+        "通話の両方の発言を seq の順に読む。既読にしない。after_seq より後を limit 件（最大200）まで返し、"
+        "続きがあれば more=true。会話が替わった時に、前の会話が送った内容も読むために使う。"
+    )
+)
+def call_history(session_id: str, after_seq: int = 0, limit: int = 50,
+                 ctx: Context | None = None) -> dict[str, Any]:
+    return _history(_principal(ctx), session_id, after_seq, limit)
+
+
+def _history(principal: Principal, session_id: str, after_seq: int, limit: int) -> dict[str, Any]:
+    sess = store.get_session(session_id)
+    if sess is None:
+        return {"error": "not_found", "detail": f"session not found: {session_id}"}
+    if not is_participant(principal, sess):
+        return _forbidden("this connection is not a party of the call")
+    try:
+        return store.history(session_id, after_seq=after_seq, limit=limit)
+    except ValueError as e:
+        return {"error": "rejected", "detail": str(e)}
+
+
+@mcp.tool(
+    description=(
+        "local の側が、member の発言（seq）をどう扱ったかを知らせる。state は submitted（会話のキューか端末へ入れた）、"
+        "started（会話が番を始めた）、fetched（会話が自分で取りに来た）、relaunched（止まっていたので新しいタスクへ渡した）、"
+        "failed、unknown。同じ seq は最後の知らせで上書きする。call_info の local_delivery に出る。"
+    )
+)
+def call_receipt(session_id: str, seq: int, state: str, detail: str | None = None,
+                 conversation: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
+    return _receipt(_principal(ctx), session_id, seq, state, detail, conversation)
+
+
+def _receipt(principal: Principal, session_id: str, seq: int, state: str,
+             detail: str | None, conversation: str | None) -> dict[str, Any]:
+    denied = _party_denied(principal, session_id, "local")
+    if denied:
+        return denied
+    try:
+        return store.record_receipt(session_id, seq, state, detail, conversation)
+    except KeyError as e:
+        return {"error": "not_found", "detail": str(e)}
+    except ValueError as e:
+        return {"error": "rejected", "detail": str(e)}
+
+
+@mcp.tool(
+    description=(
         "電話帳。GrokBotのプロフィールとBellTeamのBot一覧を要求ごとに読む。"
         "各項目のsystemとidで所属と既存Bot IDを区別する。"
         "優先順は CALL_BRIDGE_DIRECTORY_UNIX、CALL_BRIDGE_DIRECTORY_URL、"
@@ -345,7 +397,7 @@ async def health(_request: Request) -> Response:
             "ok": True,
             "service": "call-bridge",
             "status": "up",
-            "version": "0.1.2",
+            "version": "0.2.0",
         }
     )
 
@@ -437,7 +489,43 @@ async def rest_poll(request: Request) -> Response:
             {"ok": False, "error": "query party=local|member required"},
             status_code=400,
         )
-    result = _poll(_request_principal(request), session_id, party, after_seq)
+    # peek=1 reads without marking delivered: a receiver that only checks whether
+    # the conversation fetched the message itself must not set that mark.
+    peek = request.query_params.get("peek", "") == "1"
+    result = _poll(_request_principal(request), session_id, party, after_seq, peek)
+    if result.get("error"):
+        return JSONResponse({"ok": False, **result}, status_code=_delivery_http_status(str(result["error"])))
+    return JSONResponse({"ok": True, **result})
+
+
+@mcp.custom_route("/v0/sessions/{session_id}/history", methods=["GET"])
+async def rest_history(request: Request) -> Response:
+    session_id = request.path_params["session_id"]
+    try:
+        after_seq = int(request.query_params.get("after_seq", "0"))
+        limit = int(request.query_params.get("limit", "50"))
+    except ValueError:
+        return JSONResponse({"ok": False, "error": "after_seq and limit must be integers"}, status_code=400)
+    result = _history(_request_principal(request), session_id, after_seq, limit)
+    if result.get("error"):
+        return JSONResponse({"ok": False, **result}, status_code=_delivery_http_status(str(result["error"])))
+    return JSONResponse({"ok": True, **result})
+
+
+@mcp.custom_route("/v0/sessions/{session_id}/receipts", methods=["POST"])
+async def rest_receipt(request: Request) -> Response:
+    session_id = request.path_params["session_id"]
+    try:
+        body = await request.json()
+    except Exception:
+        return JSONResponse({"ok": False, "error": "invalid_json"}, status_code=400)
+    seq, state = body.get("seq") if isinstance(body, dict) else None, body.get("state") if isinstance(body, dict) else None
+    detail, conversation = (body.get("detail"), body.get("conversation")) if isinstance(body, dict) else (None, None)
+    if type(seq) is not int or not isinstance(state, str) or any(
+            value is not None and not isinstance(value, str) for value in (detail, conversation)):
+        return JSONResponse({"ok": False, "error": "need seq (integer) and state; detail and conversation are text"},
+                            status_code=400)
+    result = _receipt(_request_principal(request), session_id, seq, state, detail, conversation)
     if result.get("error"):
         return JSONResponse({"ok": False, **result}, status_code=_delivery_http_status(str(result["error"])))
     return JSONResponse({"ok": True, **result})
