@@ -99,6 +99,29 @@ class ReceiverPlanTest(unittest.TestCase):
         self.assertEqual(set(watched), {first, later})
 
 
+class ReceiverReloadTest(unittest.TestCase):
+    def test_macos_reinstall_waits_for_the_old_agent_to_be_gone_before_registering(self) -> None:
+        calls: list[str] = []
+        still_there = {"n": 2}
+
+        def run(command, accept=(0,)):
+            calls.append(command[1])
+            code = 0
+            if command[1] == "print":
+                code = 0 if still_there["n"] > 0 else 113
+                still_there["n"] -= 1
+            return subprocess.CompletedProcess(command, code, "", "")
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"CALL_BRIDGE_STATE": tmp}), \
+             patch.object(Path, "home", return_value=Path(tmp)), patch.object(receiver, "_run", run), \
+             patch.object(receiver.os, "getuid", return_value=501, create=True), \
+             patch.object(receiver.time, "sleep", lambda _s: None), \
+             patch.object(receiver, "state", return_value={"registered": True, "running": True}):
+            self.assertEqual(receiver.install("darwin"), {"registered": True, "running": True})
+            self.assertTrue((Path(tmp) / "Library/LaunchAgents/dev.kitepon.call-bridge.receiver.plist").is_file())
+        self.assertEqual(calls, ["bootout", "print", "print", "print", "bootstrap"])
+
+
 class ReceiverLimitsTest(unittest.TestCase):
     def test_file_limit_is_raised_and_never_lowered(self) -> None:
         import resource

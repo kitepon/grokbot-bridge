@@ -196,6 +196,13 @@ def install(platform: str = sys.platform) -> dict[str, Any]:
         file.parent.mkdir(parents=True, exist_ok=True)
         domain = f"gui/{os.getuid()}"
         _run(["launchctl", "bootout", f"{domain}/{LABEL}"], accept=(0, 3, 5, 36, 113))
+        # bootout は、止め終わる前に返る。残っている間の bootstrap は「5: Input/output error」で断られる
+        # （2026-10-10 に Mac で、登録し直した時に起きた）。居なくなるのを待ってから登録する。
+        deadline = time.monotonic() + _START_WAIT_SECONDS
+        while _run(["launchctl", "print", f"{domain}/{LABEL}"], accept=(0, 113)).returncode == 0:
+            if time.monotonic() >= deadline:
+                raise DeliveryError("RECEIVER_SETUP_FAILED", "前の受け取り係が止まり終わりません")
+            time.sleep(0.5)
         file.write_bytes(body)
         _run(["launchctl", "bootstrap", domain, str(file)])
     elif platform == "win32":
