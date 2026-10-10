@@ -66,6 +66,16 @@ def dispatch_send(
                 stored["delivery"] = {"status": "unknown", "detail": str(exc)}
             except BellTeamError as exc:
                 stored["delivery"] = {"status": "error", "detail": str(exc)}
+        elif sess:
+            # Other callers fetch by polling. Say so, with the last time they asked,
+            # so the sender does not read "stored" as "received".
+            seen = sess.get("local_seen_at")
+            stored["delivery"] = {
+                "status": "stored",
+                "detail": f"waiting for the caller to fetch; last fetch at {seen}" if seen
+                else "waiting for the caller to fetch; it has not fetched on this call yet",
+                "local_seen_at": seen,
+            }
         return stored
 
     sess = store.get_session(session_id)

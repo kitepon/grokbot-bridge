@@ -225,7 +225,7 @@ class DeliverTests(unittest.TestCase):
         result = dispatch_send(self.store, session["session_id"], "member", "確認しました")
 
         self.assertEqual(result["message"], "確認しました")
-        self.assertNotIn("delivery", result)
+        self.assertEqual(result["delivery"]["status"], "stored")
         self.assertIsNone(webhook.captured)  # type: ignore[attr-defined]
 
     def test_missing_webhook_env_does_not_store(self) -> None:

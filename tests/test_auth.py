@@ -349,6 +349,69 @@ class HttpIdentityTest(unittest.TestCase):
             bad_header = client.get("/v0/directory", headers=_headers(GROKBOT, "g-1"))
             self.assertEqual(bad_header.status_code, 403)
 
+    def _call_with_one_reply(self) -> str:
+        opened = self._tool(_headers(LOCAL), "call_open", local_id="mac-1", local_label="ベル", member_name="マリアン")
+        self.assertEqual(opened["local_system"], "local", opened)
+        sid = opened["session_id"]
+        reply = self._tool(_headers(GROKBOT), "call_send", session_id=sid, from_party="member", message="返事")
+        self.assertEqual((reply["seq"], reply["delivery"]["status"]), (1, "stored"), reply)
+        return sid
+
+    def test_local_reports_a_receipt_and_the_member_reads_it_in_call_info(self) -> None:
+        sid = self._call_with_one_reply()
+        done = self._tool(_headers(LOCAL), "call_receipt", session_id=sid, seq=1, state="relaunched",
+                          detail="stopped conversation; new task in the same folder", conversation="hosted:bell")
+        self.assertEqual(done["state"], "relaunched", done)
+        info = self._tool(_headers(GROKBOT), "call_info", session_id=sid)
+        self.assertEqual([(r["seq"], r["state"], r["conversation"]) for r in info["local_delivery"]],
+                         [(1, "relaunched", "hosted:bell")])
+
+    def test_only_the_local_party_may_report_a_receipt(self) -> None:
+        sid = self._call_with_one_reply()
+        self.assertEqual(self._tool(_headers(GROKBOT), "call_receipt", session_id=sid, seq=1,
+                                    state="started")["error"], "forbidden")
+        self.assertEqual(self._tool(_headers(BELLTEAM, "bot-b"), "call_receipt", session_id=sid, seq=1,
+                                    state="started")["error"], "forbidden")
+        self.assertEqual(self._tool(_headers(LOCAL), "call_receipt", session_id=sid, seq=9,
+                                    state="started")["error"], "rejected")
+        self.assertEqual(self._tool(_headers(LOCAL), "call_receipt", session_id=sid, seq=1,
+                                    state="read")["error"], "rejected")
+
+    def test_history_is_for_parties_and_is_not_a_fetch(self) -> None:
+        sid = self._call_with_one_reply()
+        page = self._tool(_headers(GROKBOT), "call_history", session_id=sid)
+        self.assertEqual([(m["seq"], m["from_party"]) for m in page["messages"]], [(1, "member")])
+        self.assertEqual(self._tool(_headers(BELLTEAM, "bot-b"), "call_history", session_id=sid)["error"], "forbidden")
+        self.assertEqual(self._tool(_headers(LOCAL), "call_history", session_id="none")["error"], "not_found")
+        self.assertIsNone(server.store.get_session(sid)["local_seen_at"])
+
+    def test_rest_peek_leaves_the_delivered_mark_and_rest_receipt_stores(self) -> None:
+        sid = self._call_with_one_reply()
+
+        def delivered() -> int:
+            with server.store._conn() as conn:
+                return conn.execute("SELECT delivered_to_local FROM messages WHERE session_id = ? AND seq = 1",
+                                    (sid,)).fetchone()[0]
+
+        with httpx.Client(base_url=self.base, timeout=10) as client:
+            peeked = client.get(f"/v0/sessions/{sid}/poll", params={"party": "local", "peek": "1"}, headers=_headers(LOCAL))
+            self.assertEqual([m["seq"] for m in peeked.json()["messages"]], [1], peeked.text)
+            self.assertEqual(delivered(), 0)
+            self.assertIsNotNone(server.store.get_session(sid)["local_seen_at"])
+            client.get(f"/v0/sessions/{sid}/poll", params={"party": "local"}, headers=_headers(LOCAL))
+            self.assertEqual(delivered(), 1)
+            stored = client.post(f"/v0/sessions/{sid}/receipts", headers=_headers(LOCAL),
+                                 json={"seq": 1, "state": "submitted", "conversation": "codex:t-1"})
+            self.assertEqual(stored.status_code, 200, stored.text)
+            self.assertEqual(client.post(f"/v0/sessions/{sid}/receipts", headers=_headers(GROKBOT),
+                                         json={"seq": 1, "state": "started"}).status_code, 403)
+            self.assertEqual(client.post(f"/v0/sessions/{sid}/receipts", headers=_headers(LOCAL),
+                                         json={"seq": "1", "state": "started"}).status_code, 400)
+            history = client.get(f"/v0/sessions/{sid}/history", headers=_headers(LOCAL))
+            self.assertEqual((history.status_code, history.json()["more"]), (200, False), history.text)
+            self.assertEqual(client.get(f"/v0/sessions/{sid}/history", headers=_headers(BELLTEAM, "bot-b")).status_code, 403)
+        self.assertEqual([r["state"] for r in server.store.receipts(sid)], ["submitted"])
+
 
 if __name__ == "__main__":
     unittest.main()
