@@ -1,10 +1,11 @@
 """Wake the switchboard (Marian).
 
-``session.opened`` (from ``call_open``) is a versioned envelope with no message
-body. ``session.message`` (from a local ``call_send``) uses the same webhook
-and the same auth, and this event includes the caller's text so Marian can
-relay it into the member's main chat. ``bridge.link_down`` uses that webhook
-too, with no message body, when a request finds the directory unix socket down.
+``session.opened`` is a versioned envelope with no message body. A local
+``call_send`` to a GrokBot member posts it as a ring when the member has no
+unread message waiting; Marian only tells the member the MCP URL and
+``session_id``, and the member reads the text with ``call_poll``. No event
+carries the caller's text. ``bridge.link_down`` uses the same webhook, with no
+message body, when a request finds the directory unix socket down.
 Webhook secrets are never part of any payload.
 """
 
@@ -23,7 +24,6 @@ log = logging.getLogger("call_bridge.wake")
 
 WAKE_SCHEMA = "grokbot.call.v0"
 WAKE_EVENT = "session.opened"
-MESSAGE_EVENT = "session.message"
 DEFAULT_PUBLIC_MCP_URL = "https://call.kitepon.dev/mcp"
 WAKE_TIMEOUT_SECONDS = 8
 
@@ -61,9 +61,15 @@ def public_mcp_url() -> str:
     return os.environ.get("CALL_BRIDGE_PUBLIC_MCP_URL", "").strip() or DEFAULT_PUBLIC_MCP_URL
 
 
-def build_wake_payload(session: dict[str, Any]) -> dict[str, Any]:
-    """Stable ``session.opened`` envelope. Allowlisted keys only — no message body."""
-    return {
+def build_wake_payload(
+    session: dict[str, Any], *, member_agent_id: str | None = None
+) -> dict[str, Any]:
+    """Stable ``session.opened`` envelope. Allowlisted keys only — no message body.
+
+    ``member_agent_id`` is added when the caller has resolved it, so the
+    switchboard can pick the seat by id after a rename.
+    """
+    payload = {
         "schema": WAKE_SCHEMA,
         "event": WAKE_EVENT,
         "session_id": session.get("session_id"),
@@ -75,32 +81,9 @@ def build_wake_payload(session: dict[str, Any]) -> dict[str, Any]:
         "mcp_url": public_mcp_url(),
         "created_at": session.get("created_at"),
     }
-
-
-def build_message_payload(
-    session: dict[str, Any],
-    *,
-    member_agent_id: str,
-    message: str,
-    reply_required: bool,
-) -> dict[str, Any]:
-    """Stable ``session.message`` envelope. Includes the caller's text.
-
-    ``message`` is the text the local party passed to ``call_send``, not the
-    stored copy with the reply-request suffix. ``reply_required`` is separate.
-    """
-    return {
-        "schema": WAKE_SCHEMA,
-        "event": MESSAGE_EVENT,
-        "session_id": session.get("session_id"),
-        "member_name": session.get("member_name"),
-        "member_agent_id": member_agent_id,
-        "local_id": session.get("local_id"),
-        "local_label": session.get("local_label"),
-        "message": message,
-        "reply_required": reply_required,
-        "mcp_url": public_mcp_url(),
-    }
+    if member_agent_id:
+        payload["member_agent_id"] = member_agent_id
+    return payload
 
 
 class _ReturnHTTPStatus(urllib.request.HTTPErrorProcessor):
@@ -170,59 +153,26 @@ def _log_notify(result: dict[str, str], ok_fmt: str, err_fmt: str, *args: object
     return result
 
 
-def notify_wake(session: dict[str, Any]) -> dict[str, str]:
-    """POST the ``session.opened`` envelope. Never raises.
+def notify_ring(session: dict[str, Any], *, member_agent_id: str) -> dict[str, str]:
+    """POST ``session.opened`` as the ring for a local ``call_send``. Never raises.
 
-    Returns ``{"status": "ok"|"skipped"|"error", "detail": "..."}``.
-    Opening a call must not fail because this notification failed.
-    The payload has no message body.
-    """
-    session_id = session.get("session_id")
-    url = _first_env(_URL_ENV)
-    if not url:
-        log.info("wake notify skipped: webhook URL unset (session_id=%s)", session_id)
-        return {"status": "skipped", "detail": "webhook url unset"}
-
-    result = _post_json(build_wake_payload(session))
-    return _log_notify(
-        result,
-        "wake notify ok session_id=%s %s",
-        "wake notify failed session_id=%s: %s",
-        session_id,
-    )
-
-
-def notify_message(
-    session: dict[str, Any],
-    *,
-    member_agent_id: str,
-    message: str,
-    reply_required: bool,
-) -> dict[str, str]:
-    """POST ``session.message``, including the caller text. Never raises.
-
-    A missing webhook URL is an error. Local ``call_send`` must not store the
-    message or report it delivered when this is not ``ok``.
+    The ``session.opened`` envelope with ``member_agent_id``; no message
+    body. A missing webhook URL is an error here: local ``call_send`` must not
+    store the message or report it delivered when this is not ``ok``.
     A failed POST is not a box-link failure and does not send ``bridge.link_down``.
     Returns ``{"status": "ok"|"error", "detail": "..."}``.
     """
     session_id = session.get("session_id")
     url = _first_env(_URL_ENV)
     if not url:
-        log.error("message notify failed session_id=%s: webhook url unset", session_id)
+        log.error("ring failed session_id=%s: webhook url unset", session_id)
         return {"status": "error", "detail": "webhook url unset"}
 
-    payload = build_message_payload(
-        session,
-        member_agent_id=member_agent_id,
-        message=message,
-        reply_required=reply_required,
-    )
-    result = _post_json(payload)
+    result = _post_json(build_wake_payload(session, member_agent_id=member_agent_id))
     return _log_notify(
         result,
-        "message notify ok session_id=%s %s",
-        "message notify failed session_id=%s: %s",
+        "ring ok session_id=%s %s",
+        "ring failed session_id=%s: %s",
         session_id,
     )
 
@@ -265,7 +215,7 @@ def reset_link_down_limiter() -> None:
 def notify_link_down(link: str, detail: str) -> dict[str, str]:
     """POST ``bridge.link_down`` at most once per 60 seconds. Never raises.
 
-    Uses the same webhook URL and Authorization value as ``notify_wake``.
+    Uses the same webhook URL and Authorization value as ``notify_ring``.
     A skipped POST because the URL is unset does not start the interval.
     There is no background retry.
     """

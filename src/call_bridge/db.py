@@ -259,6 +259,19 @@ class CallStore:
                 "latest_seq": messages[-1]["seq"] if messages else after_seq,
             }
 
+    def unread_by_member(self, session_id: str) -> dict[str, Any]:
+        """Local messages the member has not polled yet: count and oldest time."""
+        with self._conn() as conn:
+            row = conn.execute(
+                """
+                SELECT COUNT(*) AS n, MIN(created_at) AS oldest
+                FROM messages
+                WHERE session_id = ? AND from_party = 'local' AND delivered_to_member = 0
+                """,
+                (session_id,),
+            ).fetchone()
+            return {"count": int(row["n"]), "oldest_created_at": row["oldest"]}
+
     def hangup(
         self, session_id: str, by_party: str, reason: str | None = None
     ) -> dict[str, Any]:

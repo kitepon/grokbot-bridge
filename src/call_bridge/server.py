@@ -1,9 +1,9 @@
 """grokbot-bridge MCP server — shared phone-call bridge for Grok Bot.
 
 Streamable HTTP (FastMCP). Local agents and Grok Bot members both connect as MCP clients.
-A switchboard agent wakes the member. Local call_send posts session.message
-(with the text) to that webhook so Marian can relay it into the member's main chat.
-Member sends stay on this MCP.
+A local call_send to a GrokBot member stores the text here and rings the member
+through the switchboard webhook (no message body). Marian only passes the MCP URL
+and session_id; the member reads the text with call_poll. Member sends stay on this MCP.
 """
 
 from __future__ import annotations
@@ -24,7 +24,6 @@ from .auth import UNAUTHENTICATED, AuthError, Authenticator, OPEN, Principal, ch
 from .db import CallStore
 from .deliver import dispatch_send
 from .directory import DIRECTORY_HOP_HEADER, resolve_bellteam_member, resolve_member_agent_id, search_directory
-from .wake import notify_wake
 
 log = logging.getLogger("call_bridge")
 
@@ -36,12 +35,12 @@ BellTeam宛てはcall_openのmember_system="bellteam"、member_nameには名前�
 BellTeamのBotが発信する時はlocal_system="bellteam"、local_idには自身のBot IDを指定する。
 同名が複数あればBot IDを使う。local/memberは通話内の発信者/受信者を表す。
 接続のトークンが所属に結び付いている時は、その所属（BellTeamはBot IDまで）の当事者としてだけ操作でき、違えばerror=forbiddenになる。
-GrokBot宛てのsession.openedには本文を含めず、localのcall_sendをMarianが中継する。
+GrokBot宛ての本文はMarianを通らない。localのcall_sendは本文を橋に保存し、Marianは本文なしのsession.openedで相手を起こすだけ。相手はcall_pollで本文を読む。
 BellTeam宛てはcall_sendがBellTeamへ直接届ける。マリアンは通らない。
 
 ## 流れ
-1. localがcall_openでセッション作成（status=ringing）。GrokBot宛てだけスイッチボードへsession.openedをPOSTする（本文なし）
-2. GrokBot宛ては電話番が相手を起こす。BellTeam宛ては最初のcall_sendで着信する
+1. localがcall_openでセッション作成（status=ringing）。この時点では誰も起こさない
+2. GrokBot宛ては最初のcall_sendで電話番が相手を起こす（本文なし）。相手が未読のうちに続けて送った分は起こし直さず、相手の次のcall_pollでまとめて届く。BellTeam宛ても最初のcall_sendで着信する
 3. localのcall_sendは宛先の所属に応じて配送し、受付後に保存する。memberのcall_sendは保存し、BellTeam発信者へは返信を直接配送する
 4. call_hangup で終了
 
@@ -129,7 +128,7 @@ def _session_view(sess: dict[str, Any], wake: dict[str, str]) -> dict[str, Any]:
         "通話セッションを開く（local→member）。BellTeam宛てはmember_system=bellteam、"
         "BellTeam Bot発信はlocal_system=bellteamと自身のBot IDをlocal_idに指定する。"
         "local_systemを省くと、所属に結び付いた接続ではその所属、それ以外はlocalになる。"
-        "GrokBot宛てだけスイッチボードへ本文なしのwakeを送る。session_idを返す。"
+        "call_openだけでは相手を起こさない。最初のcall_sendで着信する。session_idを返す。"
     )
 )
 def call_open(
@@ -174,13 +173,13 @@ def _open(
         member_id = resolved["id"]
         member_name = resolved.get("name") or member_name
     sess = store.open_session(local_id, local_label, member_name, purpose, member_system, member_id, local_system)
-    wake = notify_wake(sess) if member_system == "grokbot" else {"status": "skipped", "detail": "BellTeam direct delivery on call_send"}
-    return _session_view(sess, wake)
+    detail = "rings on the first call_send" if member_system == "grokbot" else "BellTeam direct delivery on call_send"
+    return _session_view(sess, {"status": "skipped", "detail": detail})
 
 
 @mcp.tool(
     description=(
-        "セッションへメッセージ送信。localはGrokBot宛てならマリアンへ、BellTeam宛てなら直接配送する。"
+        "セッションへメッセージ送信。localのGrokBot宛ては本文を橋に保存し、マリアンが本文なしで相手を起こす（相手はcall_pollで読む）。BellTeam宛ては直接配送する。"
         "返信不要なら reply_required=false。"
         "結果の delivery.status は delivered、error、unknown。"
         "BellTeamの結果がunknownなら本文を履歴へ保存し、二重配送を避けるため自動再送しない。"

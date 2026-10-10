@@ -167,19 +167,21 @@ class BellTeamTests(unittest.TestCase):
             store = CallStore(Path(root) / "calls.db")
             with mock.patch.object(call_server, "store", store), \
                  mock.patch.object(call_server, "resolve_bellteam_member", return_value={"ok": True, "id": "bot-a", "name": "トロニー"}), \
-                 mock.patch.object(call_server, "notify_wake") as wake:
+                 mock.patch("call_bridge.wake._post_json") as post:
                 result = call_server.call_open("grok-caller", "ラピ", "bot-a", member_system="bellteam", local_system="grokbot")
                 self.assertEqual(result["member_id"], "bot-a")
                 self.assertEqual(result["wake"]["status"], "skipped")
-                wake.assert_not_called()
+                post.assert_not_called()
 
     def test_grok_call_open_keeps_resolved_id_and_name(self):
         with tempfile.TemporaryDirectory() as root:
             store = CallStore(Path(root) / "calls.db")
             with mock.patch.object(call_server, "store", store), \
                  mock.patch.object(call_server, "resolve_member_agent_id", return_value={"ok": True, "id": "grok-a", "name": "ラピ"}), \
-                 mock.patch.object(call_server, "notify_wake", return_value={"status": "skipped"}):
+                 mock.patch("call_bridge.wake._post_json") as post:
                 result = call_server.call_open("bot-caller", "トロニー", "grok-a", local_system="bellteam")
+                post.assert_not_called()
+                self.assertEqual(result["wake"], {"status": "skipped", "detail": "rings on the first call_send"})
                 self.assertEqual(result["member_id"], "grok-a")
                 self.assertEqual(result["member_name"], "ラピ")
                 self.assertEqual(store.get_session(result["session_id"])["local_system"], "bellteam")

@@ -28,7 +28,7 @@ from call_bridge.wake import (  # noqa: E402
     build_link_down_payload,
     build_wake_payload,
     notify_link_down,
-    notify_wake,
+    notify_ring,
     reset_link_down_limiter,
 )
 
@@ -250,8 +250,8 @@ class LinkDownTests(unittest.TestCase):
         clock = {"now": 5000.0}
         with mock.patch("call_bridge.wake.time.monotonic", side_effect=lambda: clock["now"]):
             down = notify_link_down("gateway", "request failed")
-            opened = notify_wake(_session())
-            again = notify_wake(_session())
+            opened = notify_ring(_session(), member_agent_id="rapi-agent")
+            again = notify_ring(_session(), member_agent_id="rapi-agent")
             limited = notify_link_down("directory", "timed out")
 
         self.assertEqual(down["status"], "ok")
@@ -358,15 +358,15 @@ class LinkDownTests(unittest.TestCase):
         self.assertEqual(store.session_info(session["session_id"])["message_count"], 1)
         self.assertEqual(len(webhook.requests), 1)  # type: ignore[attr-defined]
         body = json.loads(webhook.requests[0]["body"].decode("utf-8"))  # type: ignore[attr-defined]
-        self.assertEqual(body["event"], "session.message")
-        self.assertEqual(body["message"], "hello")
+        self.assertEqual(body["event"], "session.opened")
+        self.assertNotIn("message", body)
         self.assertEqual(body["member_agent_id"], "rapi-agent")
         posted = webhook.requests[0]["body"].decode("utf-8")  # type: ignore[attr-defined]
         self.assertNotIn(_GATEWAY_TOKEN, posted)
         self.assertNotIn("wake-secret-do-not-log", posted)
         self.assertNotIn(_GATEWAY_TOKEN, "\n".join(self.logs.messages))
 
-    def test_message_webhook_failure_does_not_emit_link_down(self) -> None:
+    def test_ring_failure_does_not_emit_link_down(self) -> None:
         webhook = self._webhook(502)
         os.environ["CALL_BRIDGE_WAKE_WEBHOOK_URL"] = self._url(webhook)
         self._profiles({"rapi-agent": "ラピ"})
@@ -383,7 +383,7 @@ class LinkDownTests(unittest.TestCase):
         self.assertEqual(store.session_info(session["session_id"])["message_count"], 0)
         self.assertEqual(len(webhook.requests), 1)  # type: ignore[attr-defined]
         body = json.loads(webhook.requests[0]["body"].decode("utf-8"))  # type: ignore[attr-defined]
-        self.assertEqual(body["event"], "session.message")
+        self.assertEqual(body["event"], "session.opened")
 
     def test_member_send_and_unset_webhook_do_not_emit_link_down(self) -> None:
         webhook = self._webhook(204)
@@ -422,8 +422,8 @@ class LinkDownTests(unittest.TestCase):
         self.assertEqual(first["event"], "bridge.link_down")
         self.assertEqual(first["link"], "directory")
         self.assertEqual(first["detail"], "unix socket not found")
-        self.assertEqual(second["event"], "session.message")
-        self.assertEqual(second["message"], "hello")
+        self.assertEqual(second["event"], "session.opened")
+        self.assertNotIn("message", second)
         self.assertEqual(second["member_agent_id"], "rapi-agent")
 
     def _profiles(self, seats: dict[str, str]) -> None:
