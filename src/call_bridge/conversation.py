@@ -15,6 +15,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Awaitable, Callable
 
+from .codex_delivery import hidden_child
+
 _TAIL_FIRST_BYTES = 256 * 1024
 _TAIL_MAX_BYTES = 16 * 1024 * 1024
 _TURN_EVENTS = {"task_started": "running", "task_complete": "completed", "turn_aborted": "interrupted"}
@@ -141,7 +143,7 @@ async def _throughline_json(args: list[str]) -> Any:
     try:
         process = await asyncio.create_subprocess_exec(
             binary, *args, stdin=asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL, **hidden_child())
     except OSError:
         return None
     try:

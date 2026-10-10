@@ -26,6 +26,7 @@ STEER_MIN_VERSION = (0, 1, 5)
 # App Server の応答は1行の JSON。config/read は設定全体を返すので、既定の 64KiB では足りない端末がある。
 _RPC_LINE_LIMIT = 64 * 1024 * 1024
 _STEER_TIMEOUT = 60
+_CREATE_NO_WINDOW = 0x08000000
 
 
 class DeliveryError(RuntimeError):
@@ -33,6 +34,15 @@ class DeliveryError(RuntimeError):
         super().__init__(f"{code}: {detail}")
         self.code = code
         self.outcome_unknown = outcome_unknown
+
+
+def hidden_child(windows: bool = os.name == "nt") -> dict[str, int]:
+    """子の process を起こす時の、端末の窓を出さない指定。Windows だけ。
+
+    常駐の受け取り係（pythonw）は console を持たない。そこから console の命令を起こすと、
+    起こすたびに端末の窓が開いて閉じる（2026-10-10 に fox で、1回につき 0.2〜0.4 秒）。
+    """
+    return {"creationflags": _CREATE_NO_WINDOW} if windows else {}
 
 
 def private_dir(path: Path, windows: bool = os.name == "nt") -> Path:
@@ -230,7 +240,7 @@ class CodexRPC:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
                 env={**os.environ, "CODEX_HOME": str(self.home)},
-                limit=_RPC_LINE_LIMIT,
+                limit=_RPC_LINE_LIMIT, **hidden_child(),
             )
         except OSError as exc:
             raise DeliveryError("CODEX_UNAVAILABLE", "Codex App Server を起動できません") from exc
@@ -399,7 +409,7 @@ async def steer(args: list[str], *, text: str | None = None, sends: bool = False
         process = await asyncio.create_subprocess_exec(
             *command, *_steer_arguments(args),
             stdin=asyncio.subprocess.PIPE if text is not None else asyncio.subprocess.DEVNULL,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE, env=env, **hidden_child(),
         )
     except OSError as exc:
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery を起動できません") from exc

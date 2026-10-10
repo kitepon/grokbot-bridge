@@ -14,8 +14,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import patch
 
-from call_bridge import harness_setup, local, receiver
-from call_bridge.codex_delivery import DeliveryError
+from call_bridge import codex_delivery, conversation, harness_setup, local, receiver
+from call_bridge.codex_delivery import DeliveryError, hidden_child
 
 
 class ReceiverPlanTest(unittest.TestCase):
@@ -288,6 +288,37 @@ class HarnessSetupTest(unittest.TestCase):
             self.assertEqual(harness_setup.status("grok"), {"harness": "grok", "status": "unavailable"})
         with self.assertRaises(DeliveryError):
             harness_setup.enable("codex")
+
+
+class HiddenChildTest(unittest.IsolatedAsyncioTestCase):
+    """Windows の常駐の受け取り係は console を持たない。動いている間に起こす子で、端末の窓を出さない。"""
+
+    def test_the_setting_is_only_for_windows(self) -> None:
+        self.assertEqual(hidden_child(windows=True), {"creationflags": 0x08000000})
+        self.assertEqual(hidden_child(windows=False), {})
+
+    async def test_every_child_started_while_running_carries_the_setting(self) -> None:
+        seen: list[object] = []
+
+        async def refuse(*_args: object, **kwargs: object) -> None:
+            seen.append(kwargs.get("creationflags"))
+            raise OSError("no child in a test")
+
+        marker = {"creationflags": 7}
+        with tempfile.TemporaryDirectory() as tmp, \
+                patch.dict(os.environ, {"CALL_BRIDGE_STATE": tmp, "CALL_BRIDGE_THROUGHLINE": "throughline"}), \
+                patch("asyncio.create_subprocess_exec", refuse), \
+                patch.object(codex_delivery, "hidden_child", return_value=marker), \
+                patch.object(conversation, "hidden_child", return_value=marker), \
+                patch.object(codex_delivery, "codex_command", return_value=["codex"]), \
+                patch.object(codex_delivery, "_steer_command", return_value=(["steer"], {})), \
+                patch.object(codex_delivery, "_steer_arguments", return_value=[]):
+            with self.assertRaises(DeliveryError):
+                await codex_delivery.CodexRPC(Path(tmp)).__aenter__()   # Codex の App Server
+            with self.assertRaises(DeliveryError):
+                await codex_delivery.steer(["state"])                    # aiterm-steer-delivery
+            self.assertIsNone(await conversation._throughline_json(["auto-handoff", "status", "--json"]))
+        self.assertEqual(seen, [7, 7, 7])
 
 
 if __name__ == "__main__":
