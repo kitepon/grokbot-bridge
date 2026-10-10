@@ -1,4 +1,7 @@
-"""試験は、動かした端末へ常駐の受け取り係を登録しない。"""
+"""試験は、動かした端末へ何も立てず、何も登録しない。
+
+本物の Aiterm へつなぐと、席（本物の AI の会話）が立つ。試験が自分の代わりを渡した時だけ、そこへつながる。
+"""
 
 from __future__ import annotations
 
@@ -7,7 +10,12 @@ from unittest import mock
 import pytest
 
 
+def _refuse_real_aiterm():
+    raise AssertionError("試験から本物の Aiterm へつなごうとしました。aiterm.connect を試験用に差し替えてください")
+
+
 @pytest.fixture(autouse=True)
-def _no_real_receiver():
-    with mock.patch("call_bridge.setup._receiver", return_value="running"):
+def _nothing_real():
+    with mock.patch("call_bridge.setup._receiver", return_value="running"), \
+         mock.patch("call_bridge.aiterm.connect", _refuse_real_aiterm):
         yield
