@@ -173,7 +173,9 @@ def windows_task(user: str) -> str:
 
 def _run(command: list[str], accept: tuple[int, ...] = (0,)) -> subprocess.CompletedProcess[str]:
     try:
-        result = subprocess.run(command, capture_output=True, text=True, timeout=60, stdin=subprocess.DEVNULL)
+        # 読めない文字があっても、命令の成否は終了コードで決める（Windows の命令の出力は端末の文字コード）。
+        result = subprocess.run(command, capture_output=True, text=True, errors="replace", timeout=60,
+                                stdin=subprocess.DEVNULL)
     except (OSError, subprocess.TimeoutExpired) as exc:
         raise DeliveryError("RECEIVER_SETUP_FAILED", f"{command[0]} を実行できません: {exc}") from exc
     if result.returncode not in accept:
