@@ -71,7 +71,7 @@ Claude Code には、返信を会話へ自動で渡すための hook も登録�
 
 - 使うのは共通パッケージ aiterm-steer-delivery（0.4.2 以降）の channel。Claude Code の公式の hook（`asyncRewake`）が、止まっている会話を起こして本文を渡す。パッケージの CLI は Codex だけなので、call-bridge の Node の入口（`src/call_bridge/steer/`）から呼ぶ。入口は置き場の `steer/` へ写し、パッケージの場所を隣の `steer.json` に書く。入れ直した後は、もう一度 `enable` を流す。
 - 登録先は Claude Code の利用者の設定（`~/.claude/settings.json`。`CLAUDE_CONFIG_DIR` があればその中）。`PreToolUse`・`PostToolUse`（`call_open` と `call_adopt` だけ）、`Stop`、`SessionStart`、`SessionEnd` に1つずつ足す。ほかの hook は変えない。書き換える前の控えが `settings.json.call-bridge-backup` に残る。
-- 効くのは、登録の後に起きた会話。前から動いている会話は、今までどおり自分で取りに来る。
+- 入れ直す前から動いている会話は、その会話の通話MCP（`call_bridge.local` の process）が古いままなので、今までどおり自分で取りに来る。Claude Code を起動し直すか、`/mcp` で call-bridge をつなぎ直した後に、`call_open` か `call_adopt` を呼んだ通話から効く。hook そのものは、動いている Claude Code にも設定の書き換えだけで効く（Claude Code 2.1.296 の Linux で確かめた。hook を入れる前から動いていた会話が、後から入れた hook で受け取れた）。
 - パッケージが無い・古い端末でも、ローカル MCP の登録は済ませる。その時は `warning` に理由が出て、`delivery` は `manual`。
 - 待ち受けは24時間で切れる。丸1日だれも話しかけていない会話は起こさず、返信は30分後に席へ渡る。
 
