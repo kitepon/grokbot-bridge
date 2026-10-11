@@ -23,6 +23,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import Context, FastMCP
 
 from . import aiterm
+from . import claude_channel
 from . import conversation as talk
 from . import relaunch
 from .codex_delivery import (CodexRPC, DeliveryError, codex_home, conversation_missing, hook_delivery_state,
@@ -38,9 +39,14 @@ _TOKEN_READ_ATTEMPTS = 15
 _RECHECK_SECONDS = 30.0
 # キューへ入れてから、動いたかを確かめるまで。配送パッケージが寝た会話を起こす（15秒後に見直し、30秒待つ）のを待つ。
 _CONFIRM_AFTER_SECONDS = 50.0
+# Claude Code の会話へ入れてから、会話へ出たかを確かめるまで。生きている待ち受けは1秒かからずに取り出す。
+_CHANNEL_CONFIRM_SECONDS = 10.0
+# Claude Code の会話が番の途中で、待ち受けが居ない間は待つ（番の終わりに取り出す）。これより長く誰も取り出さない時は、
+# 待ち受けの期限（24時間）が切れたまま止まっている会話として、担当フォルダの席へ渡す。
+_CHANNEL_BUSY_SECONDS = 1800.0
 # 途中で止められた直後は、Throughline が続きの会話を作っている途中の事がある。これより新しい中断は待つ。
 _INTERRUPT_SETTLE_SECONDS = 120.0
-_MODES = ("queue", "exec", "hosted", "manual")
+_MODES = ("queue", "exec", "hosted", "manual", "channel")
 _HARNESSES = ("codex", "claude-code", "cursor", "grok")
 _DONE = ("submitted", "injected", "relaunched", "fetched")
 
@@ -318,6 +324,12 @@ class LocalStore:
             db.execute("UPDATE subscriptions SET hold_seq = after_seq, after_seq = MIN(after_seq, ?), last_error = ? "
                        "WHERE session_id = ?", (seq - 1, error, session_id))
 
+    def failed(self, session_id: str, seq: int, error: str) -> None:
+        """この返信はどこにも入っていない。やり直しの時に、もう一度扱う。"""
+        with self.connect() as db:
+            db.execute("UPDATE deliveries SET state = 'failed', error = ?, confirmed = 1 WHERE session_id = ? AND seq = ?",
+                       (error, session_id, seq))
+
     def bound_to(self, harness: str, thread_id: str, session_id: str) -> list[dict[str, Any]]:
         """同じ会話に付いている、生きている通話。会話のIDが無い結び付けは、その通話だけ。"""
         with self.connect() as db:
@@ -334,7 +346,8 @@ class LocalStore:
             if thread_id:
                 done = db.execute("UPDATE subscriptions SET thread_id = ?, delivery_mode = 'hosted', cwd = ? "
                                   "WHERE state = 'active' AND harness = ? AND thread_id = ? "
-                                  "AND delivery_mode IN ('queue', 'hosted', 'manual')", (seat, cwd, harness, thread_id))
+                                  "AND delivery_mode IN ('queue', 'hosted', 'manual', 'channel')",
+                                  (seat, cwd, harness, thread_id))
             else:
                 done = db.execute("UPDATE subscriptions SET thread_id = ?, delivery_mode = 'hosted', cwd = ? "
                                   "WHERE session_id = ?", (seat, cwd, session_id))
@@ -352,6 +365,13 @@ class LocalStore:
             db.execute("UPDATE subscriptions SET thread_id = ?, codex_home = ?, cwd = COALESCE(?, cwd), harness = 'codex', "
                        "delivery_mode = 'queue', state = 'active', last_error = NULL, hold_seq = NULL "
                        "WHERE session_id = ?", (thread_id, str(home), cwd, session_id))
+
+    def adopt_channel(self, session_id: str, channel_id: str, cwd: str | None) -> None:
+        """新しい Claude Code の会話が、通話を自分へ付け替える。"""
+        with self.connect() as db:
+            db.execute("UPDATE subscriptions SET thread_id = ?, codex_home = '.', cwd = COALESCE(?, cwd), "
+                       "harness = 'claude-code', delivery_mode = 'channel', state = 'active', last_error = NULL, "
+                       "hold_seq = NULL WHERE session_id = ?", (channel_id, cwd, session_id))
 
     def note_relaunch(self, source: str, target: str, state: str, detail: str | None) -> None:
         with self.connect() as db:
@@ -395,6 +415,8 @@ class LocalStore:
         """キューの受付後に hook が取り出し中・中断した配送を、その状態で示す。"""
         subscription = self.subscription(session_id)
         status = self.status(session_id)
+        if subscription["harness"] != "codex":
+            return status
         for delivery in status["deliveries"]:
             if delivery["state"] == "submitted":
                 hook_state = await hook_delivery_state(subscription["thread_id"], Path(subscription["codex_home"]),
@@ -473,8 +495,8 @@ class Watchers:
                     continue
                 token_failures = 0
                 params: dict[str, Any] = {"party": "local", "after_seq": subscription["after_seq"]}
-                if subscription["delivery_mode"] == "manual":
-                    # 自分で取りに来る会話の代わりに読むだけ。既読の印は、会話が取りに来た時に付く。
+                if subscription["delivery_mode"] in ("manual", "channel"):
+                    # 読むだけ。既読の印は、会話が自分で取りに来た時に付く（取りに来た返信は、重ねて渡さない）。
                     params["peek"] = "1"
                 try:
                     response = await client.get(_rest_url(session_id), headers=headers, params=params)
@@ -524,6 +546,12 @@ class Watchers:
                         return
                     if not messages or current["after_seq"] >= messages[-1]["seq"] or current["hold_seq"] is not None:
                         self.store.stop(session_id, "closed", current["last_error"])
+                        if current["delivery_mode"] == "channel":
+                            # 開いたままの channel があると、会話の待ち受けが残り続ける。
+                            try:
+                                await claude_channel.close(current["thread_id"])
+                            except DeliveryError as exc:
+                                log.warning("channel for %s was not closed: %s", session_id, exc)
                         return
                 await asyncio.sleep(_POLL_SECONDS)
 
@@ -553,6 +581,8 @@ class Watchers:
                 return await self._manual(subscription, message, text, report)
             if mode == "hosted":
                 return await self._hosted(subscription, seq, text, report)
+            if mode == "channel":
+                return await self._channel(subscription, message, delivery_id, text, report)
             return await self._queue(subscription, seq, delivery_id, text, report)
         except DeliveryError as exc:
             if exc.code == "RELAUNCH_BUSY":
@@ -612,6 +642,37 @@ class Watchers:
                 return "next"
         return await self._hand_over(subscription, seq, [text], "席が動いていませんでした", report)
 
+    async def _channel(self, subscription: dict[str, Any], message: dict[str, Any], delivery_id: str, text: str,
+                       report: "_Reporter") -> str:
+        """生きている Claude Code の会話へ入れる。会話の hook が取り出して、止まっている会話を起こす。"""
+        session_id, seq, channel = subscription["session_id"], message["seq"], subscription["thread_id"]
+        if message.get("fetched") is True:
+            self.store.submitted(session_id, seq, "fetched")
+            await report(seq, "fetched", None, None)
+            return "next"
+        try:
+            await claude_channel.send(channel, delivery_id, text)
+        except DeliveryError as exc:
+            if exc.outcome_unknown:
+                raise
+            if exc.code in ("CHANNEL_CLOSED", "CHANNEL_UNKNOWN"):
+                # 会話が終わった時に、hook が channel を閉じている。本文は入っていない。
+                reason = "通話を開いた会話が終わっていました"
+            elif (exc.code == "CHANNEL_DELIVERY_DUPLICATE"
+                  and (await claude_channel.delivery_state(channel, delivery_id))[0] == "withdrawn"):
+                # 前に入れて取り下げた返信（席へ渡せなかった時のやり直し）。もう一度は入れない。
+                reason = "会話が返信を取り出しませんでした"
+            else:
+                raise
+            # 席へ渡すのは、まだ確かめていない前の返信の扱いが決まってから（順番を保つ）。
+            if self.store.unconfirmed(session_id):
+                self.store.defer(session_id, seq)
+                return "wait"
+            return await self._hand_over(subscription, seq, [text], reason, report)
+        self.store.submitted(session_id, seq, confirmed=False)
+        await report(seq, "submitted", None, f"claude:{channel}")
+        return "next"
+
     async def _manual(self, subscription: dict[str, Any], message: dict[str, Any], text: str,
                       report: "_Reporter") -> str:
         """自分で取りに来る会話。待っても取りに来なければ、担当フォルダの席へ渡す。"""
@@ -635,11 +696,15 @@ class Watchers:
 
     async def _confirm_queued(self, session_id: str, report: "_Reporter") -> None:
         """キューへ入れた返信が動いたかを確かめる。動かないキューに残った返信は取り消して、席へ渡す。"""
-        waiting = [row for row in self.store.unconfirmed(session_id)
-                   if time.time() - (row["at"] or 0.0) >= _CONFIRM_AFTER_SECONDS]
+        subscription = self.store.subscription(session_id)
+        channel = subscription["delivery_mode"] == "channel"
+        after = _CHANNEL_CONFIRM_SECONDS if channel else _CONFIRM_AFTER_SECONDS
+        waiting = [row for row in self.store.unconfirmed(session_id) if time.time() - (row["at"] or 0.0) >= after]
         if not waiting or not self._due(session_id):
             return
-        subscription = self.store.subscription(session_id)
+        if channel:
+            await self._confirm_channel(subscription, waiting, report)
+            return
         if subscription["delivery_mode"] != "queue":
             # 付け替えが済んでいる。前の会話のキューは、もうこの通話の物ではない。
             for row in waiting:
@@ -703,6 +768,74 @@ class Watchers:
             await report(seq, "failed", str(exc), None)
 
 
+    async def _confirm_channel(self, subscription: dict[str, Any], waiting: list[dict[str, Any]],
+                               report: "_Reporter") -> None:
+        """Claude Code の会話へ入れた返信が、会話へ出たかを確かめる。誰も取り出さない返信は取り下げて、席へ渡す。"""
+        session_id, channel = subscription["session_id"], subscription["thread_id"]
+        seq = waiting[0]["seq"]
+        withdrawn: list[int] = []
+        reason = "通話を開いた会話が終わっていました"
+        try:
+            for row in waiting:
+                seq, delivery_id = row["seq"], row["delivery_id"]
+                try:
+                    state, alive = await claude_channel.delivery_state(channel, delivery_id)
+                except DeliveryError as exc:
+                    if exc.code != "CHANNEL_UNKNOWN":
+                        raise
+                    state, alive = None, False
+                if state == "emitted" or state is None:
+                    # None は、付け替える前の会話へ入れた返信。前の channel は、もうこの通話の物ではない。
+                    self.store.confirm(session_id, seq)
+                    if state:
+                        await report(seq, "started", None, f"claude:{channel}")
+                    continue
+                if state == "unknown":
+                    raise DeliveryError("CLAUDE_CHANNEL_DELIVERY_UNCONFIRMED", "会話へ出たかを確かめられません",
+                                        outcome_unknown=True)
+                if state == "queued":
+                    if not withdrawn and alive and time.time() - (row["at"] or 0.0) < _CHANNEL_BUSY_SECONDS:
+                        self._later(session_id)  # 番の途中。番の終わりに、会話の待ち受けが取り出す
+                        return
+                    if alive:
+                        reason = "会話が返信を取り出さないまま止まっています"
+                    if not await claude_channel.withdraw(channel, delivery_id):
+                        state = "sending"  # 見ている間に取り出された
+                if state == "sending":
+                    if withdrawn:
+                        break  # 取り下げた分を先に席へ渡す。残りは次に見た時に確かめる
+                    self._later(session_id)
+                    return
+                withdrawn.append(seq)  # queued を取り下げた、または前に取り下げてある（席へ渡せなかった時のやり直し）
+            if not withdrawn:
+                return
+            seq = withdrawn[0]
+            # 取り下げた返信は、まとめて1回で席へ渡す。1通ずつ渡すと、2通目より後が前の channel に残る。
+            texts = [reply_text(subscription, each, await fetch_body(session_id, each)) for each in withdrawn]
+            seat = await relaunch.hand_over(self.store, subscription, texts, reason)
+            for each in withdrawn:
+                self.store.confirm(session_id, each, "relaunched")
+                await report(each, "relaunched", reason, f"hosted:{seat}")
+        except DeliveryError as exc:
+            if exc.code == "RELAUNCH_BUSY":
+                return
+            log.error("channel reply for %s seq=%s could not be confirmed: %s", session_id, seq, exc)
+            if exc.outcome_unknown:
+                self.store.stop(session_id, "unknown", str(exc), seq)
+                await report(seq, "unknown", str(exc), None)
+                return
+            if not withdrawn:
+                # 状態を読めなかっただけ。何も動かしていないので、後でもう一度読む。
+                self.store.transport_error(session_id, str(exc))
+                self._later(session_id)
+                return
+            # 取り下げた後で、席へも入らなかった。次の返信が来た時に、取り下げた返信からもう一度渡す。
+            self.store.rewind(session_id, withdrawn[0], str(exc))
+            for each in withdrawn[1:]:
+                self.store.failed(session_id, each, str(exc))
+            await report(withdrawn[0], "failed", str(exc), None)
+
+
 class _Reporter:
     """端末の側が返信をどう扱ったかを、通話のサーバーへ知らせる。知らせの失敗では配送を止めない。"""
 
@@ -757,7 +890,7 @@ def _start_watch(session_id: str, claimed: int | None = None) -> None:
     subscription = store.subscription(session_id)
     mode = subscription["delivery_mode"]
     # exec の親へは、次のプロンプトの hook が渡す。自分で取りに来る会話の通話は、開いた会話と受け取り係だけが見る。
-    if mode in ("queue", "hosted") or (mode == "manual" and (claimed is not None or watchers.receiver)):
+    if mode in ("queue", "hosted", "channel") or (mode == "manual" and (claimed is not None or watchers.receiver)):
         watchers.start(session_id, claimed)
     elif claimed is not None:
         os.close(claimed)
@@ -776,7 +909,9 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 mcp = FastMCP("grokbot-bridge-local", instructions=(
     "call_open は、GrokBot または BellTeam の返信をこの端末で受け取ります。"
     "親が Codex の時は、返信を親のタスクへ自動で渡します。親は call_poll や待機ループを実行せず、作業を続けるかターンを終えてください。"
-    "親が Claude Code・Cursor・Grok の時は、自動では渡しません。call_open の結果の parent_delivery.state が manual なら、"
+    "親が Claude Code の時も、hook が入っていれば自動で渡します（call_open の結果の parent_delivery.state が watching）。"
+    "止まっている会話は返信で起き、作業中の会話にはその番へ入ります。call_poll や待機は要りません。"
+    "parent_delivery.state が manual の時（Cursor・Grok と、hook の無い Claude Code）は自動では渡しません。"
     "call_poll で取りに来てください。会話が終わった後に届いた返信は、同じフォルダの席（Aiterm）へ渡されます。"
     "通話を引き継いだ時は、call_history で前のやりとりを読めます。"
 ), lifespan=_lifespan)
@@ -813,6 +948,17 @@ def _parent_harness(ctx: Context) -> str:
     return harness
 
 
+async def _claude_channel(ctx: Context) -> dict[str, str] | str:
+    """道具を呼んだ Claude Code の会話に channel を開く。開けない時は理由を返す（会話が自分で取りに来る形にする）。"""
+    params = ctx.session.client_params
+    meta = ctx.request_context.meta
+    try:
+        return await claude_channel.open_channel(params.clientInfo.name if params is not None else None,
+                                                 dict(meta.model_extra or {}) if meta is not None else {})
+    except DeliveryError as exc:
+        return str(exc)
+
+
 async def _parent_folder(ctx: Context) -> str:
     """親が作業しているフォルダ。親が roots を答える時はその先頭、答えない時はこの MCP が起こされた場所。"""
     try:
@@ -833,8 +979,9 @@ async def call_directory(query: str | None = None) -> dict[str, Any]:
     return await _remote_tool("call_directory", {"query": query})
 
 
-@mcp.tool(description="GrokBot または BellTeam のメンバーとの通話を開く。親が Codex なら返信を自動で渡す。"
-                      "Claude Code・Cursor・Grok は call_poll で取りに来る（parent_delivery.state=manual）")
+@mcp.tool(description="GrokBot または BellTeam のメンバーとの通話を開く。親が Codex と、hook の入った Claude Code なら、"
+                      "返信を自動で渡す（parent_delivery.state が watching）。parent_delivery.state が manual の時"
+                      "（Cursor・Grok と、hook の無い Claude Code）は call_poll で取りに来る")
 async def call_open(local_id: str, local_label: str, member_name: str,
                     purpose: str | None = None,
                     member_system: Literal["grokbot", "bellteam"] = "grokbot",
@@ -855,13 +1002,23 @@ async def call_open(local_id: str, local_label: str, member_name: str,
         folder = await _parent_folder(ctx)
         result = await _remote_tool("call_open", arguments)
         session_id = _session_id(result)
+        channel = await _claude_channel(ctx) if harness == "claude-code" else None
+        if isinstance(channel, dict):
+            store.add(session_id, channel["channel_id"], Path(""), member_name, "channel", member_system, harness, folder)
+            _start_watch(session_id)
+            return {**result, "parent_delivery": {
+                "state": "watching", "harness": harness, "folder": folder, "conversation": channel["session_id"],
+                "note": "返信は、この会話へ自動で入ります。call_poll や待機は要りません。作業を続けるか、ターンを終えてください。"}}
         # 鍵を先に取ってから控えを作る。受け取り係は控えから通話を知るので、会話より先に鍵を取れない。
         claimed = _claim_session(session_id)
         store.add(session_id, "", Path(""), member_name, "manual", member_system, harness, folder)
         _start_watch(session_id, claimed)
-        return {**result, "parent_delivery": {
+        delivery = {
             "state": "manual", "harness": harness, "folder": folder,
-            "note": "返信は自動では届きません。call_poll で取りに来てください。この会話が終わった後に届いた返信は、同じフォルダの席へ渡されます。"}}
+            "note": "返信は自動では届きません。call_poll で取りに来てください。この会話が終わった後に届いた返信は、同じフォルダの席へ渡されます。"}
+        if channel is not None:
+            delivery["reason"] = channel
+        return {**result, "parent_delivery": delivery}
     thread_id, home = _parent(ctx)
     source = await verify_parent(thread_id, home)
     result = await _remote_tool("call_open", arguments)
@@ -893,19 +1050,29 @@ def _session_id(result: dict[str, Any]) -> str:
     return session_id
 
 
-@mcp.tool(description="この端末で開いた通話を、今の Codex のタスクへ付け替える。前の会話が止まった・引き継いだ時に、"
-                      "新しい会話が呼ぶ。以後の返信はこのタスクへ届く。通話の session_id は変わらない")
+@mcp.tool(description="この端末で開いた通話を、今の会話（Codex か、hook の入った Claude Code）へ付け替える。"
+                      "前の会話が止まった・引き継いだ時に、新しい会話が呼ぶ。以後の返信はこの会話へ届く。"
+                      "通話の session_id は変わらない")
 async def call_adopt(session_id: str, ctx: Context | None = None) -> dict[str, Any]:
     if ctx is None:
         raise DeliveryError("PARENT_UNAVAILABLE", "親タスクを確認できません")
-    thread_id, home = _parent(ctx)
     previous = store.subscription(session_id)
+    before = {"harness": previous["harness"], "conversation": previous["thread_id"],
+              "delivery_mode": previous["delivery_mode"], "state": previous["state"]}
+    if _parent_harness(ctx) == "claude-code":
+        channel = await _claude_channel(ctx)
+        if not isinstance(channel, dict):
+            raise DeliveryError("PARENT_UNSUPPORTED", f"この Claude Code の会話へは付け替えられません（{channel}）")
+        store.adopt_channel(session_id, channel["channel_id"], await _parent_folder(ctx))
+        _start_watch(session_id)
+        return {"session_id": session_id, "previous": before,
+                "parent_delivery": {"state": "watching", "harness": "claude-code", "conversation": channel["session_id"]}}
+    thread_id, home = _parent(ctx)
     if await verify_parent(thread_id, home) == "exec":
         raise DeliveryError("PARENT_UNSUPPORTED", "codex exec のタスクへは付け替えられません")
     store.adopt(session_id, thread_id, home, await _codex_folder(thread_id, home))
     _start_watch(session_id)
-    return {"session_id": session_id, "previous": {"harness": previous["harness"], "conversation": previous["thread_id"],
-                                                   "delivery_mode": previous["delivery_mode"], "state": previous["state"]},
+    return {"session_id": session_id, "previous": before,
             "parent_delivery": {"state": "watching", "thread_id": thread_id}}
 
 
