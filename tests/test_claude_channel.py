@@ -41,7 +41,11 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.withdraw = AsyncMock(return_value=True)
         self.close = AsyncMock()
         self.bodies = AsyncMock(side_effect=lambda _session, seq: f"返事{seq}")
+        self.owner = AsyncMock(return_value="conversation-1")
+        self.handoff = AsyncMock(return_value=None)
         for target, name, value in ((local.claude_channel, "send", self.send),
+                                    (local.claude_channel, "owner", self.owner),
+                                    (local.talk, "claude_handoff", self.handoff),
                                     (local.claude_channel, "delivery_state", self.state),
                                     (local.claude_channel, "withdraw", self.withdraw),
                                     (local.claude_channel, "close", self.close),
@@ -80,6 +84,54 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
                          [(2, "submitted", f"claude:{CHANNEL}"), (2, "started", f"claude:{CHANNEL}")])
         self.assertEqual(self.terminal.launched, [])
         self.close.assert_awaited_once_with(CHANNEL)  # 通話が終わったら、会話の待ち受けを残さない
+
+    async def test_reply_is_not_put_into_a_conversation_throughline_has_handed_off(self):
+        """引き継がれて止まった会話は、道具を使えない。そこへ入れると、文で答えるだけで何も進まない。"""
+        session_id = self._call()
+        events: list[str] = []
+        retired = {"state": "unknown", "successor_session_id": None, "successor_short_id": "e50377e1"}
+        answers = iter([retired, retired])  # 2回は止まった会話のまま。その後、後継が通話を使って届け先が替わる
+
+        def handoff(_session):
+            answer = next(answers, None)
+            events.append("retired" if answer else "working")
+            return answer
+
+        self.handoff.side_effect = handoff
+        self.send.side_effect = lambda *_args: events.append("send")
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge)
+        self.owner.assert_awaited_with(CHANNEL)
+        self.handoff.assert_awaited_with("conversation-1")
+        self.assertEqual(events, ["retired", "retired", "working", "send"])  # 止まっている間は、1回も入れない
+        self.assertEqual(self.terminal.launched, [])
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "submitted"), (2, "started")])
+
+    async def test_successor_that_never_uses_the_call_leaves_the_reply_to_the_folder_seat(self):
+        session_id = self._call()
+        self.handoff.return_value = {"state": "sent", "successor_session_id": "2baa9325-b638-428a-8b5c-2d676000e35b"}
+        with patch.object(local, "_CHANNEL_BUSY_SECONDS", 0.0):
+            bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+            await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual((self.send.await_count, len(self.terminal.launched)), (0, 1))
+        self.assertIn("返事", self.terminal.launched[0][3])
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])
+        self.assertIn("後継 2baa9325", bridge.receipts[0]["detail"])
+
+    async def test_conversation_that_still_works_gets_the_reply(self):
+        for record in (None, {"state": "requested"}, {"state": "failed"}):  # 記録なし・予約だけ・後継が立たなかった
+            with self.subTest(record=record):
+                session_id = self._call()
+                self.send.reset_mock()
+                self.handoff.return_value = record
+                await self._watch(session_id, Bridge([{"seq": 2, "message": "返事"}], status="hungup"))
+                self.assertEqual(self.send.await_count, 1)
+
+    async def test_owner_that_cannot_be_read_does_not_hold_the_reply(self):
+        session_id = self._call()
+        self.owner.side_effect = DeliveryError("CHANNEL_UNKNOWN", "受け口の記録がありません")
+        await self._watch(session_id, Bridge([{"seq": 2, "message": "返事"}], status="hungup"))
+        self.assertEqual((self.send.await_count, self.handoff.await_count), (1, 0))
 
     async def test_reply_the_conversation_already_fetched_is_not_put_in_again(self):
         session_id = self._call()
@@ -621,6 +673,7 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
         opened = await claude_channel.open_wait("grok-cli")
         info = await claude_channel.wait_info(opened["channel_id"])
         self.assertEqual((info["closed"], info["kind"], info["wait"]), (False, "background", opened["wait"]))
+        self.assertIsNone(await claude_channel.owner(opened["channel_id"]))  # Claude Code の会話の受け口ではない
         waiter = subprocess.Popen(["sh", "-c", opened["wait"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         self.addCleanup(lambda: (waiter.poll() is None and waiter.kill(), waiter.wait(), waiter.stdout.close(), waiter.stderr.close()))
         await asyncio.sleep(1.0)
@@ -643,6 +696,7 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
         opened = await claude_channel.open_channel("claude-code", {"claudecode/toolUseId": self.tool})
         self.assertEqual(opened["session_id"], self.session)
         channel = opened["channel_id"]
+        self.assertEqual(await claude_channel.owner(channel), self.session)  # 受け口を開いた会話（引き継ぎを Throughline へ尋ねる時に使う）
 
         waiter = self._hook({"hook_event_name": "PostToolUse", "tool_use_id": self.tool,
                              "tool_name": "mcp__call-bridge__call_open"})

@@ -663,6 +663,17 @@ class Watchers:
             self.store.submitted(session_id, seq, "fetched")
             await report(seq, "fetched", None, None)
             return "next"
+        successor = await self._retired(subscription)
+        if successor:
+            # Throughline に引き継がれて止まった会話。ここへ入れると、道具を使えない会話が起きて文で答えるだけになり、
+            # 送った側には「届いた」と見えたまま何も進まない（2026-10-11 に fox で続いた）。入れずに、後継が通話を使うのを待つ
+            # （使えば届け先が後継へ付き、この返信もそこへ渡る）。待っても使わなければ、担当フォルダの席へ渡す。
+            if time.time() - self.store.reserved_at(session_id, seq) < _CHANNEL_BUSY_SECONDS:
+                self.store.defer(session_id, seq)
+                return self._later(session_id)
+            return await self._hand_over(
+                subscription, seq, [text],
+                f"会話は Throughline に引き継がれました（後継 {successor[:8]}）。後継が通話を使いませんでした", report)
         try:
             await claude_channel.send(channel, delivery_id, text)
         except DeliveryError as exc:
@@ -690,6 +701,18 @@ class Watchers:
         self.store.submitted(session_id, seq, confirmed=False)
         await report(seq, "submitted", None, f"{_channel_label(subscription)}:{channel}")
         return "next"
+
+    async def _retired(self, subscription: dict[str, Any]) -> str | None:
+        """受け口の会話が Throughline に引き継がれて止まっていれば、後継の番号。分からない時は None（今までどおり渡す）。"""
+        if subscription["harness"] != "claude-code":
+            return None
+        try:
+            session = await claude_channel.owner(subscription["thread_id"])
+        except DeliveryError:
+            return None
+        if not session:
+            return None
+        return talk.claude_retired(await talk.claude_handoff(session))
 
     async def _manual(self, subscription: dict[str, Any], message: dict[str, Any], text: str,
                       report: "_Reporter") -> str:

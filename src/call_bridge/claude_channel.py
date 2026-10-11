@@ -165,6 +165,12 @@ async def own(client_name: str | None, meta: dict[str, Any], channel_id: str | N
     return await run(args + (["--channel", channel_id] if channel_id else []))
 
 
+async def owner(channel_id: str) -> str | None:
+    """受け口を開いた Claude Code の会話（session id）。Cursor・Grok の受け口は None。"""
+    session = (await run(["owner", "--channel", channel_id])).get("session")
+    return session if isinstance(session, str) and session else None
+
+
 async def send(channel_id: str, delivery_id: str, text: str) -> None:
     await run(["send", "--channel", channel_id, "--delivery", delivery_id], text=text, sends=True)
 

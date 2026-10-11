@@ -6,6 +6,7 @@
 //   open-wait --client <name>                          → channel_id, kind（cursor|background）, wait（待ち受けの命令の1行）
 //   wait     --channel <uuid>                          → wait, closed, kind
 //   own      --client <name> --meta <json> [--channel <uuid>] → session_id（道具を呼んだ会話）, channel_open, channel_session
+//   owner    --channel <uuid>                          → session（受け口を開いた Claude Code の会話。ほかの受け口は null）, kind, closed
 //   send     --channel <uuid> --delivery <uuid>       → state（本文は stdin）
 //   state    --channel <uuid> --delivery <uuid>       → state（queued|sending|emitted|unknown|withdrawn|null）, closed,
 //                                                       parent_alive・transcript_age（queued の時だけ。会話が生きているか）
@@ -102,6 +103,13 @@ async function run(argv) {
                 } catch { /* 受け口の記録が無い。閉じている物として扱う */ }
             }
             return { session_id: parent.session_id, channel_open: open, channel_session: session };
+        }
+        case "owner": {
+            // 受け口を開いた会話を答える。受け口は作らない・変えない。
+            const id = required(args, "--channel");
+            const channel = steer.readChannel(profile, id);
+            return { channel_id: id, kind: channel.kind ?? null, session: channel.claude?.session_id ?? null,
+                     closed: steer.channelClosed(profile, id) };
         }
         case "send":
             return await steer.sendToChannel(profile, required(args, "--channel"), required(args, "--delivery"), await readStdin());
