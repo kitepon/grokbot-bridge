@@ -119,7 +119,7 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("後継 2baa9325", bridge.receipts[0]["detail"])
 
     async def test_conversation_that_still_works_gets_the_reply(self):
-        for record in (None, {"state": "requested"}, {"state": "failed"}):  # 記録なし・予約だけ・後継が立たなかった
+        for record in (None, {"state": "requested"}, {"state": "failed"}):  # 記録なし・予約だけ・次の道具で立て直す
             with self.subTest(record=record):
                 session_id = self._call()
                 self.send.reset_mock()
@@ -634,6 +634,63 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
         document = json.loads(self.settings.read_text(encoding="utf-8"))
         self.assertEqual(document["hooks"]["Stop"], [{"hooks": [{"type": "command", "command": "echo other"}]}])
         self.assertNotIn(claude_channel.HOOK, json.dumps(document))
+
+    async def test_prompt_hook_is_added_and_removed_without_touching_other_prompt_hooks(self):
+        other = {"hooks": [{"type": "command", "command": "echo throughline"}]}
+        self.settings.write_text(json.dumps({"hooks": {"UserPromptSubmit": [other]}}), encoding="utf-8")
+        self.assertEqual(claude_channel.hooks("status")["prompt_registered"], False)
+        self.assertEqual(claude_channel.hooks("enable")["prompt"], "configured")
+        self.assertEqual(claude_channel.hooks("enable")["prompt"], "unchanged")
+        groups = json.loads(self.settings.read_text(encoding="utf-8"))["hooks"]["UserPromptSubmit"]
+        self.assertEqual(groups[0], other)  # ほかの製品の hook は、並びごとそのまま
+        self.assertEqual(len(groups), 2)
+        self.assertIn(claude_channel.PROMPT_HOOK, groups[1]["hooks"][0]["command"])
+        self.assertEqual(claude_channel.hooks("status")["prompt_registered"], True)
+        self.assertEqual(claude_channel.hooks("disable")["prompt"], "configured")
+        document = json.loads(self.settings.read_text(encoding="utf-8"))
+        self.assertEqual(document["hooks"]["UserPromptSubmit"], [other])
+        self.assertNotIn(claude_channel.PROMPT_HOOK, json.dumps(document))
+
+    def _prompt_hook(self, prompt: str, handoffs: list[dict]) -> subprocess.CompletedProcess:
+        """後継の会話の UserPromptSubmit の hook を、Claude Code の代わりに起こす。Throughline の答えだけ、決めた物にする。"""
+        stub = Path(self.temp.name) / "throughline-stub"
+        stub.write_text("#!/bin/sh\ncat <<'JSON'\n" + json.dumps({"handoffs": handoffs}) + "\nJSON\n", encoding="utf-8")
+        stub.chmod(0o755)
+        document = json.loads(self.settings.read_text(encoding="utf-8"))
+        command = next(entry["command"] for group in document["hooks"]["UserPromptSubmit"] for entry in group["hooks"]
+                       if claude_channel.PROMPT_HOOK in entry["command"])
+        return subprocess.run(["sh", "-c", command], capture_output=True, text=True, timeout=60,
+                              input=json.dumps({"hook_event_name": "UserPromptSubmit", "session_id": "successor", "prompt": prompt}),
+                              env={**os.environ, "CALL_BRIDGE_THROUGHLINE": str(stub)})
+
+    async def test_successor_is_told_which_calls_its_predecessor_held(self):
+        claude_channel.hooks("enable")
+        # 前の会話（self.session）が通話の道具を呼んで、受け口を開いた。その受け口へ届けている通話が1本ある。
+        self.assertEqual(self._hook({"hook_event_name": "PreToolUse", "tool_use_id": self.tool,
+                                     "tool_name": "mcp__call-bridge__call_open"}).wait(30), 0)
+        opened = await claude_channel.open_channel("claude-code", {"claudecode/toolUseId": self.tool})
+        store = local.LocalStore(Path(os.environ["CALL_BRIDGE_STATE"]))
+        mine, others = str(uuid.uuid4()), str(uuid.uuid4())
+        store.add(mine, opened["channel_id"], Path(""), "リリーバイス", "channel", "bellteam", "claude-code", self.temp.name)
+        store.add(others, str(uuid.uuid4()), Path(""), "エレグ", "channel", "bellteam", "claude-code", self.temp.name)  # 別の会話の通話
+        handoff = str(uuid.uuid4())
+        record = {"handoff_id": handoff, "source_session_id": self.session, "state": "launching"}
+
+        done = self._prompt_hook(f"Throughline自動継続 {handoff}\n\n注入された記憶と元のユーザー依頼に従い、未完了の作業を継続してください。", [record])
+        self.assertEqual((done.returncode, done.stderr), (0, ""))
+        output = json.loads(done.stdout)["hookSpecificOutput"]
+        self.assertEqual(output["hookEventName"], "UserPromptSubmit")
+        self.assertIn(f"session_id={mine} 相手=リリーバイス", output["additionalContext"])
+        self.assertIn("call_adopt", output["additionalContext"])
+        self.assertNotIn(others, output["additionalContext"])  # ほかの会話の通話は、知らせない
+
+        # 前の会話が通話を持っていない引き継ぎ・ふつうの文・記録の無い引き継ぎでは、何も出さない。文も止めない。
+        nothing = {"handoff_id": handoff, "source_session_id": str(uuid.uuid4()), "state": "launching"}
+        for prompt, handoffs in ((f"Throughline自動継続 {handoff}", [nothing]), ("おはよう。続きをやって", [record]),
+                                 (f"Throughline自動継続 {handoff}", []), ("Throughline自動継続 について教えて", [record])):
+            with self.subTest(prompt=prompt, handoffs=len(handoffs)):
+                done = self._prompt_hook(prompt, handoffs)
+                self.assertEqual((done.returncode, done.stdout), (0, ""))
 
     async def test_cursor_gets_the_reply_at_its_next_tool_return_and_grok_through_the_wait_command(self):
         hooks_file = Path(self.temp.name) / "cursor" / "hooks.json"

@@ -7,12 +7,13 @@
 //   wait     --channel <uuid>                          → wait, closed, kind
 //   own      --client <name> --meta <json> [--channel <uuid>] → session_id（道具を呼んだ会話）, channel_open, channel_session
 //   owner    --channel <uuid>                          → session（受け口を開いた Claude Code の会話。ほかの受け口は null）, kind, closed
+//   owners   --channels <uuid,uuid,...>                → owners（受け口ごとの、開いた Claude Code の会話。読めない受け口は null）
 //   send     --channel <uuid> --delivery <uuid>       → state（本文は stdin）
 //   state    --channel <uuid> --delivery <uuid>       → state（queued|sending|emitted|unknown|withdrawn|null）, closed,
 //                                                       parent_alive・transcript_age（queued の時だけ。会話が生きているか）
 //   withdraw --channel <uuid> --delivery <uuid>       → withdrawn（真なら、会話へは出ていない）
 //   close    --channel <uuid>
-//   setup    <enable|disable|status> --settings <file>          （Claude Code の hook）
+//   setup    <enable|disable|status> --settings <file>          （Claude Code の hook。配送の hook と、後継へ通話を知らせる hook）
 //   cursor-setup <enable|disable|status> [--hooks <file>]      （Cursor の hook）
 //
 // 失敗は {ok:false, code, message, outcome_unknown} を返し、exit 1。
@@ -53,6 +54,62 @@ function transcriptAge(sessionId) {
 
 function hookRuntime(steer, profile, name = profile.hooks.claude) {
     return { command: steer.setupNodeExecutable(), script: path.join(here, name) };
+}
+
+// Throughline が立てた後継の会話へ、前の会話が持っていた通話を知らせる hook（UserPromptSubmit）。
+// 配送のパッケージが登録する hook とは入口の名前が違うので、パッケージの登録・解除はこれに触らない。ここで足し引きする。
+const PROMPT_HOOK = "call-bridge-claude-prompt.mjs";
+const isRecord = (value) => typeof value === "object" && value !== null && !Array.isArray(value);
+const isPromptHook = (entry) => isRecord(entry) && typeof entry.command === "string"
+    && (entry.command.includes(`/${PROMPT_HOOK}'`) || entry.command.includes(`\\${PROMPT_HOOK}'`));
+
+function promptHookEntry(steer, profile) {
+    return { type: "command", ...steer.claudeParentHookCommand(hookRuntime(steer, profile, PROMPT_HOOK)), timeout: 30 };
+}
+
+function readSettings(file) {
+    if (!fs.existsSync(file)) return {};
+    const document = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (!isRecord(document) || (document.hooks !== undefined && !isRecord(document.hooks))) {
+        throw Object.assign(new Error("Claude の hook の設定を読めません"), { delivery_code: "config_invalid" });
+    }
+    return document;
+}
+
+function promptHookRegistered(document) {
+    const groups = isRecord(document.hooks) ? document.hooks.UserPromptSubmit : undefined;
+    return Array.isArray(groups) && groups.some(group => isRecord(group) && Array.isArray(group.hooks) && group.hooks.some(isPromptHook));
+}
+
+/** ほかの製品の UserPromptSubmit の hook と並びはそのまま保ち、この製品の1つだけを足す・外す。 */
+function writePromptHook(file, entry) {
+    const target = fs.existsSync(file) ? fs.realpathSync(file) : file;
+    const current = readSettings(target);
+    const previous = current.hooks?.UserPromptSubmit ?? [];
+    if (!Array.isArray(previous) || previous.some(group => !isRecord(group) || !Array.isArray(group.hooks))) {
+        throw Object.assign(new Error("Claude の UserPromptSubmit の hook の形を読めません"), { delivery_code: "config_invalid" });
+    }
+    const owned = previous.flatMap(group => group.hooks.filter(isPromptHook));
+    if (entry !== null && owned.length === 1 && JSON.stringify(owned[0]) === JSON.stringify(entry)) return "unchanged";
+    if (entry === null && owned.length === 0) return "unchanged";
+    const retained = previous.map(group => ({ ...group, hooks: group.hooks.filter(hook => !isPromptHook(hook)) }))
+        .filter(group => group.hooks.length > 0);
+    const groups = entry === null ? retained : [...retained, { hooks: [entry] }];
+    const hooks = { ...(current.hooks ?? {}) };
+    if (groups.length > 0) hooks.UserPromptSubmit = groups; else delete hooks.UserPromptSubmit;
+    const next = { ...current, hooks };
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    const temporary = `${target}.call-bridge-prompt-${process.pid}`;
+    try {
+        fs.writeFileSync(temporary, `${JSON.stringify(next, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+        fs.renameSync(temporary, target);
+    } finally {
+        if (fs.existsSync(temporary)) fs.unlinkSync(temporary);
+    }
+    if (JSON.stringify(JSON.parse(fs.readFileSync(target, "utf8"))) !== JSON.stringify(next)) {
+        throw Object.assign(new Error("Claude の hook の登録の読み戻しが一致しません"), { delivery_code: "config_readback_failed" });
+    }
+    return "configured";
 }
 
 /** Cursor と Grok の会話が、返信を待つ時に背景で動かす命令（その端末の shell に書ける1行）。 */
@@ -111,6 +168,14 @@ async function run(argv) {
             return { channel_id: id, kind: channel.kind ?? null, session: channel.claude?.session_id ?? null,
                      closed: steer.channelClosed(profile, id) };
         }
+        case "owners": {
+            // 受け口ごとの、開いた会話。後継へ「前の会話が持っていた通話」を知らせる時に、1回で引く。
+            const owners = {};
+            for (const id of required(args, "--channels").split(",").filter(Boolean)) {
+                try { owners[id] = steer.readChannel(profile, id).claude?.session_id ?? null; } catch { owners[id] = null; }
+            }
+            return { owners };
+        }
         case "send":
             return await steer.sendToChannel(profile, required(args, "--channel"), required(args, "--delivery"), await readStdin());
         case "state": {
@@ -133,13 +198,20 @@ async function run(argv) {
             return {};
         case "setup": {
             const file = required(args, "--settings");
-            if (args[0] === "enable") return { result: steer.mergeClaudeParentHooks(profile, file, hookRuntime(steer, profile)) };
-            if (args[0] === "disable") return { result: steer.removeClaudeParentHooks(profile, file) };
+            if (args[0] === "enable") {
+                const result = steer.mergeClaudeParentHooks(profile, file, hookRuntime(steer, profile));
+                return { result, prompt: writePromptHook(file, promptHookEntry(steer, profile)) };
+            }
+            if (args[0] === "disable") {
+                const result = steer.removeClaudeParentHooks(profile, file);
+                return { result, prompt: fs.existsSync(file) ? writePromptHook(file, null) : "unchanged" };
+            }
             if (args[0] !== "status") throw Object.assign(new Error("enable・disable・status のどれかです"), { delivery_code: "CLI_USAGE" });
             const document = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
             const scripts = steer.claudeParentHookScripts(profile, document);
             return { registered: steer.claudeParentHooksRegistered(profile, document),
-                     scripts, missing: scripts.filter(script => !fs.existsSync(script)) };
+                     scripts, missing: scripts.filter(script => !fs.existsSync(script)),
+                     prompt_registered: promptHookRegistered(isRecord(document) ? document : {}) };
         }
         case "cursor-setup": {
             const file = option(args, "--hooks") ?? steer.cursorHooksFile();

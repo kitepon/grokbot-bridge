@@ -15,6 +15,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -24,6 +25,8 @@ from .codex_delivery import (DeliveryError, _bridge_config, _steer_result, curre
 HOOK = "call-bridge-claude-hook.mjs"
 CURSOR_HOOK = "call-bridge-cursor-hook.mjs"
 RECEIVE = "call-bridge-channel-receive.mjs"
+# Throughline が立てた後継の会話へ、前の会話が持っていた通話を知らせる hook（UserPromptSubmit）の入口。
+PROMPT_HOOK = "call-bridge-claude-prompt.mjs"
 CLI = "call-bridge-channel.mjs"
 # hook が会話を見分ける道具。通話を開く・引き取る時と、通話を使う時（送る・取りに行く）。
 # 通話を使った会話へ、返信の届け先を合わせる為（local.py の _follow_speaker）。
@@ -79,10 +82,18 @@ def install(mcp_server: str) -> dict[str, str]:
     profile = {**steer_profile(mcp_server), "dispatch_tools": DISPATCH_TOOLS}
     profile["hooks"] = {**profile["hooks"], "claude": HOOK, "cursor": CURSOR_HOOK}
     temporary = target / "steer.json.tmp"
-    temporary.write_text(json.dumps({"library": str(library), "node": os.path.abspath(node), "profile": profile},
-                                    ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    temporary.write_text(json.dumps({"library": str(library), "node": os.path.abspath(node), "python": _python(),
+                                     "profile": profile}, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, target / "steer.json")
     return {"library": str(library), "version": ".".join(map(str, version))}
+
+
+def _python() -> str:
+    """hook から call_bridge を呼ぶ時の Python。Windows の常駐は窓を出さない pythonw で動くので、隣の python を控える。"""
+    current = Path(sys.executable)
+    if os.name == "nt" and current.name.lower() == "pythonw.exe" and current.with_name("python.exe").is_file():
+        return str(current.with_name("python.exe"))
+    return str(current)
 
 
 def _command() -> list[str]:
@@ -169,6 +180,15 @@ async def owner(channel_id: str) -> str | None:
     """受け口を開いた Claude Code の会話（session id）。Cursor・Grok の受け口は None。"""
     session = (await run(["owner", "--channel", channel_id])).get("session")
     return session if isinstance(session, str) and session else None
+
+
+async def owners(channel_ids: list[str]) -> dict[str, str | None]:
+    """受け口ごとの、開いた Claude Code の会話。読めない受け口・Claude Code の物でない受け口は None。"""
+    if not channel_ids:
+        return {}
+    value = (await run(["owners", "--channels", ",".join(channel_ids)])).get("owners")
+    return {key: (found if isinstance(found, str) and found else None)
+            for key, found in value.items()} if isinstance(value, dict) else {}
 
 
 async def send(channel_id: str, delivery_id: str, text: str) -> None:
