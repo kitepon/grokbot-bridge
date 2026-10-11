@@ -12,7 +12,11 @@ import { fileURLToPath } from "node:url";
 const PREFIX = /^\s*Throughline自動継続\s+([0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12})(?![0-9a-f-])/u;
 
 try {
-    const event = JSON.parse(fs.readFileSync(0, "utf8"));
+    // 入力は流れとして読む。Windows では、管の 0 番を一度に読む呼び出しが「終わり」を誤りとして返す事がある。
+    let raw = "";
+    process.stdin.setEncoding("utf8");
+    for await (const chunk of process.stdin) raw += chunk;
+    const event = JSON.parse(raw);
     const match = typeof event?.prompt === "string" ? PREFIX.exec(event.prompt) : null;
     if (match) {
         const here = path.dirname(fileURLToPath(import.meta.url));
