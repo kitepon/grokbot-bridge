@@ -35,6 +35,8 @@ _DIRECT_LINE_LIMIT = 16 * 1024 * 1024
 # Claude Code の席を立てる時に渡すモデルと思考の強さ。渡さないと、その端末の ~/.claude/settings.json の既定で立つ
 # （2026-10-11 に Mac で、止まった会話の役を引き継ぐ席が sonnet・low で立ち、そのまま仕事を任されていた）。
 # 端末ごとに変える時は、config.json の claude_seat_model／claude_seat_effort に書く。
+# pty_list の席ごとの答えのうち、席の会話の番号が入る項目。
+CONVERSATION_FIELD = "agent_session_id"
 CLAUDE_SEAT_MODEL = "claude-opus-5-5"
 CLAUDE_SEAT_EFFORT = "high"
 
@@ -114,6 +116,18 @@ class Aiterm:
             raise AitermError("AITERM_LIST_FAILED", _text(result) or "席の一覧を読めません", sent=False)
         return {row["session_id"]: row.get("harness") for row in rows
                 if isinstance(row, dict) and isinstance(row.get("session_id"), str)}
+
+    async def conversation(self, session_id: str) -> str | None:
+        """席の中で動いている会話の番号（Claude Code の session id）。Aiterm が返さない版・席でない端末は None。"""
+        result = await self._call("pty_list", {})
+        rows = result.structuredContent.get("sessions") if isinstance(result.structuredContent, dict) else None
+        if result.isError or not isinstance(rows, list):
+            return None
+        for row in rows:
+            if isinstance(row, dict) and row.get("session_id") == session_id:
+                value = row.get(CONVERSATION_FIELD)
+                return value if isinstance(value, str) and value else None
+        return None
 
     async def launch(self, harness: str, cwd: str, session_name: str, prompt: str,
                      preface: str = PREFACE) -> tuple[str, bool]:

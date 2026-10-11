@@ -655,13 +655,18 @@ class Watchers:
     async def _hosted(self, subscription: dict[str, Any], seq: int, text: str, report: "_Reporter") -> str:
         """担当フォルダの席へ送る。席が動いていなければ、同じ名前で立て直す。"""
         seat = subscription["thread_id"]
+        reason = "席が動いていませんでした"
         async with aiterm.connect() as terminal:
             if seat in await terminal.sessions():
-                await terminal.send(seat, text, preface=aiterm.seat_preface(subscription["harness"]))
-                self.store.submitted(subscription["session_id"], seq)
-                await report(seq, "submitted", None, f"hosted:{seat}")
-                return "next"
-        return await self._hand_over(subscription, seq, [text], "席が動いていませんでした", report)
+                successor = await relaunch.seat_handed_off(terminal, seat, subscription["harness"])
+                if not successor:
+                    await terminal.send(seat, text, preface=aiterm.seat_preface(subscription["harness"]))
+                    self.store.submitted(subscription["session_id"], seq)
+                    await report(seq, "submitted", None, f"hosted:{seat}")
+                    return "next"
+                # 席の中身は、引き継がれた後の会話。入れても何も出来ないので、席を立て直して渡す（hand_over が閉じて立てる）。
+                reason = f"席の会話は Throughline に引き継がれていました（後継 {successor[:8]}）"
+        return await self._hand_over(subscription, seq, [text], reason, report)
 
     async def _channel(self, subscription: dict[str, Any], message: dict[str, Any], delivery_id: str, text: str,
                        report: "_Reporter") -> str:

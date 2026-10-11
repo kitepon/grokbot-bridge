@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, AsyncContextManager, Callable, Iterator
 
 from . import aiterm
+from . import conversation as talk
 from .codex_delivery import DeliveryError, state_root
 
 def seat_name(harness: str, cwd: str) -> str:
@@ -42,6 +43,21 @@ def first_prompt(calls: list[dict[str, Any]], texts: list[str], reason: str) -> 
         *texts,
     ]
     return "\n".join(lines)
+
+
+async def seat_handed_off(terminal: Any, name: str, harness: str) -> str | None:
+    """席の中身の会話が Throughline に引き継がれた後なら、後継の番号。そうでない・分からない時は None。
+
+    引き継がれた後の会話は、Throughline が道具を全部断る。席は一覧に居て、文も入るが、読む事も返す事も出来ない
+    （2026-10-12 に fox で、Windows のベルあての返信が3通、そういう席へ入ったまま返事が出なかった）。
+    後継は裏の会話で、席の端末には居ない。席の会話の番号は Aiterm の pty_list から読む。返さない版では None（今までどおり渡す）。
+    """
+    if harness != "claude-code":
+        return None
+    conversation = await terminal.conversation(name)
+    if not conversation:
+        return None
+    return talk.claude_retired(await talk.claude_handoff(conversation))
 
 
 @contextmanager
@@ -85,9 +101,13 @@ async def hand_over(store: Any, subscription: dict[str, Any], texts: list[str], 
         try:
             async with connect() as terminal:
                 seats = await terminal.sessions()
+                if name in seats and seats[name] != aiterm.HARNESSES[harness]:
+                    raise DeliveryError("RELAUNCH_NAME_TAKEN", f"{name} は別の端末が使っています")
+                if name in seats and await seat_handed_off(terminal, name, harness):
+                    # 席は動いているが、中身は引き継がれた後の会話。閉じて、同じ名前で新しい席を立てる。
+                    await terminal.close(name)
+                    del seats[name]
                 if name in seats:
-                    if seats[name] != aiterm.HARNESSES[harness]:
-                        raise DeliveryError("RELAUNCH_NAME_TAKEN", f"{name} は別の端末が使っています")
                     await terminal.send(name, text, preface=preface)
                 else:
                     seat, delivered = await terminal.launch(harness, cwd, name, text)
