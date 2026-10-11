@@ -16,12 +16,13 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from call_bridge import claude_channel, harness_setup, local, relaunch
+from call_bridge import claude_bg, claude_channel, harness_setup, local, relaunch
 from call_bridge.codex_delivery import DeliveryError
 
 from test_stopped_conversation import Bridge, FakeTerminal
 
 CHANNEL = "11111111-1111-4111-8111-111111111111"
+ADOPTED = "22222222-2222-4222-8222-222222222222"  # 起こした会話が、通話を引き取って開いた受け口
 
 
 class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
@@ -43,7 +44,11 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.bodies = AsyncMock(side_effect=lambda _session, seq: f"返事{seq}")
         self.owner = AsyncMock(return_value="conversation-1")
         self.handoff = AsyncMock(return_value=None)
+        self.background = AsyncMock(return_value=None)  # 裏の会話ではない（今までどおり席へ渡す）
+        self.wake = AsyncMock(return_value="conversa")
         for target, name, value in ((local.claude_channel, "send", self.send),
+                                    (local.claude_bg, "background", self.background),
+                                    (local.claude_bg, "wake", self.wake),
                                     (local.claude_channel, "owner", self.owner),
                                     (local.talk, "claude_handoff", self.handoff),
                                     (local.claude_channel, "delivery_state", self.state),
@@ -151,6 +156,132 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("返事", prompt)
         self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])
         self.assertEqual(self.store.subscription(session_id)["delivery_mode"], "hosted")
+
+    def _stopped_background(self) -> dict:
+        """受け口の会話は、Claude Code に止められた裏の会話。起こすと動き出す。"""
+        seen = {"running": False, "state": "done"}
+
+        async def background(conversation):
+            return claude_bg.Background(conversation, str(self.folder), seen["running"], seen["state"])
+
+        async def wake(_found, _calls):
+            seen["running"] = True
+            return "conversa"
+
+        def send(channel, _delivery, _text):
+            if channel == CHANNEL:
+                raise DeliveryError("CHANNEL_CLOSED", "channelは閉じています。本文は送っていません")
+
+        self.background.side_effect, self.wake.side_effect, self.send.side_effect = background, wake, send
+        return seen
+
+    def _adopt_after(self, bridge: Bridge, session_id: str, polls: int) -> None:
+        """起きた会話が call_adopt を呼んで、通話を自分の新しい受け口へ付け替える。"""
+        count = {"n": 0}
+
+        def poll():
+            count["n"] += 1
+            if count["n"] == polls:
+                self.store.adopt_channel(session_id, ADOPTED, None)
+
+        bridge.on_poll = poll
+
+    async def test_conversation_claude_code_stopped_is_woken_and_gets_the_reply_after_it_takes_the_call(self):
+        """役と記憶は会話にある。席（別の会話）へ渡さず、同じ会話を起こして、引き取った後に渡す。"""
+        session_id = self._call()
+        self._stopped_background()
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        self._adopt_after(bridge, session_id, 4)
+        await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual(self.wake.await_count, 1)  # 起きている間は、もう一度は起こさない（写しが出来る）
+        found, calls = self.wake.await_args.args
+        self.assertEqual((found.session_id, found.cwd, calls), ("conversation-1", str(self.folder), [session_id]))
+        self.assertEqual(self.terminal.launched, [])
+        self.assertEqual({call.args[0] for call in self.send.await_args_list}, {CHANNEL, ADOPTED})
+        self.assertIn("返事", self.send.await_args.args[2])
+        self.assertEqual([(r["seq"], r["state"], r["conversation"]) for r in bridge.receipts],
+                         [(2, "submitted", f"claude:{ADOPTED}"), (2, "started", f"claude:{ADOPTED}")])
+        self.assertEqual([(row["target"], row["state"]) for row in reversed(self.store.relaunches())],
+                         [("claude-bg:conversation-1", "starting"), ("claude-bg:conversation-1", "started")])
+
+    async def test_every_call_of_the_stopped_conversation_is_named_and_it_is_woken_once(self):
+        first, second = self._call(), self._call()
+        self._stopped_background()
+        bridges = [Bridge([{"seq": 2, "message": "返事"}], status="hungup") for _ in range(2)]
+        self._adopt_after(bridges[0], first, 4)
+        self._adopt_after(bridges[1], second, 4)
+        await asyncio.gather(self._watch(first, bridges[0], receiver=True), self._watch(second, bridges[1], receiver=True))
+        self.assertEqual(self.wake.await_count, 1)
+        self.assertEqual(self.wake.await_args.args[1], sorted([first, second]))
+        self.assertEqual(self.terminal.launched, [])
+
+    async def test_woken_conversation_that_never_takes_the_call_leaves_the_reply_to_the_folder_seat(self):
+        session_id = self._call()
+        self._stopped_background()
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        with patch.object(local, "_CHANNEL_BUSY_SECONDS", 0.0):
+            await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual((self.wake.await_count, len(self.terminal.launched)), (1, 1))
+        self.assertIn("返事", self.terminal.launched[0][3])
+        self.assertEqual([(r["seq"], r["state"], r["detail"]) for r in bridge.receipts],
+                         [(2, "relaunched", "起こした会話が通話を引き取りませんでした")])
+
+    async def test_conversation_open_somewhere_else_is_not_woken(self):
+        """動いている会話に起こす命令を出すと、Claude Code は写しを立てる。受け口だけが閉じている時は、席へ渡す。"""
+        session_id = self._call()
+        self._stopped_background()["running"] = True
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual((self.wake.await_count, len(self.terminal.launched)), (0, 1))
+        self.assertEqual(bridge.receipts[-1]["detail"], "通話を開いた会話が終わっていました")
+
+    async def test_conversation_a_person_stopped_in_the_middle_of_its_work_is_not_woken(self):
+        """途中で止められた会話は stopped で残る。返信が来たからといって、止めた仕事を動かし直さない。"""
+        for state in ("stopped", "working", "blocked", None):
+            with self.subTest(state=state):
+                session_id = self._call()
+                self._stopped_background()["state"] = state
+                bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+                await self._watch(session_id, bridge, receiver=True)
+                self.assertEqual(self.wake.await_count, 0)
+                self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])  # 席へ渡る
+
+    async def test_conversation_that_cannot_be_woken_leaves_the_reply_to_the_folder_seat(self):
+        session_id = self._call()
+        self._stopped_background()
+        self.wake.side_effect = DeliveryError("CLAUDE_BG_WAKE_FAILED", "会話を起こせませんでした（exit 1）")
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual((self.wake.await_count, len(self.terminal.launched)), (1, 1))
+        self.assertEqual([(row["target"].split("-")[0], row["state"]) for row in reversed(self.store.relaunches())],
+                         [("claude", "starting"), ("claude", "failed"), ("cb", "starting"), ("cb", "started")])
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])
+
+    async def test_replies_left_in_a_dead_channel_wait_for_the_woken_conversation(self):
+        """process だけが消えて受け口が開いたままの時。入れた返信を取り下げて、起こした会話が引き取った後に渡す。"""
+        session_id = self._call()
+        self._stopped_background()
+
+        def send(channel, _delivery, _text):
+            if channel == CHANNEL and self.withdraw.await_count:
+                raise DeliveryError("CHANNEL_DELIVERY_DUPLICATE", "同じ配送IDの本文はすでに受け取られています")
+
+        def state(channel, _delivery):
+            if channel == ADOPTED:
+                return ("emitted", False)
+            return ("withdrawn", False) if self.withdraw.await_count else ("queued", False)
+
+        self.send.side_effect, self.state.side_effect = send, state
+        bridge = Bridge([{"seq": 2, "message": "返事2"}, {"seq": 3, "message": "返事3"}], status="hungup")
+        self._adopt_after(bridge, session_id, 5)
+        await self._watch(session_id, bridge)
+        self.assertEqual((self.wake.await_count, self.terminal.launched), (1, []))
+        adopted = [call.args[2] for call in self.send.await_args_list if call.args[0] == ADOPTED]
+        self.assertEqual(len(adopted), 2)
+        self.assertIn("返事2", adopted[0])
+        self.assertIn("返事3", adopted[1])
+        self.assertEqual([(r["seq"], r["state"], r["conversation"]) for r in bridge.receipts][-2:],
+                         [(2, "started", f"claude:{ADOPTED}"), (3, "started", f"claude:{ADOPTED}")])
 
     async def test_replies_nobody_takes_are_withdrawn_and_reach_the_seat_together(self):
         session_id = self._call()

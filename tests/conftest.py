@@ -14,6 +14,11 @@ def _refuse_real_aiterm():
     raise AssertionError("試験から本物の Aiterm へつなごうとしました。aiterm.connect を試験用に差し替えてください")
 
 
+def _refuse_real_claude(*_args, **_kwargs):
+    raise AssertionError("試験から本物の claude の命令を流そうとしました（裏の会話が起きます）。"
+                         "claude_bg._run か CALL_BRIDGE_CLAUDE を試験用に差し替えてください")
+
+
 def _refuse_real_claude_settings():
     raise AssertionError("試験から本物の Claude Code・Cursor の設定へ触ろうとしました。"
                          "claude_channel.settings_file・cursor_hooks_file を試験用に差し替えてください")
@@ -23,6 +28,7 @@ def _refuse_real_claude_settings():
 def _nothing_real():
     with mock.patch("call_bridge.setup._receiver", return_value="running"), \
          mock.patch("call_bridge.aiterm.connect", _refuse_real_aiterm), \
+         mock.patch("call_bridge.claude_bg._claude", _refuse_real_claude), \
          mock.patch("call_bridge.claude_channel.settings_file", _refuse_real_claude_settings), \
          mock.patch("call_bridge.claude_channel.cursor_hooks_file", _refuse_real_claude_settings):
         yield

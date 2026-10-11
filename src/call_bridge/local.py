@@ -23,6 +23,7 @@ from mcp.client.streamable_http import streamablehttp_client
 from mcp.server.fastmcp import Context, FastMCP
 
 from . import aiterm
+from . import claude_bg
 from . import claude_channel
 from . import conversation as talk
 from . import relaunch
@@ -397,6 +398,13 @@ class LocalStore:
                               (limit,)).fetchall()
         return [dict(row) for row in rows]
 
+    def relaunched_at(self, source: str, target: str) -> float | None:
+        """この届け先から、その渡し先へ渡し終えた（started）一番新しい時刻。無ければ None。"""
+        with self.connect() as db:
+            row = db.execute("SELECT MAX(at) FROM relaunches WHERE source = ? AND target = ? AND state = 'started'",
+                             (source, target)).fetchone()
+        return row[0] if row is not None else None
+
     def defer(self, session_id: str, seq: int) -> None:
         with self.connect() as db:
             db.execute("UPDATE deliveries SET state = 'waiting', error = NULL WHERE session_id = ? AND seq = ?",
@@ -697,7 +705,12 @@ class Watchers:
             if self.store.unconfirmed(session_id):
                 self.store.defer(session_id, seq)
                 return "wait"
-            return await self._hand_over(subscription, seq, [text], reason, report)
+            waiting, unanswered = await self._wake(subscription, reason)
+            if waiting:
+                # 止められていた会話を起こした。この返信は、会話が通話を引き取った後に、新しい受け口から渡る。
+                self.store.defer(session_id, seq)
+                return self._later(session_id)
+            return await self._hand_over(subscription, seq, [text], unanswered or reason, report)
         self.store.submitted(session_id, seq, confirmed=False)
         await report(seq, "submitted", None, f"{_channel_label(subscription)}:{channel}")
         return "next"
@@ -713,6 +726,51 @@ class Watchers:
         if not session:
             return None
         return talk.claude_retired(await talk.claude_handoff(session))
+
+    async def _wake(self, subscription: dict[str, Any], reason: str) -> tuple[bool, str | None]:
+        """受け口の会話が、Claude Code に止められた裏の会話なら、同じ会話のまま起こす。
+
+        返りの1つ目が真なら、起こした（または、起こした会話が通話を引き取るのを待っている）。返信は渡さずに待つ。
+        偽なら、担当フォルダの席へ渡す。2つ目は、起こして待っても引き取らなかった時の、席へ渡す理由。
+        役と記憶は会話にある。席（別の会話）へ渡すと、通話の履歴から役を読み直す事になり、同じフォルダの別の役と
+        同じ席に重なる（2026-10-11 に fox で、Windows のベルの通話が、リヴァリンと話していた席へ入った）。
+        """
+        if subscription["harness"] != "claude-code" or subscription["delivery_mode"] != "channel":
+            return False, None
+        try:
+            conversation = await claude_channel.owner(subscription["thread_id"])
+        except DeliveryError:
+            return False, None
+        found = await claude_bg.background(conversation) if conversation else None
+        if found is None:
+            return False, None
+        source, target = relaunch.source_key(subscription), f"claude-bg:{conversation}"
+        woken = self.store.relaunched_at(source, target)
+        if woken is not None:
+            # この受け口の会話は、もう起こしてある。起きている間は、通話を引き取るのを待つ（もう一度起こすと写しが出来る）。
+            if found.running and time.time() - woken < _CHANNEL_BUSY_SECONDS:
+                return True, None
+            return False, "起こした会話が通話を引き取りませんでした"
+        if not found.retired:
+            # 動いているのに受け口が閉じている（アプリで開き直した会話など）か、仕事の途中で人が止めた会話。起こす相手ではない。
+            return False, None
+        calls = [call["session_id"] for call in
+                 self.store.bound_to("claude-code", subscription["thread_id"], subscription["session_id"])]
+        with relaunch.seat_lock(f"wake-{conversation}"):
+            if self.store.relaunched_at(source, target) is not None:
+                return True, None  # 同じ会話に付いたほかの通話の見張りが、今起こした
+            self.store.note_relaunch(source, target, "starting", reason)
+            try:
+                started = await claude_bg.wake(found, calls)
+            except DeliveryError as exc:
+                self.store.note_relaunch(source, target, "failed", str(exc))
+                log.warning("stopped conversation %s was not woken: %s", conversation, exc)
+                return False, None
+            if not conversation.startswith(started):
+                # 一覧を読んだ後に、ほかの誰かが同じ会話を開いた。Claude Code は写しを立てる。知らせは写しへ入っている。
+                log.warning("conversation %s was already running; Claude Code started a copy %s", conversation, started)
+            self.store.note_relaunch(source, target, "started", f"{reason}（起きた会話 {started}）")
+        return True, None
 
     async def _manual(self, subscription: dict[str, Any], message: dict[str, Any], text: str,
                       report: "_Reporter") -> str:
@@ -851,9 +909,15 @@ class Watchers:
             if not withdrawn:
                 return
             seq = withdrawn[0]
+            waiting, unanswered = await self._wake(subscription, reason)
+            if waiting:
+                # 止められていた会話を起こした。取り下げた返信は、会話が通話を引き取った後に、新しい受け口から渡る。
+                self.store.requeue(session_id, withdrawn, "止まっていた会話を起こしました")
+                self._later(session_id)
+                return
             # 取り下げた返信は、まとめて1回で席へ渡す。1通ずつ渡すと、2通目より後が前の channel に残る。
             texts = [reply_text(subscription, each, await fetch_body(session_id, each)) for each in withdrawn]
-            seat = await relaunch.hand_over(self.store, subscription, texts, reason)
+            seat = await relaunch.hand_over(self.store, subscription, texts, unanswered or reason)
             for each in withdrawn:
                 self.store.confirm(session_id, each, "relaunched")
                 await report(each, "relaunched", reason, f"hosted:{seat}")
