@@ -159,10 +159,10 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
 
     def _stopped_background(self) -> dict:
         """受け口の会話は、Claude Code に止められた裏の会話。起こすと動き出す。"""
-        seen = {"running": False}
+        seen = {"running": False, "state": "done"}
 
         async def background(conversation):
-            return claude_bg.Background(conversation, str(self.folder), seen["running"])
+            return claude_bg.Background(conversation, str(self.folder), seen["running"], seen["state"])
 
         async def wake(_found, _calls):
             seen["running"] = True
@@ -234,6 +234,17 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         await self._watch(session_id, bridge, receiver=True)
         self.assertEqual((self.wake.await_count, len(self.terminal.launched)), (0, 1))
         self.assertEqual(bridge.receipts[-1]["detail"], "通話を開いた会話が終わっていました")
+
+    async def test_conversation_a_person_stopped_in_the_middle_of_its_work_is_not_woken(self):
+        """途中で止められた会話は stopped で残る。返信が来たからといって、止めた仕事を動かし直さない。"""
+        for state in ("stopped", "working", "blocked", None):
+            with self.subTest(state=state):
+                session_id = self._call()
+                self._stopped_background()["state"] = state
+                bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+                await self._watch(session_id, bridge, receiver=True)
+                self.assertEqual(self.wake.await_count, 0)
+                self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])  # 席へ渡る
 
     async def test_conversation_that_cannot_be_woken_leaves_the_reply_to_the_folder_seat(self):
         session_id = self._call()

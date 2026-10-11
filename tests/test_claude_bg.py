@@ -66,15 +66,25 @@ class ClaudeBackgroundTest(unittest.IsolatedAsyncioTestCase):
     async def test_stopped_background_conversation_is_found_with_its_folder(self):
         self._plan([{"pid": 1, "kind": "interactive", "sessionId": "other", "cwd": "/x"}, self._job()])
         found = await claude_bg.background(SESSION)
-        self.assertEqual(found, claude_bg.Background(SESSION, str(self.folder), False))
+        self.assertEqual(found, claude_bg.Background(SESSION, str(self.folder), False, "done"))
+        self.assertTrue(found.retired)  # 番を終えた後で止まっている。Claude Code が自分で止めた会話はこの形
         self.assertEqual(self._seen()[0]["args"], ["agents", "--json", "--all"])  # 読むだけの一覧
 
     async def test_conversation_running_in_the_background_or_in_the_app_counts_as_running(self):
         self._plan([self._job(pid=77960, status="idle", state="blocked")])
         self.assertTrue((await claude_bg.background(SESSION)).running)
+        self._plan([self._job(pid=77960, status="idle")])
+        self.assertFalse((await claude_bg.background(SESSION)).retired)  # 済んだ会話でも、動いている間は起こさない
         # 裏では止まっていて、同じ会話をアプリが開いている（fox で多い形）
         self._plan([self._job(state="stopped"), {"pid": 30380, "kind": "interactive", "sessionId": SESSION, "cwd": str(self.folder)}])
         self.assertTrue((await claude_bg.background(SESSION)).running)
+
+    async def test_conversation_stopped_in_the_middle_of_its_work_is_not_one_to_wake(self):
+        for state in ("stopped", "working", "blocked"):
+            with self.subTest(state=state):
+                self._plan([self._job(state=state)])
+                found = await claude_bg.background(SESSION)
+                self.assertEqual((found.running, found.state, found.retired), (False, state, False))
 
     async def test_conversation_that_is_not_a_background_one_is_left_alone(self):
         self._plan([{"pid": 40556, "kind": "interactive", "sessionId": SESSION, "cwd": str(self.folder)}])

@@ -8,6 +8,9 @@ Throughline が立てる後継は裏の会話なので、相手の返信を待�
 
 会話の一覧は `claude agents --json --all`（読むだけ）。裏の会話の行は kind=background で、動いている時だけ pid が付く。
 同じ会話をアプリや端末で開いている時は kind=interactive の行が別にあり、そこに pid が付く。
+state は、会話が最後に申告した状態。Claude Code が自分で止めた会話は done のまま残る（番を終えて「済んだ」会話だけを止めるため）。
+仕事の途中（working・blocked）で人が止めた会話と、アプリへ移した会話は stopped になる。起こすのは done だけ。
+人が途中で止めた仕事を、返信が来たからといって動かし直さない。
 """
 
 from __future__ import annotations
@@ -78,6 +81,12 @@ class Background:
     session_id: str
     cwd: str
     running: bool
+    state: str | None = None
+
+    @property
+    def retired(self) -> bool:
+        """番を終えた後で止まっていて、どこでも動いていない。同じ会話のまま起こしてよい。"""
+        return self.state == "done" and not self.running
 
 
 async def background(session_id: str) -> Background | None:
@@ -89,7 +98,9 @@ async def background(session_id: str) -> Background | None:
     job = next((row for row in mine if row.get("kind") == "background"), None)
     if job is None or not isinstance(job.get("cwd"), str) or not job["cwd"]:
         return None
-    return Background(session_id, job["cwd"], any(isinstance(row.get("pid"), int) for row in mine))
+    state = job.get("state")
+    return Background(session_id, job["cwd"], any(isinstance(row.get("pid"), int) for row in mine),
+                      state if isinstance(state, str) else None)
 
 
 def wake_prompt(calls: list[str]) -> str:

@@ -751,8 +751,8 @@ class Watchers:
             if found.running and time.time() - woken < _CHANNEL_BUSY_SECONDS:
                 return True, None
             return False, "起こした会話が通話を引き取りませんでした"
-        if found.running:
-            # 動いているのに受け口が閉じている（アプリで開き直した会話など）。起こす相手ではない。
+        if not found.retired:
+            # 動いているのに受け口が閉じている（アプリで開き直した会話など）か、仕事の途中で人が止めた会話。起こす相手ではない。
             return False, None
         calls = [call["session_id"] for call in
                  self.store.bound_to("claude-code", subscription["thread_id"], subscription["session_id"])]
