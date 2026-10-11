@@ -620,9 +620,11 @@ if __name__ == "__main__":
 class _Session:
     """Aiterm の MCP の代わり。呼ばれた道具と引数を覚えて、決めた結果を返す。"""
 
-    def __init__(self, launch: dict | None = None, launch_error: bool = False, send_error: str | None = None):
+    def __init__(self, launch: dict | None = None, launch_error: bool = False, send_error: str | None = None,
+                 seats: list[dict] | None = None):
         self.calls: list[tuple[str, dict]] = []
         self.launch, self.launch_error, self.send_error = launch, launch_error, send_error
+        self.seats = seats
 
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
@@ -632,6 +634,9 @@ class _Session:
                      **(self.launch or {})}
             return types.SimpleNamespace(isError=self.launch_error, structuredContent=value,
                                          content=[types.SimpleNamespace(type="text", text="起動に失敗しました")] if self.launch_error else [])
+        if name == "pty_list" and self.seats is not None:
+            return types.SimpleNamespace(isError=False, content=[], structuredContent={
+                "schema": "aiterm.pty-list-result.v1", "sessions": self.seats})
         if name == "pty_send" and self.send_error is not None:
             return types.SimpleNamespace(isError=True, structuredContent=None,
                                          content=[types.SimpleNamespace(type="text", text=self.send_error)])
@@ -685,6 +690,18 @@ class AitermSeatTest(unittest.IsolatedAsyncioTestCase):
                 self.assertRaises(aiterm.AitermError) as raised:
             aiterm.aiterm_command()
         self.assertEqual((raised.exception.code, raised.exception.sent), ("AITERM_UNAVAILABLE", False))
+
+    async def test_seat_conversation_number_is_read_from_the_list_when_aiterm_gives_it(self):
+        """Aiterm 0.58.3 以降は、席ごとに vendor_session_id を返す。前の版は項目が無い。素の端末は null。"""
+        session = _Session(seats=[
+            {"session_id": "cb-claude-work", "harness": "claude-code", "vendor_session_id": "d310d07c-eda8-45d8-bfae-e4e64c99e296"},
+            {"session_id": "cb-old-aiterm", "harness": "claude-code"},
+            {"session_id": "shell", "harness": None, "vendor_session_id": None}])
+        terminal = aiterm.Aiterm(session)
+        self.assertEqual(await terminal.conversation("cb-claude-work"), "d310d07c-eda8-45d8-bfae-e4e64c99e296")
+        for name in ("cb-old-aiterm", "shell", "no-such-seat"):
+            self.assertIsNone(await terminal.conversation(name))
+        self.assertIsNone(await aiterm.Aiterm(_Session()).conversation("cb-claude-work"))  # 一覧を読めない時
 
     async def test_other_harnesses_get_the_text_at_launch_as_before(self):
         for harness in ("codex", "cursor", "grok"):
