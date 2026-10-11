@@ -24,6 +24,9 @@ plan = json.load(open(os.path.join(here, "plan.json"), encoding="utf-8"))
 with open(os.path.join(here, "seen.jsonl"), "a", encoding="utf-8") as seen:
     seen.write(json.dumps({"args": sys.argv[1:], "cwd": os.getcwd()}, ensure_ascii=False) + "\\n")
 answer = plan["agents"] if sys.argv[1:2] == ["agents"] else plan["wake"]
+if answer.get("sleep"):
+    import time
+    time.sleep(answer["sleep"])
 sys.stderr.write(answer.get("stderr", ""))
 sys.stdout.write(answer.get("stdout", ""))
 sys.exit(answer.get("exit", 0))
@@ -122,9 +125,19 @@ class ClaudeBackgroundTest(unittest.IsolatedAsyncioTestCase):
             await claude_bg.wake(found, CALLS)
         self.assertEqual(raised.exception.code, "CLAUDE_BG_WAKE_FAILED")
         self.assertIn("Workspace not trusted", str(raised.exception))
-        self._plan([], wake={"stdout": "something else\n"})  # 0 で終わっても、起きた印が無い
-        with self.assertRaises(DeliveryError):
-            await claude_bg.wake(found, CALLS)
+        with patch.object(claude_bg, "_claude", lambda: str(self.root / "missing")):  # 命令を流せない。何も始まっていない
+            with self.assertRaises(DeliveryError) as raised:
+                await claude_bg.wake(found, CALLS)
+        self.assertEqual(raised.exception.code, "CLAUDE_BG_UNAVAILABLE")
+
+    async def test_wake_whose_outcome_cannot_be_read_is_not_called_a_failure(self):
+        """起きた印を読めないだけで「起こせなかった」と決めると、起きた会話と席の両方が同じ返信で動く。"""
+        found = claude_bg.Background(SESSION, str(self.folder), False)
+        self._plan([], wake={"stdout": "started in the background (a4c499de)\n"})  # 0 で終わったが、書き方が違う
+        self.assertEqual(await claude_bg.wake(found, CALLS), "")
+        self._plan([], wake={"sleep": 5})
+        with patch.object(claude_bg, "_TIMEOUT", 0.5):  # 終わらないので止めた。どこまで進んだかは分からない
+            self.assertEqual(await claude_bg.wake(found, CALLS), "")
 
     async def test_wake_is_refused_before_claude_runs_when_the_arguments_are_not_plain_ids(self):
         for found, calls, code in (
