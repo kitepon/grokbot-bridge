@@ -286,6 +286,33 @@ class HarnessHookTest(unittest.TestCase):
         self.assertIn("STEER_DELIVERY_UNAVAILABLE", result["warning"])
 
 
+class NodePathTest(unittest.TestCase):
+    """控えた Node の場所は、Node を上げると無くなる事がある（Homebrew の版つきの実体など）。"""
+
+    def test_node_that_disappeared_is_found_again_on_the_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"CALL_BRIDGE_STATE": tmp}):
+            steer = Path(tmp) / "steer"
+            steer.mkdir()
+            (steer / claude_channel.CLI).write_text("", encoding="utf-8")
+            (steer / "steer.json").write_text(json.dumps({"node": str(Path(tmp) / "gone" / "node")}), encoding="utf-8")
+            with patch.object(claude_channel.shutil, "which", return_value=sys.executable):
+                self.assertEqual(claude_channel._command(), [sys.executable, str(steer / claude_channel.CLI)])
+            with patch.object(claude_channel.shutil, "which", return_value=None), self.assertRaises(DeliveryError) as caught:
+                claude_channel._command()
+            self.assertEqual(caught.exception.code, "CLAUDE_CHANNEL_UNAVAILABLE")
+
+    def test_codex_delivery_finds_node_again_too(self) -> None:
+        from call_bridge import codex_delivery
+        with tempfile.TemporaryDirectory() as tmp:
+            cli = Path(tmp) / "cli.js"
+            cli.write_text("", encoding="utf-8")
+            config = {"steer_cli": str(cli), "steer_node": str(Path(tmp) / "gone" / "node")}
+            with patch.dict(os.environ, {"AITERM_STEER_DELIVERY": ""}), \
+                 patch.object(codex_delivery.shutil, "which", return_value=sys.executable):
+                command, _env = codex_delivery._steer_command(config)
+            self.assertEqual(command, [sys.executable, str(cli.resolve())])
+
+
 def _steer_cli() -> Path | None:
     """本物の aiterm-steer-delivery（0.4.2 以降）の dist/cli.js。無ければ、Node を通す試験は飛ばす。"""
     named = os.environ.get("CALL_BRIDGE_TEST_STEER_CLI")

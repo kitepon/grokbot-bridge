@@ -59,7 +59,8 @@ def install(mcp_server: str) -> dict[str, str]:
         raise DeliveryError("STEER_DELIVERY_OUTDATED",
                             "Claude Code への自動の配送には aiterm-steer-delivery 0.4.2 以降が要ります。"
                             "npm install -g aiterm-steer-delivery@latest を実行してください")
-    node = config.get("steer_node") or shutil.which("node")
+    # 版つきの実体（Homebrew の Cellar など）ではなく、PATH にある入口を控える。Node を上げても場所が変わらない。
+    node = shutil.which("node") or config.get("steer_node")
     if not isinstance(node, str) or not Path(node).is_file():
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "Node の実行ファイルが見つかりません")
     target = private_dir(steer_dir())
@@ -68,7 +69,7 @@ def install(mcp_server: str) -> dict[str, str]:
     profile = {**steer_profile(mcp_server), "dispatch_tools": DISPATCH_TOOLS}
     profile["hooks"] = {**profile["hooks"], "claude": HOOK}
     temporary = target / "steer.json.tmp"
-    temporary.write_text(json.dumps({"library": str(library), "node": str(Path(node).resolve()), "profile": profile},
+    temporary.write_text(json.dumps({"library": str(library), "node": os.path.abspath(node), "profile": profile},
                                     ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     os.replace(temporary, target / "steer.json")
     return {"library": str(library), "version": ".".join(map(str, version))}
@@ -81,7 +82,9 @@ def _command() -> list[str]:
     except (OSError, ValueError, KeyError, TypeError) as exc:
         raise DeliveryError("CLAUDE_CHANNEL_UNAVAILABLE",
                             "call-bridge-setup harness claude-code enable を実行してください") from exc
-    if not isinstance(node, str) or not (directory / CLI).is_file():
+    if not isinstance(node, str) or not Path(node).is_file():
+        node = shutil.which("node")  # 控えた場所から Node が無くなった（入れ直しなど）。今の PATH から探す
+    if not node or not (directory / CLI).is_file():
         raise DeliveryError("CLAUDE_CHANNEL_UNAVAILABLE", "call-bridge-setup harness claude-code enable を実行してください")
     return [node, str(directory / CLI)]
 
