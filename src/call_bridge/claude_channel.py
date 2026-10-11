@@ -1,7 +1,9 @@
-"""通話の返信を、生きている Claude Code の会話へ渡す。
+"""通話の返信を、生きている Claude Code・Cursor・Grok の会話へ渡す。
 
-共通パッケージ aiterm-steer-delivery の channel を使う。Claude Code の公式の hook（asyncRewake）が、
+共通パッケージ aiterm-steer-delivery の channel を使う。Claude Code は、公式の hook（asyncRewake）が、
 番を終えて止まっている会話を起こして本文を渡す。作業中の会話には、その番へ入る。
+Cursor と Grok には、止まっている会話を外から起こす口が無い。会話が待ち受けの命令を背景で動かしている間、
+届いた返信がその命令の出力として会話へ入る。Cursor は、作業中なら hook が次の道具の返りへ差し込む。
 パッケージの CLI は Codex だけなので、call-bridge が持つ Node の入口（steer/*.mjs）から呼ぶ。
 入口は置き場の steer/ へ写して使う。hook の登録が指す場所を、入れ直しで動かさないため。
 """
@@ -20,6 +22,8 @@ from .codex_delivery import (DeliveryError, _bridge_config, _steer_result, curre
                              private_dir, state_root, steer_profile)
 
 HOOK = "call-bridge-claude-hook.mjs"
+CURSOR_HOOK = "call-bridge-cursor-hook.mjs"
+RECEIVE = "call-bridge-channel-receive.mjs"
 CLI = "call-bridge-channel.mjs"
 # hook が会話を見分ける道具。通話を開く・引き取る時と、通話を使う時（送る・取りに行く）。
 # 通話を使った会話へ、返信の届け先を合わせる為（local.py の _follow_speaker）。
@@ -39,6 +43,10 @@ def steer_dir() -> Path:
 
 def settings_file() -> Path:
     return Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "settings.json"
+
+
+def cursor_hooks_file() -> Path:
+    return Path(os.environ.get("CURSOR_HOME") or Path.home() / ".cursor") / "hooks.json"
 
 
 def _version(library: Path) -> tuple[int, ...] | None:
@@ -69,7 +77,7 @@ def install(mcp_server: str) -> dict[str, str]:
     for source in sorted((Path(__file__).parent / "steer").glob("*.mjs")):
         shutil.copyfile(source, target / source.name)
     profile = {**steer_profile(mcp_server), "dispatch_tools": DISPATCH_TOOLS}
-    profile["hooks"] = {**profile["hooks"], "claude": HOOK}
+    profile["hooks"] = {**profile["hooks"], "claude": HOOK, "cursor": CURSOR_HOOK}
     temporary = target / "steer.json.tmp"
     temporary.write_text(json.dumps({"library": str(library), "node": os.path.abspath(node), "profile": profile},
                                     ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
@@ -125,6 +133,24 @@ def hooks(action: str) -> dict[str, Any]:
     return run_sync(["setup", action, "--settings", str(settings_file())])
 
 
+def cursor_hooks(action: str) -> dict[str, Any]:
+    """Cursor の利用者の設定（hooks.json）にある、call-bridge の hook を登録・解除・確認する。ほかの hook は変えない。"""
+    return run_sync(["cursor-setup", action, "--hooks", str(cursor_hooks_file())])
+
+
+async def open_wait(client_name: str | None) -> dict[str, str]:
+    """Cursor・Grok の会話に、待ち受けの命令で受け取る受け口を開く。wait が、会話が背景で動かす命令の1行。"""
+    opened = await run(["open-wait", "--client", client_name or ""])
+    if not isinstance(opened.get("channel_id"), str) or not isinstance(opened.get("wait"), str):
+        raise DeliveryError("CLAUDE_CHANNEL_UNAVAILABLE", "受け口を開いた結果を読めません")
+    return {"channel_id": opened["channel_id"], "wait": opened["wait"]}
+
+
+async def wait_info(channel_id: str) -> dict[str, Any]:
+    """今の受け口の、待ち受けの命令（wait）と、閉じているか（closed）。"""
+    return await run(["wait", "--channel", channel_id])
+
+
 async def open_channel(client_name: str | None, meta: dict[str, Any]) -> dict[str, str]:
     """道具を呼んだ会話に channel を開く。会話は、hook が残した記録と要求の toolUseId で見分ける。"""
     opened = await run(["open", "--client", client_name or "", "--meta", json.dumps(meta)])
@@ -149,10 +175,13 @@ async def delivery_state(channel_id: str, delivery_id: str) -> tuple[str | None,
     queued＝まだ誰も取っていない、sending＝出している途中、emitted＝会話へ出した、unknown＝取った後に止まった。
     生きているかは queued の時だけ調べる（ほかの時は偽）。channel を開いた Claude Code の process が居るか、
     会話の記録がこの2分のうちに書かれていれば、生きている。
+    Cursor・Grok の受け口は、会話の生き死にを見分ける物が無い。待ち受けを張り直すまでの間として、生きている物として待つ
+    （待つ長さは呼ぶ側が決める）。
     """
     value = await run(["state", "--channel", channel_id, "--delivery", delivery_id])
     state, age = value.get("state"), value.get("transcript_age")
-    alive = value.get("parent_alive") is True or (isinstance(age, (int, float)) and age < _ACTIVE_SECONDS)
+    alive = (value.get("parent_alive") is True or (isinstance(age, (int, float)) and age < _ACTIVE_SECONDS)
+             or value.get("kind") in ("cursor", "background"))
     return (state if isinstance(state, str) else None), alive
 
 

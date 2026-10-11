@@ -3,13 +3,16 @@
 // 共通パッケージ aiterm-steer-delivery の CLI は Codex だけなので、Claude Code の channel はここから呼ぶ。
 //
 //   open     --client <name> --meta <json>            → channel_id, session_id（道具を呼んだ会話に channel を開く）
+//   open-wait --client <name>                          → channel_id, kind（cursor|background）, wait（待ち受けの命令の1行）
+//   wait     --channel <uuid>                          → wait, closed, kind
 //   own      --client <name> --meta <json> [--channel <uuid>] → session_id（道具を呼んだ会話）, channel_open, channel_session
 //   send     --channel <uuid> --delivery <uuid>       → state（本文は stdin）
 //   state    --channel <uuid> --delivery <uuid>       → state（queued|sending|emitted|unknown|withdrawn|null）, closed,
 //                                                       parent_alive・transcript_age（queued の時だけ。会話が生きているか）
 //   withdraw --channel <uuid> --delivery <uuid>       → withdrawn（真なら、会話へは出ていない）
 //   close    --channel <uuid>
-//   setup    <enable|disable|status> --settings <file>
+//   setup    <enable|disable|status> --settings <file>          （Claude Code の hook）
+//   cursor-setup <enable|disable|status> [--hooks <file>]      （Cursor の hook）
 //
 // 失敗は {ok:false, code, message, outcome_unknown} を返し、exit 1。
 import * as fs from "node:fs";
@@ -47,8 +50,14 @@ function transcriptAge(sessionId) {
     return newest === null ? null : Math.max(0, (Date.now() - newest) / 1000);
 }
 
-function hookRuntime(steer, profile) {
-    return { command: steer.setupNodeExecutable(), script: path.join(here, profile.hooks.claude) };
+function hookRuntime(steer, profile, name = profile.hooks.claude) {
+    return { command: steer.setupNodeExecutable(), script: path.join(here, name) };
+}
+
+/** Cursor と Grok の会話が、返信を待つ時に背景で動かす命令（その端末の shell に書ける1行）。 */
+function waitCommand(steer, channelId) {
+    return steer.waitProcessCommandLine(steer.channelReceiveProcess(
+        path.join(here, "call-bridge-channel-receive.mjs"), channelId, steer.setupNodeExecutable()));
 }
 
 async function run(argv) {
@@ -61,6 +70,23 @@ async function run(argv) {
             if (parent === null) throw Object.assign(new Error("Claude Code の会話ではありません"), { delivery_code: "CLAUDE_PARENT_UNSUPPORTED" });
             const channel = steer.openChannel(profile, parent);
             return { channel_id: channel.channel_id, session_id: channel.claude.session_id };
+        }
+        case "open-wait": {
+            // Cursor と Grok の会話に、待ち受けの命令で受け取る受け口を開く。
+            // Cursor は hook が登録してあれば、作業中の会話へ次の道具の返りで差し込める（道具の返りの印で会話へ結ぶ）。
+            // それ以外（Grok など）は、待ち受けの命令だけで受け取る。
+            const client = option(args, "--client") ?? "";
+            const parent = steer.isCursorMcpClient(client)
+                ? steer.cursorParentFromRequest(profile, client, { hookRoot: steer.cursorHookRoot(profile) })
+                : null;
+            const channel = steer.openChannel(profile, parent);
+            return { channel_id: channel.channel_id, kind: channel.kind, wait: waitCommand(steer, channel.channel_id) };
+        }
+        case "wait": {
+            // 今の受け口の、待ち受けの命令。閉じていれば closed が真。
+            const id = required(args, "--channel");
+            const channel = steer.readChannel(profile, id);
+            return { channel_id: id, kind: channel.kind, closed: steer.channelClosed(profile, id), wait: waitCommand(steer, id) };
         }
         case "own": {
             // 道具を呼んだ会話と、通話に付いている受け口の持ち主・開閉を答える。受け口は作らない。
@@ -85,11 +111,12 @@ async function run(argv) {
             // まだ誰も取っていない時だけ、会話が生きているかを見る。生きていれば、番の途中で待ち受けが居ないだけ
             // （番の終わりに取り出す）。channel を開いた process と、会話の記録が最後に書かれてからの秒数の2つを返す。
             // 起動し直して再開された会話は、開いた時の process が居なくても、記録が書かれ続ける。
-            const parent = state === "queued" ? steer.readChannel(profile, id).claude : undefined;
+            const channel = state === "queued" ? steer.readChannel(profile, id) : undefined;
+            const parent = channel?.claude;
             const alive = parent ? steer.readRuntimeProcesses().some(row =>
                 row.pid === parent.parent_pid && row.started_identity === parent.parent_started_identity) : null;
             return { state, closed: steer.channelClosed(profile, id), parent_alive: alive,
-                     transcript_age: parent ? transcriptAge(parent.session_id) : null };
+                     transcript_age: parent ? transcriptAge(parent.session_id) : null, kind: channel?.kind ?? null };
         }
         case "withdraw":
             return { withdrawn: steer.withdrawFromChannel(profile, required(args, "--channel"), required(args, "--delivery")) };
@@ -105,6 +132,15 @@ async function run(argv) {
             const scripts = steer.claudeParentHookScripts(profile, document);
             return { registered: steer.claudeParentHooksRegistered(profile, document),
                      scripts, missing: scripts.filter(script => !fs.existsSync(script)) };
+        }
+        case "cursor-setup": {
+            const file = option(args, "--hooks") ?? steer.cursorHooksFile();
+            const hook = hookRuntime(steer, profile, profile.hooks.cursor);
+            if (args[0] === "enable") return { result: steer.mergeCursorParentHooks(profile, file, hook), file };
+            if (args[0] === "disable") return { result: steer.removeCursorParentHooks(profile, file), file };
+            if (args[0] !== "status") throw Object.assign(new Error("enable・disable・status のどれかです"), { delivery_code: "CLI_USAGE" });
+            const document = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : {};
+            return { registered: steer.cursorParentHooksRegistered(profile, document), file };
         }
         default:
             throw Object.assign(new Error(`未対応の命令です: ${command}`), { delivery_code: "CLI_USAGE" });

@@ -149,6 +149,26 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.subscription(session_id)["state"], "unknown")
         self.assertEqual(bridge.receipts[-1]["state"], "unknown")
 
+    async def test_cursor_conversation_is_given_time_to_set_its_wait_again_then_the_seat_takes_over(self):
+        session_id = str(uuid.uuid4())
+        self.store.add(session_id, CHANNEL, Path(""), "リリーバイス", "channel", "bellteam", "cursor", str(self.folder))
+        answers = iter([("queued", True), ("queued", True), ("emitted", False)])  # 待ち受けを張り直すまで待つ → 受け取った
+        self.state.side_effect = lambda *_a: next(answers)
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge)
+        self.assertEqual((self.withdraw.await_count, self.terminal.launched), (0, []))
+        self.assertEqual([(r["seq"], r["state"], r["conversation"]) for r in bridge.receipts],
+                         [(2, "submitted", f"cursor:{CHANNEL}"), (2, "started", f"cursor:{CHANNEL}")])
+
+        other = str(uuid.uuid4())
+        self.store.add(other, CHANNEL, Path(""), "リリーバイス", "channel", "bellteam", "grok", str(self.folder))
+        self.state.side_effect = None
+        self.state.return_value = ("queued", True)  # 待ち受けが張られないまま
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        with patch.object(local, "_CHANNEL_BUSY_SECONDS", 0.0):
+            await self._watch(other, bridge)
+        self.assertEqual((self.withdraw.await_count, self.terminal.launched[0][0]), (1, "grok"))  # Grok の席が続きをやる
+
     async def test_seat_that_fails_after_withdrawal_gets_the_reply_again_with_the_next_one(self):
         session_id = self._call()
         self.state.return_value = ("queued", False)
@@ -231,13 +251,34 @@ class CallOpenTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("CLAUDE_PARENT_HOOK_UNAVAILABLE", result["parent_delivery"]["reason"])
         self.assertEqual(self.store.subscription(self.session_id)["delivery_mode"], "manual")
 
-    async def test_cursor_is_not_asked_for_a_channel(self):
-        opened = AsyncMock()
-        with patch.object(local.claude_channel, "open_channel", opened):
+    async def test_cursor_and_grok_get_a_wait_command_and_cursor_gets_the_binding_mark(self):
+        for client, harness in (("cursor-vscode", "cursor"), ("grok-cli", "grok")):
+            with self.subTest(harness=harness):
+                self.session_id = str(uuid.uuid4())
+                local._remote_tool.return_value = {"session_id": self.session_id}
+                waited = AsyncMock(return_value={"channel_id": CHANNEL, "wait": "node receive.mjs --channel x"})
+                claude = AsyncMock()
+                with patch.object(local.claude_channel, "open_wait", waited), \
+                     patch.object(local.claude_channel, "open_channel", claude):
+                    result = await local.call_open(f"{harness}:x", "ベル", "リリーバイス", member_system="bellteam",
+                                                   ctx=self._ctx(client))
+                waited.assert_awaited_once_with(client)
+                self.assertEqual(claude.await_count, 0)
+                self.assertEqual(result["steer_channel"], {"channel_id": CHANNEL})  # Cursor の hook が会話へ結ぶ印
+                delivery = result["parent_delivery"]
+                self.assertEqual((delivery["state"], delivery["harness"], delivery["wait_command"]),
+                                 ("wait", harness, "node receive.mjs --channel x"))
+                self.assertEqual("差し込まれます" in delivery["note"], harness == "cursor")
+                saved = self.store.subscription(self.session_id)
+                self.assertEqual((saved["delivery_mode"], saved["thread_id"], saved["harness"]), ("channel", CHANNEL, harness))
+
+    async def test_cursor_without_the_package_keeps_fetching_by_itself(self):
+        failed = AsyncMock(side_effect=DeliveryError("CLAUDE_CHANNEL_UNAVAILABLE", "call-bridge-setup harness … を実行してください"))
+        with patch.object(local.claude_channel, "open_wait", failed):
             result = await local.call_open("cursor:x", "ベル", "リリーバイス", member_system="bellteam",
                                            ctx=self._ctx("cursor-vscode"))
-        self.assertEqual((opened.await_count, result["parent_delivery"]["state"]), (0, "manual"))
-        self.assertNotIn("reason", result["parent_delivery"])
+        self.assertEqual(result["parent_delivery"]["state"], "manual")
+        self.assertIn("CLAUDE_CHANNEL_UNAVAILABLE", result["parent_delivery"]["reason"])
 
     async def test_new_claude_code_conversation_takes_the_call_over(self):
         self.store.add(self.session_id, "cb-claude-seat-12345678", Path(""), "リリーバイス", "hosted", "bellteam",
@@ -316,13 +357,34 @@ class FollowSpeakerTest(CallOpenTest):
             return False
         return True
 
-    async def test_member_side_cursor_and_finished_calls_do_not_move_anything(self):
+    async def test_cursor_or_grok_that_uses_a_call_gets_the_wait_command_each_time(self):
+        self._old_call()  # 前の会話（Claude Code）が開いた通話を、Grok の会話が使う
+        waited = AsyncMock(return_value={"channel_id": CHANNEL, "wait": "node receive.mjs --channel new"})
+        with patch.object(local.claude_channel, "open_wait", waited):
+            sent = await local.call_send(self.session_id, "local", "続き", ctx=self._ctx("grok-cli"))
+        self.assertEqual((sent["session_id"], sent["parent_delivery"]["state"], sent["parent_delivery"]["wait_command"]),
+                         (self.session_id, "wait", "node receive.mjs --channel new"))
+        self.assertEqual(self._bound(), ("channel", CHANNEL, "grok"))
+        # もう受け口がある時は、作り直さずに同じ待ち受けの命令を返す（張り直しの案内）
+        info = AsyncMock(return_value={"closed": False, "wait": "node receive.mjs --channel new", "kind": "background"})
+        again = AsyncMock()
+        with patch.object(local.claude_channel, "wait_info", info), patch.object(local.claude_channel, "open_wait", again):
+            polled = await local.call_poll(self.session_id, "local", ctx=self._ctx("grok-cli"))
+        self.assertEqual((again.await_count, polled["parent_delivery"]["wait_command"]), (0, "node receive.mjs --channel new"))
+        # 受け口が閉じていたら、開き直す
+        closed = AsyncMock(return_value={"closed": True, "wait": "x", "kind": "background"})
+        other = "22222222-2222-4222-8222-222222222222"
+        reopened = AsyncMock(return_value={"channel_id": other, "wait": "node receive.mjs --channel other"})
+        with patch.object(local.claude_channel, "wait_info", closed), patch.object(local.claude_channel, "open_wait", reopened):
+            await local.call_send(self.session_id, "local", "もう1通", ctx=self._ctx("grok-cli"))
+        self.assertEqual(self._bound(), ("channel", other, "grok"))
+
+    async def test_member_side_and_finished_calls_do_not_move_anything(self):
         self._old_call()
         own = AsyncMock()
         with patch.object(local.claude_channel, "own", own):
             await local.call_send(self.session_id, "member", "返事", ctx=self._ctx())
             await local.call_poll(self.session_id, "member", ctx=self._ctx())
-            await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx("cursor-vscode"))
             self.store.stop(self.session_id, "closed")
             await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx())
             await local.call_send(str(uuid.uuid4()), "local", "この端末の通話ではない", ctx=self._ctx())
@@ -484,6 +546,56 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
         document = json.loads(self.settings.read_text(encoding="utf-8"))
         self.assertEqual(document["hooks"]["Stop"], [{"hooks": [{"type": "command", "command": "echo other"}]}])
         self.assertNotIn(claude_channel.HOOK, json.dumps(document))
+
+    async def test_cursor_gets_the_reply_at_its_next_tool_return_and_grok_through_the_wait_command(self):
+        hooks_file = Path(self.temp.name) / "cursor" / "hooks.json"
+        hooks_file.parent.mkdir()
+        hooks_file.write_text(json.dumps({"version": 1, "hooks": {"stop": [{"command": "echo other"}]}}), encoding="utf-8")
+        with patch.object(claude_channel, "cursor_hooks_file", lambda: hooks_file):
+            self.assertEqual(claude_channel.cursor_hooks("status")["registered"], False)
+            with self.assertRaises(DeliveryError):  # hook が無い Cursor には、差し込めない。受け口を開かない
+                await claude_channel.open_wait("cursor-vscode")
+            self.assertEqual(claude_channel.cursor_hooks("enable")["result"], "configured")
+            self.assertEqual(claude_channel.cursor_hooks("status")["registered"], True)
+            document = json.loads(hooks_file.read_text(encoding="utf-8"))
+            self.assertEqual(document["hooks"]["stop"][0], {"command": "echo other"})
+            command = next(entry["command"] for entries in document["hooks"].values() for entry in entries
+                           if claude_channel.CURSOR_HOOK in entry.get("command", ""))
+
+            def cursor_hook(event: dict) -> dict:
+                done = subprocess.run(["sh", "-c", command], input=json.dumps(event), capture_output=True, text=True,
+                                      timeout=30, env={**os.environ, "CURSOR_HOME": str(hooks_file.parent)})
+                return json.loads(done.stdout.strip().splitlines()[-1])
+
+            with patch.dict(os.environ, {"CURSOR_HOME": str(hooks_file.parent)}):
+                opened = await claude_channel.open_wait("cursor-vscode")
+            channel = opened["channel_id"]
+            # 道具の返りに載った印で、受け口がこの会話へ結ばれる
+            marked = json.dumps({"session_id": "s", "steer_channel": {"channel_id": channel}})
+            self.assertEqual(cursor_hook({"hook_event_name": "afterMCPExecution", "conversation_id": "conv-1",
+                                          "result_json": marked}), {})
+            first = str(uuid.uuid4())
+            await claude_channel.send(channel, first, "作業中に届いた返信")
+            self.assertEqual((await claude_channel.delivery_state(channel, first)), ("queued", True))
+            injected = cursor_hook({"hook_event_name": "postToolUse", "conversation_id": "conv-1", "tool_output": "{}"})
+            self.assertEqual(injected.get("additional_context"), "作業中に届いた返信")  # 次の道具の返りで入る
+            self.assertEqual((await claude_channel.delivery_state(channel, first))[0], "emitted")
+
+        # Grok：待ち受けの命令を背景で動かしている間に届いた返信が、その命令の出力になる
+        opened = await claude_channel.open_wait("grok-cli")
+        info = await claude_channel.wait_info(opened["channel_id"])
+        self.assertEqual((info["closed"], info["kind"], info["wait"]), (False, "background", opened["wait"]))
+        waiter = subprocess.Popen(["sh", "-c", opened["wait"]], stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+        self.addCleanup(lambda: (waiter.poll() is None and waiter.kill(), waiter.wait(), waiter.stdout.close(), waiter.stderr.close()))
+        await asyncio.sleep(1.0)
+        self.assertIsNone(waiter.poll())  # 待っている
+        second = str(uuid.uuid4())
+        await claude_channel.send(opened["channel_id"], second, "止まって待っている所へ届いた返信")
+        self.assertEqual(waiter.wait(30), 0)
+        printed = json.loads(waiter.stdout.read().strip().splitlines()[-1])
+        self.assertEqual((printed["outcome"], printed["deliveries"][0]["text"]), ("delivered", "止まって待っている所へ届いた返信"))
+        self.assertIn("next_wait_process", printed)  # 次の返信も待つための、張り直しの命令
+        self.assertEqual((await claude_channel.delivery_state(opened["channel_id"], second))[0], "emitted")
 
     async def test_reply_wakes_the_conversation_and_leftovers_can_be_withdrawn(self):
         claude_channel.hooks("enable")

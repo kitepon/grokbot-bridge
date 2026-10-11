@@ -252,7 +252,8 @@ class HarnessSetupTest(unittest.TestCase):
         file = Path(self.tmp.name) / "mcp.json"
         file.write_text(json.dumps({"mcpServers": {"other": {"url": "https://example.test/mcp"}}, "extra": 1}),
                         encoding="utf-8")
-        self.assertEqual(harness_setup.enable("cursor"), {"harness": "cursor", "status": "registered"})
+        enabled = harness_setup.enable("cursor")  # 配送のパッケージが無い端末でも、登録は済む
+        self.assertEqual((enabled["harness"], enabled["status"], enabled["delivery"]), ("cursor", "registered", "manual"))
         saved = json.loads(file.read_text(encoding="utf-8"))
         self.assertEqual(saved["extra"], 1)
         self.assertEqual(saved["mcpServers"]["other"], {"url": "https://example.test/mcp"})
