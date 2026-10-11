@@ -167,6 +167,30 @@ async def handoff_operations(host: str = "codex") -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
+# Claude Code の会話が Throughline に引き継がれて、もう仕事をしない状態。後継を立てている所から後。
+# requested は予約だけで、会話はまだ動く（次に道具を使う時に止まる）。failed は、後継が立っていない。
+_CLAUDE_RETIRED = ("launching", "launched", "sent", "unknown")
+
+
+async def claude_handoff(session_id: str) -> dict[str, Any] | None:
+    """Claude Code の会話の、Throughline の引き継ぎの記録。無い・読めない時は None。
+
+    `throughline auto-handoff status --host claude --operation <session id> --json`（0.16.23 で確かめた口）。
+    答えの handoffs は 0個か1個。項目は state・successor_session_id・successor_short_id など。
+    """
+    value = await _throughline_json(["auto-handoff", "status", "--host", "claude", "--operation", session_id, "--json"])
+    rows = value.get("handoffs") if isinstance(value, dict) else None
+    return rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
+
+
+def claude_retired(handoff: dict[str, Any] | None) -> str | None:
+    """引き継がれて止まった会話なら、後継の番号（分かる所まで。頭8字だけの時がある）。まだ動く会話は None。"""
+    if not handoff or handoff.get("state") not in _CLAUDE_RETIRED:
+        return None
+    successor = handoff.get("successor_session_id") or handoff.get("successor_short_id")
+    return successor if isinstance(successor, str) and successor else "?"
+
+
 @dataclass(frozen=True)
 class Handoff:
     """止められた Codex の会話の、引き継ぎの状態。"""
