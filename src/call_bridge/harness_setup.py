@@ -3,6 +3,7 @@
 Codex の登録は setup.py が公式の設定 API で行う。ここは残りの3つで、各 CLI の公式の登録先だけを書く。
 登録するのは call-bridge の1項目だけで、ほかの MCP とほかの設定は変えない。
 Claude Code には、返信を会話へ自動で渡すための hook も登録する（claude_channel）。
+Cursor には、作業中の会話へ返信を差し込む hook を登録する。Cursor と Grok の会話は、待ち受けの命令で返信を受け取る。
 """
 
 from __future__ import annotations
@@ -93,11 +94,18 @@ def enable(harness: str, run: Runner = _run) -> dict[str, str]:
         raise DeliveryError("HARNESS_UNSUPPORTED", f"{harness} には対応していません")
     require_token()
     command = _local_command()
+    warning = None
     if harness == "cursor":
         value = _cursor_read()
         servers = dict(value.get("mcpServers", {}))
         servers[NAME] = {"command": command[0], "args": command[1:]}
         _cursor_write({**value, "mcpServers": servers})
+        # 作業中の会話へ返信を差し込む hook と、待ち受けの命令。入れられない端末でも、登録は済ませる。
+        try:
+            claude_channel.install(NAME)
+            claude_channel.cursor_hooks("enable")
+        except DeliveryError as exc:
+            warning = str(exc)
     else:
         cli = _cli(harness)
         # 同じ名前の登録（HTTP 直結など）を、ローカル MCP へ置き換える。無い時の remove の失敗は数えない。
@@ -106,7 +114,12 @@ def enable(harness: str, run: Runner = _run) -> dict[str, str]:
                     else [cli, "mcp", "add", "--scope", "user", NAME, command[0], "--", *command[1:]])
         if added.returncode:
             raise DeliveryError("HARNESS_SETUP_FAILED", (added.stderr or added.stdout).strip()[-300:])
-    warning = None
+    if harness == "grok":
+        # Grok の会話は、待ち受けの命令で返信を受け取る。その入口を置く。hook は使わない。
+        try:
+            claude_channel.install(NAME)
+        except DeliveryError as exc:
+            warning = str(exc)
     if harness == "claude-code":
         # 返信を会話へ自動で渡す hook。入れられない端末（配送のパッケージが無い・古い）でも、登録は済ませる。
         # その時は今までどおり、会話が自分で取りに来る。
@@ -129,6 +142,8 @@ def disable(harness: str, run: Runner = _run) -> dict[str, str]:
         if NAME in servers:
             del servers[NAME]
             _cursor_write({**value, "mcpServers": servers})
+        if (claude_channel.steer_dir() / claude_channel.CLI).is_file():
+            claude_channel.cursor_hooks("disable")
     else:
         if harness == "claude-code" and (claude_channel.steer_dir() / claude_channel.CLI).is_file():
             claude_channel.hooks("disable")
@@ -136,21 +151,30 @@ def disable(harness: str, run: Runner = _run) -> dict[str, str]:
     return status(harness, run)
 
 
-def _claude_delivery() -> str:
-    """automatic＝返信を会話へ自動で渡す hook がある。manual＝無い（会話が自分で取りに来る）。"""
+def _delivery(harness: str) -> str:
+    """返信の渡し方。
+
+    automatic＝返信で会話が起きる（Claude Code。hook がある）。
+    wait＝会話が待ち受けの命令を動かしている間に届く（Cursor・Grok。Cursor は作業中なら hook が差し込む）。
+    manual＝どちらも無い（会話が自分で取りに来る）。
+    """
     if not (claude_channel.steer_dir() / claude_channel.CLI).is_file():
         return "manual"
     try:
-        found = claude_channel.hooks("status")
+        if harness == "claude-code":
+            found = claude_channel.hooks("status")
+            return "automatic" if found.get("registered") is True and not found.get("missing") else "manual"
+        if harness == "cursor":
+            return "wait" if claude_channel.cursor_hooks("status").get("registered") is True else "manual"
     except DeliveryError:
         return "manual"
-    return "automatic" if found.get("registered") is True and not found.get("missing") else "manual"
+    return "wait" if (claude_channel.steer_dir() / claude_channel.RECEIVE).is_file() else "manual"
 
 
 def status(harness: str, run: Runner = _run) -> dict[str, str]:
     """registered＝ローカル MCP として登録がある。restart は、動いている会話には次の起動から効く、の意味。
 
-    Claude Code の delivery は、返信の渡し方（automatic／manual）。どちらも、動いている会話には次の起動から効く。
+    delivery は、返信の渡し方（automatic／wait／manual）。
     """
     if harness not in HARNESSES:
         raise DeliveryError("HARNESS_UNSUPPORTED", f"{harness} には対応していません")
@@ -164,4 +188,4 @@ def status(harness: str, run: Runner = _run) -> dict[str, str]:
         shown = run([binary, "mcp", "get", NAME] if harness == "claude-code" else [binary, "mcp", "list"])
         local = shown.returncode == 0 and "call_bridge.local" in (shown.stdout + shown.stderr)
     result = {"harness": harness, "status": "registered" if local else "not_registered"}
-    return {**result, "delivery": _claude_delivery()} if harness == "claude-code" and local else result
+    return {**result, "delivery": _delivery(harness)} if local else result
