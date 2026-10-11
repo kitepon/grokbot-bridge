@@ -919,6 +919,7 @@ mcp = FastMCP("grokbot-bridge-local", instructions=(
     "parent_delivery.state が manual の時（Cursor・Grok と、hook の無い Claude Code）は自動では渡しません。"
     "call_poll で取りに来てください。会話が終わった後に届いた返信は、同じフォルダの席（Aiterm）へ渡されます。"
     "通話を引き継いだ時は、call_history で前のやりとりを読めます。"
+    "前の会話が開いた通話も、今の会話が call_send か call_poll で使えば、以後の返信は今の会話へ届きます（call_adopt は要りません）。"
 ), lifespan=_lifespan)
 
 
@@ -962,6 +963,46 @@ async def _claude_channel(ctx: Context) -> dict[str, str] | str:
                                                  dict(meta.model_extra or {}) if meta is not None else {})
     except DeliveryError as exc:
         return str(exc)
+
+
+async def _follow_speaker(session_id: str, ctx: Context | None) -> None:
+    """通話を使った会話（送った・取りに来た会話）へ、返信の届け先を合わせる。
+
+    会話は、起こし直しや引き継ぎで替わる。替わった会話が通話を使った時に、命令を足さなくても返信がその会話へ届くようにする。
+    通話を開いた端末の、生きている通話だけ。合わせられない時（hook が無い、Cursor・Grok など）は何もしない。
+    ここでの失敗で、道具の本来の仕事（送る・取りに行く）は止めない。
+    """
+    if ctx is None:
+        return
+    try:
+        harness = _parent_harness(ctx)
+        subscription = store.subscription(session_id)
+        if subscription["state"] == "closed" or harness not in ("claude-code", "codex"):
+            return
+        if harness == "codex":
+            thread_id, home = _parent(ctx)
+            if (subscription["harness"] == "codex" and subscription["thread_id"] == thread_id
+                    and subscription["delivery_mode"] in ("queue", "exec") and subscription["state"] == "active"):
+                return
+            if await verify_parent(thread_id, home) == "exec":
+                return  # codex exec の親へは、次のプロンプトの hook が渡す。付け替えない
+            store.adopt(session_id, thread_id, home, await _codex_folder(thread_id, home))
+        else:
+            params, meta = ctx.session.client_params, ctx.request_context.meta
+            channel = subscription["thread_id"] if subscription["delivery_mode"] == "channel" else None
+            mine = await claude_channel.own(params.clientInfo.name if params is not None else None,
+                                            dict(meta.model_extra or {}) if meta is not None else {}, channel)
+            if (channel and mine.get("channel_open") is True and mine.get("channel_session") == mine.get("session_id")
+                    and subscription["state"] == "active"):
+                return  # もうこの会話に付いている
+            opened = await _claude_channel(ctx)
+            if not isinstance(opened, dict):
+                return
+            store.adopt_channel(session_id, opened["channel_id"], await _parent_folder(ctx))
+        _start_watch(session_id)
+        log.info("call %s now follows the %s conversation that used it", session_id, harness)
+    except DeliveryError as exc:
+        log.info("call %s was not moved to the conversation that used it: %s", session_id, exc)
 
 
 async def _parent_folder(ctx: Context) -> str:
@@ -1081,15 +1122,22 @@ async def call_adopt(session_id: str, ctx: Context | None = None) -> dict[str, A
             "parent_delivery": {"state": "watching", "thread_id": thread_id}}
 
 
-@mcp.tool(description="通話へメッセージを送信。local は返信依頼が既定。返信不要なら reply_required=false")
+@mcp.tool(description="通話へメッセージを送信。local は返信依頼が既定。返信不要なら reply_required=false。"
+                      "Codex か、hook の入った Claude Code の会話が local として送ると、以後の返信はその会話へ届く")
 async def call_send(session_id: str, from_party: Literal["local", "member"], message: str,
-                    reply_required: bool = True) -> dict[str, Any]:
+                    reply_required: bool = True, ctx: Context | None = None) -> dict[str, Any]:
+    if from_party == "local":
+        await _follow_speaker(session_id, ctx)
     return await _remote_tool("call_send", {"session_id": session_id, "from_party": from_party,
                                             "message": message, "reply_required": reply_required})
 
 
-@mcp.tool(description="自分宛のメッセージを手動取得。自動配送中の親は通常不要")
-async def call_poll(session_id: str, party: Literal["local", "member"], after_seq: int = 0) -> dict[str, Any]:
+@mcp.tool(description="自分宛のメッセージを手動取得。自動配送中の親は通常不要。"
+                      "Codex か、hook の入った Claude Code の会話が local として取りに来ると、以後の返信はその会話へ届く")
+async def call_poll(session_id: str, party: Literal["local", "member"], after_seq: int = 0,
+                    ctx: Context | None = None) -> dict[str, Any]:
+    if party == "local":
+        await _follow_speaker(session_id, ctx)
     return await _remote_tool("call_poll", {"session_id": session_id, "party": party, "after_seq": after_seq})
 
 

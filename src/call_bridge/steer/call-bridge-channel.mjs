@@ -3,6 +3,7 @@
 // 共通パッケージ aiterm-steer-delivery の CLI は Codex だけなので、Claude Code の channel はここから呼ぶ。
 //
 //   open     --client <name> --meta <json>            → channel_id, session_id（道具を呼んだ会話に channel を開く）
+//   own      --client <name> --meta <json> [--channel <uuid>] → session_id（道具を呼んだ会話）, channel_open, channel_session
 //   send     --channel <uuid> --delivery <uuid>       → state（本文は stdin）
 //   state    --channel <uuid> --delivery <uuid>       → state（queued|sending|emitted|unknown|withdrawn|null）, closed,
 //                                                       parent_alive・transcript_age（queued の時だけ。会話が生きているか）
@@ -60,6 +61,21 @@ async function run(argv) {
             if (parent === null) throw Object.assign(new Error("Claude Code の会話ではありません"), { delivery_code: "CLAUDE_PARENT_UNSUPPORTED" });
             const channel = steer.openChannel(profile, parent);
             return { channel_id: channel.channel_id, session_id: channel.claude.session_id };
+        }
+        case "own": {
+            // 道具を呼んだ会話と、通話に付いている受け口の持ち主・開閉を答える。受け口は作らない。
+            const parent = steer.claudeParentFromRequest(profile, required(args, "--client"),
+                JSON.parse(required(args, "--meta")), steer.claudeHookRoot(profile));
+            if (parent === null) throw Object.assign(new Error("Claude Code の会話ではありません"), { delivery_code: "CLAUDE_PARENT_UNSUPPORTED" });
+            const id = option(args, "--channel");
+            let open = false, session = null;
+            if (id) {
+                try {
+                    session = steer.readChannel(profile, id).claude?.session_id ?? null;
+                    open = !steer.channelClosed(profile, id);
+                } catch { /* 受け口の記録が無い。閉じている物として扱う */ }
+            }
+            return { session_id: parent.session_id, channel_open: open, channel_session: session };
         }
         case "send":
             return await steer.sendToChannel(profile, required(args, "--channel"), required(args, "--delivery"), await readStdin());

@@ -254,6 +254,103 @@ class CallOpenTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.code, "PARENT_UNSUPPORTED")
 
 
+class FollowSpeakerTest(CallOpenTest):
+    """会話は、起こし直しや引き継ぎで替わる。通話を使った会話へ、命令を足さなくても返信が届くようにする。"""
+
+    def _codex_ctx(self, thread_id: str):
+        return SimpleNamespace(
+            session=SimpleNamespace(client_params=SimpleNamespace(clientInfo=SimpleNamespace(name="codex-mcp-client"))),
+            request_context=SimpleNamespace(meta=SimpleNamespace(model_extra={"threadId": thread_id})))
+
+    def _old_call(self, mode: str = "manual", conversation: str = "", harness: str = "claude-code") -> None:
+        self.store.add(self.session_id, conversation, Path(""), "リリーバイス", mode, "bellteam", harness, self.temp.name)
+
+    def _bound(self) -> tuple[str, str, str]:
+        saved = self.store.subscription(self.session_id)
+        return saved["delivery_mode"], saved["thread_id"], saved["harness"]
+
+    async def test_conversation_that_sends_on_an_older_call_gets_the_replies_from_then_on(self):
+        self._old_call()  # 前の会話が開いた通話。前の会話は、もう居ない
+        own = AsyncMock(return_value={"session_id": "conversation-2", "channel_open": False, "channel_session": None})
+        opened = AsyncMock(return_value={"channel_id": CHANNEL, "session_id": "conversation-2"})
+        with patch.object(local.claude_channel, "own", own), patch.object(local.claude_channel, "open_channel", opened):
+            result = await local.call_send(self.session_id, "local", "続きをやるよ", ctx=self._ctx())
+        self.assertEqual(result, {"session_id": self.session_id})  # 送る仕事は、今までどおり
+        own.assert_awaited_once_with("claude-code", {"claudecode/toolUseId": "toolu_1"}, None)
+        self.assertEqual(self._bound(), ("channel", CHANNEL, "claude-code"))
+        self.assertEqual(self.started, [(self.session_id, None)])
+
+    async def test_fetching_as_local_moves_the_call_too_and_a_seat_gives_it_back(self):
+        self._old_call("hosted", "cb-claude-seat-12345678")
+        own = AsyncMock(return_value={"session_id": "conversation-2", "channel_open": False, "channel_session": None})
+        opened = AsyncMock(return_value={"channel_id": CHANNEL, "session_id": "conversation-2"})
+        with patch.object(local.claude_channel, "own", own), patch.object(local.claude_channel, "open_channel", opened):
+            await local.call_poll(self.session_id, "local", ctx=self._ctx())
+        self.assertEqual(self._bound(), ("channel", CHANNEL, "claude-code"))
+
+    async def test_conversation_that_already_has_the_call_is_left_alone(self):
+        self._old_call("channel", CHANNEL)
+        own = AsyncMock(return_value={"session_id": "conversation-1", "channel_open": True, "channel_session": "conversation-1"})
+        opened = AsyncMock()
+        with patch.object(local.claude_channel, "own", own), patch.object(local.claude_channel, "open_channel", opened):
+            await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx())
+        own.assert_awaited_once_with("claude-code", {"claudecode/toolUseId": "toolu_1"}, CHANNEL)
+        self.assertEqual((opened.await_count, self.started), (0, []))
+
+    async def test_closed_channel_or_another_conversations_channel_is_replaced(self):
+        other = "22222222-2222-4222-8222-222222222222"
+        for answer in ({"session_id": "conversation-1", "channel_open": False, "channel_session": "conversation-1"},  # 再開の後
+                       {"session_id": "conversation-2", "channel_open": True, "channel_session": "conversation-1"}):  # 続きの会話
+            with self.subTest(answer=answer):
+                self.store.adopt_channel(self.session_id, other, None) if self._exists() else self._old_call("channel", other)
+                opened = AsyncMock(return_value={"channel_id": CHANNEL, "session_id": answer["session_id"]})
+                with patch.object(local.claude_channel, "own", AsyncMock(return_value=answer)), \
+                     patch.object(local.claude_channel, "open_channel", opened):
+                    await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx())
+                self.assertEqual(self._bound(), ("channel", CHANNEL, "claude-code"))
+
+    def _exists(self) -> bool:
+        try:
+            self.store.subscription(self.session_id)
+        except DeliveryError:
+            return False
+        return True
+
+    async def test_member_side_cursor_and_finished_calls_do_not_move_anything(self):
+        self._old_call()
+        own = AsyncMock()
+        with patch.object(local.claude_channel, "own", own):
+            await local.call_send(self.session_id, "member", "返事", ctx=self._ctx())
+            await local.call_poll(self.session_id, "member", ctx=self._ctx())
+            await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx("cursor-vscode"))
+            self.store.stop(self.session_id, "closed")
+            await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx())
+            await local.call_send(str(uuid.uuid4()), "local", "この端末の通話ではない", ctx=self._ctx())
+        self.assertEqual((own.await_count, self._bound()[0]), (0, "manual"))
+
+    async def test_a_conversation_without_the_hook_still_sends(self):
+        self._old_call()
+        failed = AsyncMock(side_effect=DeliveryError("CLAUDE_PARENT_HOOK_UNAVAILABLE", "hook がありません"))
+        with patch.object(local.claude_channel, "own", failed):
+            result = await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx())
+        self.assertEqual((result, self._bound()[0], self.started), ({"session_id": self.session_id}, "manual", []))
+
+    async def test_codex_conversation_that_uses_the_call_takes_it_over_too(self):
+        self._old_call("hosted", "cb-codex-seat-12345678", "codex")
+        thread = str(uuid.uuid4())
+        with patch.object(local, "verify_parent", AsyncMock(return_value="vscode")) as verified, \
+             patch.object(local, "_codex_folder", AsyncMock(return_value=self.temp.name)), \
+             patch.object(local, "codex_home", lambda: Path(self.temp.name)):
+            await local.call_send(self.session_id, "local", "続き", ctx=self._codex_ctx(thread))
+            self.assertEqual(self._bound(), ("queue", thread, "codex"))
+            await local.call_send(self.session_id, "local", "もう1通", ctx=self._codex_ctx(thread))
+        self.assertEqual(verified.await_count, 1)  # もう付いている会話では、確かめ直さない
+        with patch.object(local, "verify_parent", AsyncMock(return_value="exec")), \
+             patch.object(local, "codex_home", lambda: Path(self.temp.name)):
+            await local.call_send(self.session_id, "local", "exec から", ctx=self._codex_ctx(str(uuid.uuid4())))
+        self.assertEqual(self._bound(), ("queue", thread, "codex"))  # codex exec の親へは付け替えない
+
+
 class HarnessHookTest(unittest.TestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -378,7 +475,8 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
         document = json.loads(self.settings.read_text(encoding="utf-8"))
         self.assertEqual(document["model"], "x")
         self.assertEqual(document["hooks"]["Stop"][0]["hooks"][0]["command"], "echo other")
-        self.assertEqual(document["hooks"]["PreToolUse"][0]["matcher"], "^mcp__call-bridge__(call_open|call_adopt)$")
+        self.assertEqual(document["hooks"]["PreToolUse"][0]["matcher"],
+                         "^mcp__call-bridge__(call_open|call_adopt|call_send|call_poll)$")
         found = claude_channel.hooks("status")
         self.assertEqual((found["registered"], found["missing"]), (True, []))
         self.assertTrue(all(Path(script).name == claude_channel.HOOK for script in found["scripts"]))
@@ -427,7 +525,18 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
             await claude_channel.send(channel, third, "返信その3")
         self.assertEqual(caught.exception.code, "CHANNEL_DELIVERY_DUPLICATE")
 
+        # 通話を使う道具（call_send）でも会話を見分けられる。受け口の持ち主と開閉が分かる。
+        self.assertEqual(self._hook({"hook_event_name": "PreToolUse", "tool_use_id": "toolu_send01",
+                                     "tool_name": "mcp__call-bridge__call_send"}).wait(30), 0)
+        mine = await claude_channel.own("claude-code", {"claudecode/toolUseId": "toolu_send01"}, channel)
+        self.assertEqual((mine["session_id"], mine["channel_open"], mine["channel_session"]), (self.session, True, self.session))
+        nothing = await claude_channel.own("claude-code", {"claudecode/toolUseId": "toolu_send01"}, None)
+        self.assertEqual((nothing["channel_open"], nothing["channel_session"]), (False, None))
+
         self.assertEqual(self._hook({"hook_event_name": "SessionEnd"}).wait(30), 0)
+        with self.assertRaises(DeliveryError) as caught:  # 終わった会話の呼び出しは、もう見分けの元にならない
+            await claude_channel.own("claude-code", {"claudecode/toolUseId": "toolu_send01"}, channel)
+        self.assertEqual(caught.exception.code, "CLAUDE_PARENT_SESSION_CLOSED")
         with self.assertRaises(DeliveryError) as caught:
             await claude_channel.send(channel, str(uuid.uuid4()), "返信その4")
         self.assertEqual((caught.exception.code, caught.exception.outcome_unknown), ("CHANNEL_CLOSED", False))

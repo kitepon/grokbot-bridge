@@ -21,7 +21,9 @@ from .codex_delivery import (DeliveryError, _bridge_config, _steer_result, curre
 
 HOOK = "call-bridge-claude-hook.mjs"
 CLI = "call-bridge-channel.mjs"
-DISPATCH_TOOLS = ["call_open", "call_adopt"]
+# hook が会話を見分ける道具。通話を開く・引き取る時と、通話を使う時（送る・取りに行く）。
+# 通話を使った会話へ、返信の届け先を合わせる為（local.py の _follow_speaker）。
+DISPATCH_TOOLS = ["call_open", "call_adopt", "call_send", "call_poll"]
 # 0.4.2 より前は、Claude Code が起動し直して同じ会話を再開した後、開いてあった channel の本文が届かない。
 MIN_VERSION = (0, 4, 2)
 _TIMEOUT = 60
@@ -129,6 +131,12 @@ async def open_channel(client_name: str | None, meta: dict[str, Any]) -> dict[st
     if not isinstance(opened.get("channel_id"), str) or not isinstance(opened.get("session_id"), str):
         raise DeliveryError("CLAUDE_CHANNEL_UNAVAILABLE", "channel を開いた結果を読めません")
     return {"channel_id": opened["channel_id"], "session_id": opened["session_id"]}
+
+
+async def own(client_name: str | None, meta: dict[str, Any], channel_id: str | None) -> dict[str, Any]:
+    """道具を呼んだ会話（session_id）と、通話に付いている受け口の持ち主（channel_session）・開いているか。"""
+    args = ["own", "--client", client_name or "", "--meta", json.dumps(meta)]
+    return await run(args + (["--channel", channel_id] if channel_id else []))
 
 
 async def send(channel_id: str, delivery_id: str, text: str) -> None:

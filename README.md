@@ -25,6 +25,7 @@ GrokBot宛ての本文はマリアンを通らない。本文は橋に保存し�
 - キューへ入れた返信は、50秒後にキューから出たかを確かめる。番が走っていれば待つ。寝たまま・止められたままなら、キューから取り消したのを確かめてから席へ渡す。確かめられない時は `unknown` で止め、渡さない。
 - Claude Code の会話は、hook が入っていれば、返信を会話へ自動で渡す（`call_open` の結果の `parent_delivery.state` が `watching`）。番を終えて止まっている会話は、返信で起きる。作業中の会話には、その番へ入る（同じ番の2通目からは、番の終わりに入る）。
 - Claude Code の会話へ入れた返信は、10秒後に会話へ出たかを確かめる。誰も取り出していなくて、会話も生きていない時は、取り下げてから席へ渡す。取り下げた返信が何通かあれば、まとめて1回で渡す。生きている会話（channel を開いた process が居るか、会話の記録がこの2分のうちに書かれている）は、30分まで待つ。会話が終わった時は hook が受け口を閉じるので、次の返信はすぐ席へ渡る。
+- 会話は、起こし直しや引き継ぎで替わる。Codex か、hook の入った Claude Code の会話が、local として `call_send` か `call_poll` を呼ぶと、以後の返信はその会話へ届く（`call_adopt` を呼ばなくてよい）。前の会話が開いた通話も、席が受け取った通話も、使った会話へ付いて行く。`codex exec` の親へは付け替えない。
 - Cursor・Grok と、hook の無い Claude Code の会話は、返信を自分で `call_poll` する（`parent_delivery.state` が `manual`。Claude Code では `reason` に理由が出る）。会話が生きている間は、その会話の MCP が通話の鍵を持つ。会話が終わった後に届いた返信は、常駐の受け取り係が席へ渡す。
 - 確かに届けていない失敗（席が起動の画面で止まった、フォルダが分からない等）では見張りを止めず、同じ通話に新しい返信が来た時に、その返信からやり直す。時間で繰り返す再試行はしない。
 - 立てた結果・送った結果が分からない時は、立て直さない・送り直さない。本文は通話に残る。
@@ -70,8 +71,8 @@ call-bridge-setup harness grok enable
 Claude Code には、返信を会話へ自動で渡すための hook も登録する（`status` の `delivery` が `automatic`）。
 
 - 使うのは共通パッケージ aiterm-steer-delivery（0.4.2 以降）の channel。Claude Code の公式の hook（`asyncRewake`）が、止まっている会話を起こして本文を渡す。パッケージの CLI は Codex だけなので、call-bridge の Node の入口（`src/call_bridge/steer/`）から呼ぶ。入口は置き場の `steer/` へ写し、パッケージの場所を隣の `steer.json` に書く。入れ直した後は、もう一度 `enable` を流す。
-- 登録先は Claude Code の利用者の設定（`~/.claude/settings.json`。`CLAUDE_CONFIG_DIR` があればその中）。`PreToolUse`・`PostToolUse`（`call_open` と `call_adopt` だけ）、`Stop`、`SessionStart`、`SessionEnd` に1つずつ足す。ほかの hook は変えない。書き換える前の控えが `settings.json.call-bridge-backup` に残る。
-- 入れ直す前から動いている会話は、その会話の通話MCP（`call_bridge.local` の process）が古いままなので、今までどおり自分で取りに来る。Claude Code を起動し直すか、`/mcp` で call-bridge をつなぎ直した後に、`call_open` か `call_adopt` を呼んだ通話から効く。hook そのものは、動いている Claude Code にも設定の書き換えだけで効く（Claude Code 2.1.296 の Linux で確かめた。hook を入れる前から動いていた会話が、後から入れた hook で受け取れた）。
+- 登録先は Claude Code の利用者の設定（`~/.claude/settings.json`。`CLAUDE_CONFIG_DIR` があればその中）。`PreToolUse`・`PostToolUse`（`call_open`・`call_adopt`・`call_send`・`call_poll` だけ）、`Stop`、`SessionStart`、`SessionEnd` に1つずつ足す。ほかの hook は変えない。書き換える前の控えが `settings.json.call-bridge-backup` に残る。
+- 入れ直す前から動いている会話は、その会話の通話MCP（`call_bridge.local` の process）が古いままなので、今までどおり自分で取りに来る。Claude Code を起動し直すか、`/mcp` で call-bridge をつなぎ直した後に、その会話が通話を使った時（`call_send`・`call_poll`）から効く。hook そのものは、動いている Claude Code にも設定の書き換えだけで効く（Claude Code 2.1.296 の Linux で確かめた。hook を入れる前から動いていた会話が、後から入れた hook で受け取れた）。
 - パッケージが無い・古い端末でも、ローカル MCP の登録は済ませる。その時は `warning` に理由が出て、`delivery` は `manual`。
 - 待ち受けは24時間で切れる。丸1日だれも話しかけていない会話は起こさず、返信は30分後に席へ渡る。
 
