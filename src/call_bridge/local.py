@@ -330,6 +330,17 @@ class LocalStore:
             db.execute("UPDATE deliveries SET state = 'failed', error = ?, confirmed = 1 WHERE session_id = ? AND seq = ?",
                        (error, session_id, seq))
 
+    def requeue(self, session_id: str, seqs: list[int], error: str) -> None:
+        """届け先を替えた。前の受け口から取り下げた返信を、新しい届け先へもう一度渡す（見張りが、その seq から扱い直す）。"""
+        if not seqs:
+            return
+        with self.connect() as db:
+            for seq in seqs:
+                db.execute("UPDATE deliveries SET state = 'failed', error = ?, confirmed = 1 WHERE session_id = ? AND seq = ?",
+                           (error, session_id, seq))
+            db.execute("UPDATE subscriptions SET after_seq = MIN(after_seq, ?), hold_seq = NULL WHERE session_id = ?",
+                       (min(seqs) - 1, session_id))
+
     def bound_to(self, harness: str, thread_id: str, session_id: str) -> list[dict[str, Any]]:
         """同じ会話に付いている、生きている通話。会話のIDが無い結び付けは、その通話だけ。"""
         with self.connect() as db:
@@ -997,6 +1008,29 @@ async def _wait_channel(ctx: Context) -> dict[str, str] | str:
         return str(exc)
 
 
+async def _move_to_channel(previous: dict[str, Any], channel_id: str, folder: str | None, harness: str = "claude-code") -> None:
+    """通話の届け先を、新しい受け口（道具を呼んだ会話）へ替える。
+
+    前の受け口に並んだまま読まれていない返信は、取り下げて、新しい届け先へもう一度渡す。そのままにすると、
+    前の会話（止まっている・引き継がれた）の受け口に残り、だれにも届かない（2026-10-11 に fox で起きた）。
+    取り下げられなかった返信は、前の会話がもう取り出している。重ねては渡さない。
+    """
+    session_id = previous["session_id"]
+    carried: list[int] = []
+    if previous["delivery_mode"] == "channel" and previous["thread_id"] != channel_id:
+        for row in store.unconfirmed(session_id):
+            try:
+                if await claude_channel.withdraw(previous["thread_id"], row["delivery_id"]):
+                    carried.append(row["seq"])
+            except DeliveryError as exc:
+                # 前の受け口を読めない。今までどおり（前の会話へ渡した物として扱う）。
+                log.warning("unread reply for %s seq=%s was not carried over: %s", session_id, row["seq"], exc)
+    store.adopt_channel(session_id, channel_id, folder, harness)
+    store.requeue(session_id, carried, "届け先の会話が替わりました")
+    if carried:
+        log.info("call %s carries %s unread replies over to the new conversation", session_id, len(carried))
+
+
 async def _follow_speaker(session_id: str, ctx: Context | None) -> dict[str, Any] | None:
     """通話を使った会話（送った・取りに来た会話）へ、返信の届け先を合わせる。
 
@@ -1026,7 +1060,7 @@ async def _follow_speaker(session_id: str, ctx: Context | None) -> dict[str, Any
             if not isinstance(opened, dict):
                 return None
             folder = await _parent_folder(ctx)
-            store.adopt_channel(session_id, opened["channel_id"], folder, harness)
+            await _move_to_channel(subscription, opened["channel_id"], folder, harness)
             _start_watch(session_id)
             log.info("call %s now follows the %s conversation that used it", session_id, harness)
             return _waiting(opened, harness, folder)
@@ -1049,7 +1083,7 @@ async def _follow_speaker(session_id: str, ctx: Context | None) -> dict[str, Any
             opened = await _claude_channel(ctx)
             if not isinstance(opened, dict):
                 return None
-            store.adopt_channel(session_id, opened["channel_id"], await _parent_folder(ctx))
+            await _move_to_channel(subscription, opened["channel_id"], await _parent_folder(ctx))
         _start_watch(session_id)
         log.info("call %s now follows the %s conversation that used it", session_id, harness)
     except DeliveryError as exc:
@@ -1163,7 +1197,7 @@ async def call_adopt(session_id: str, ctx: Context | None = None) -> dict[str, A
         channel = await _claude_channel(ctx)
         if not isinstance(channel, dict):
             raise DeliveryError("PARENT_UNSUPPORTED", f"この Claude Code の会話へは付け替えられません（{channel}）")
-        store.adopt_channel(session_id, channel["channel_id"], await _parent_folder(ctx))
+        await _move_to_channel(previous, channel["channel_id"], await _parent_folder(ctx))
         _start_watch(session_id)
         return {"session_id": session_id, "previous": before,
                 "parent_delivery": {"state": "watching", "harness": "claude-code", "conversation": channel["session_id"]}}

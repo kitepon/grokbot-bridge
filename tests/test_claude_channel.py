@@ -357,6 +357,42 @@ class FollowSpeakerTest(CallOpenTest):
             return False
         return True
 
+    async def test_unread_replies_in_the_previous_channel_move_with_the_call(self):
+        """前の会話（止まった・引き継がれた）の受け口に並んだまま読まれていない返信は、新しい会話へ渡し直す。"""
+        other = "22222222-2222-4222-8222-222222222222"
+        self._old_call("channel", other)
+        # seq 5 は前の会話へ出た（確かめ済み）。seq 6 は並んだまま。seq 7 は前の会話がちょうど取り出した（取り下げられない）。
+        for seq, confirmed in ((5, True), (6, False), (7, False)):
+            self.store.reserve(self.session_id, seq)
+            self.store.submitted(self.session_id, seq, confirmed=confirmed)
+        ids = {row["seq"]: row["delivery_id"] for row in self.store.unconfirmed(self.session_id)}
+        withdraw = AsyncMock(side_effect=lambda _channel, delivery: delivery == ids[6])
+        own = AsyncMock(return_value={"session_id": "conversation-2", "channel_open": True, "channel_session": "conversation-1"})
+        opened = AsyncMock(return_value={"channel_id": CHANNEL, "session_id": "conversation-2"})
+        with patch.object(local.claude_channel, "own", own), patch.object(local.claude_channel, "open_channel", opened), \
+             patch.object(local.claude_channel, "withdraw", withdraw):
+            await local.call_send(self.session_id, "local", "続きをやるよ", ctx=self._ctx())
+        self.assertEqual([call.args for call in withdraw.await_args_list], [(other, ids[6]), (other, ids[7])])  # 前の受け口から
+        saved = self.store.subscription(self.session_id)
+        self.assertEqual((saved["thread_id"], saved["after_seq"], saved["hold_seq"]), (CHANNEL, 5, None))  # seq 6 から扱い直す
+        states = {row["seq"]: row["state"] for row in self.store.status(self.session_id)["deliveries"]}
+        self.assertEqual(states, {5: "submitted", 6: "failed", 7: "submitted"})
+        self.assertEqual(self.store.reserve(self.session_id, 6)[1], "new")  # 見張りが、新しい届け先へ渡し直せる
+
+    async def test_previous_channel_that_cannot_be_read_does_not_stop_the_move(self):
+        other = "22222222-2222-4222-8222-222222222222"
+        self._old_call("channel", other)
+        self.store.reserve(self.session_id, 6)
+        self.store.submitted(self.session_id, 6, confirmed=False)
+        withdraw = AsyncMock(side_effect=DeliveryError("CHANNEL_UNKNOWN", "受け口の記録がありません"))
+        own = AsyncMock(return_value={"session_id": "conversation-2", "channel_open": False, "channel_session": None})
+        opened = AsyncMock(return_value={"channel_id": CHANNEL, "session_id": "conversation-2"})
+        with patch.object(local.claude_channel, "own", own), patch.object(local.claude_channel, "open_channel", opened), \
+             patch.object(local.claude_channel, "withdraw", withdraw):
+            await local.call_send(self.session_id, "local", "続きをやるよ", ctx=self._ctx())
+        saved = self.store.subscription(self.session_id)
+        self.assertEqual((saved["thread_id"], saved["after_seq"]), (CHANNEL, 6))  # 付け替えは済む。seq 6 は今までどおり
+
     async def test_cursor_or_grok_that_uses_a_call_gets_the_wait_command_each_time(self):
         self._old_call()  # 前の会話（Claude Code）が開いた通話を、Grok の会話が使う
         waited = AsyncMock(return_value={"channel_id": CHANNEL, "wait": "node receive.mjs --channel new"})
