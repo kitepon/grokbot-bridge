@@ -82,8 +82,14 @@ class ClaudeBackgroundTest(unittest.IsolatedAsyncioTestCase):
         self._plan([self._job(state="stopped"), {"pid": 30380, "kind": "interactive", "sessionId": SESSION, "cwd": str(self.folder)}])
         self.assertTrue((await claude_bg.background(SESSION)).running)
 
+    async def test_conversation_stopped_while_waiting_for_an_answer_is_one_to_wake(self):
+        # 確認待ち（blocked）で番を終えた会話も、Claude Code は同じように止める（log は `bg retire …: idle-prompt`）。
+        self._plan([self._job(state="blocked")])
+        found = await claude_bg.background(SESSION)
+        self.assertEqual((found.running, found.state, found.retired), (False, "blocked", True))
+
     async def test_conversation_stopped_in_the_middle_of_its_work_is_not_one_to_wake(self):
-        for state in ("stopped", "working", "blocked"):
+        for state in ("stopped", "working"):
             with self.subTest(state=state):
                 self._plan([self._job(state=state)])
                 found = await claude_bg.background(SESSION)

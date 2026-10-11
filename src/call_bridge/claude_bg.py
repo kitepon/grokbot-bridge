@@ -1,16 +1,21 @@
 """Claude Code に止められた裏の会話（claude --bg）を、同じ会話のまま起こす。
 
-Claude Code は、裏の会話が「済んだ」と申告して動かないまま約1時間たつと、その process を止める（会話の記録は残す）。
+Claude Code は、番を終えて入力を待っている裏の会話を、動かないまま約1時間たつと止める（会話の記録は残す）。
 Throughline が立てる後継は裏の会話なので、相手の返信を待っている役の会話が、これで止まる
 （2026-10-11 に fox で、Claude Code の log に `bg retire e50377e1: settled, idle 61m`）。
 止められた会話は、Claude Code の公式の口 `claude --bg --resume <session id> <文>` で、同じ番号・同じ記憶・
 保存された起動の設定のまま起きる。動いている会話に同じ命令を出すと写しが出来るので、先に一覧で確かめる。
+`--model` や `--effort` を足して呼ぶと、同じ会話は起きずに写しが立ち、保存された設定（承認の形・名前）が落ちる
+（2026-10-12 に fox で確かめた）。だから、ここでは文のほかに何も足さない。
 
 会話の一覧は `claude agents --json --all`（読むだけ）。裏の会話の行は kind=background で、動いている時だけ pid が付く。
 同じ会話をアプリや端末で開いている時は kind=interactive の行が別にあり、そこに pid が付く。
-state は、会話が最後に申告した状態。Claude Code が自分で止めた会話は done のまま残る（番を終えて「済んだ」会話だけを止めるため）。
-仕事の途中（working・blocked）で人が止めた会話と、アプリへ移した会話は stopped になる。起こすのは done だけ。
+state は、会話が最後に申告した状態。番を終えて待っている会話は done（済んだ）か blocked（利用者の答えや確認を待っている）で、
+Claude Code が自分で止めた後も、そのまま残る（log は done が `settled`、blocked が `idle-prompt`）。
+仕事の途中（working）で人が止めた会話と、アプリへ移した会話は stopped になる。起こすのは done と blocked だけ。
 人が途中で止めた仕事を、返信が来たからといって動かし直さない。
+blocked を起こさなかった間は、確認待ちで止まった役の会話あての返信が、担当フォルダの席へ渡っていた
+（2026-10-12 に fox で、Windows のベルの会話 1dea5653。席の中身は Throughline に引き継がれた後の会話で、何も出来なかった）。
 """
 
 from __future__ import annotations
@@ -87,8 +92,8 @@ class Background:
 
     @property
     def retired(self) -> bool:
-        """番を終えた後で止まっていて、どこでも動いていない。同じ会話のまま起こしてよい。"""
-        return self.state == "done" and not self.running
+        """番を終えて待っている形で止まっていて、どこでも動いていない。同じ会話のまま起こしてよい。"""
+        return self.state in ("done", "blocked") and not self.running
 
 
 async def background(session_id: str) -> Background | None:

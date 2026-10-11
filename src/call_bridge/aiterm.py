@@ -32,6 +32,29 @@ _DIRECT_TIMEOUT = 300
 # 1行・200字以内・行頭が記号や空白でない・@ を含まない、が Aiterm の決まり。
 PREFACE = "通話MCP（call-bridge）が渡す、通話の相手からの返信です。この会話の仕事の続きとして、下の文に対応してください。"
 _DIRECT_LINE_LIMIT = 16 * 1024 * 1024
+# Claude Code の席を立てる時に渡すモデルと思考の強さ。渡さないと、その端末の ~/.claude/settings.json の既定で立つ
+# （2026-10-11 に Mac で、止まった会話の役を引き継ぐ席が sonnet・low で立ち、そのまま仕事を任されていた）。
+# 端末ごとに変える時は、config.json の claude_seat_model／claude_seat_effort に書く。
+CLAUDE_SEAT_MODEL = "claude-opus-5-5"
+CLAUDE_SEAT_EFFORT = "high"
+
+
+def _config() -> dict[str, Any]:
+    config_file = state_root() / "config.json"
+    return json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+
+
+def seat_settings(harness: str) -> dict[str, str]:
+    """席を立てる時に Aiterm へ渡す model と reasoning_effort（Claude Code では --model と --effort になる）。
+
+    Claude Code の席にだけ付ける。ほかのハーネスの席は、今までどおりその端末の設定で立つ。
+    """
+    if harness != "claude-code":
+        return {}
+    config = _config()
+    model, effort = config.get("claude_seat_model"), config.get("claude_seat_effort")
+    return {"model": model if isinstance(model, str) and model else CLAUDE_SEAT_MODEL,
+            "reasoning_effort": effort if isinstance(effort, str) and effort else CLAUDE_SEAT_EFFORT}
 
 
 def seat_preface(harness: str) -> str | None:
@@ -50,8 +73,7 @@ class AitermError(DeliveryError):
 
 def aiterm_command() -> list[str]:
     """npm のシム（Windows の .cmd／.ps1）を避け、同じ場所の dist/index.js を Node で直接起こす。"""
-    config_file = state_root() / "config.json"
-    config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
+    config = _config()
     binary = os.environ.get("CALL_BRIDGE_AITERM") or config.get("aiterm_mcp") or shutil.which("aiterm-mcp")
     if not binary:
         raise AitermError("AITERM_UNAVAILABLE", "aiterm-mcp が見つかりません。npm install -g aiterm-mcp を実行してください",
@@ -62,8 +84,11 @@ def aiterm_command() -> list[str]:
         if not script.is_file():
             return [str(path)]
         path = script.resolve()
-    node = config.get("steer_node") or config.get("node_binary") or shutil.which("node")
-    if not isinstance(node, str) or not Path(node).is_file():
+    # 控えた場所から Node が無くなっている事がある（Homebrew が Node を上げると、版つきの実体の場所が変わる。
+    # 2026-10-12 に Mac で、古い版が控えた場所が無くなり、席を立てられなくなっていた）。今ある物を順に探す。
+    candidates = (config.get("steer_node"), config.get("node_binary"), shutil.which("node"))
+    node = next((item for item in candidates if isinstance(item, str) and Path(item).is_file()), None)
+    if node is None:
         raise AitermError("AITERM_UNAVAILABLE", "aiterm-mcp の Node 実行ファイルが見つかりません", sent=False)
     return [node, str(path)]
 
@@ -96,9 +121,11 @@ class Aiterm:
 
         入っていない時（席は起きたが、最初の文は打たれなかった）は、呼び出し側が send で送る。
         Claude Code の席は、文を渡さずに立ててから、前置きを付けて送る（起動の時に渡す文には前置きを付けられない）。
+        Claude Code の席には、モデルと思考の強さも渡す（seat_settings）。
         """
         framed = harness == "claude-code"
-        arguments = {"harness": HARNESSES[harness], "cwd": cwd, "session_name": session_name, "trust_project": True}
+        arguments = {"harness": HARNESSES[harness], "cwd": cwd, "session_name": session_name, "trust_project": True,
+                     **seat_settings(harness)}
         if not framed:
             arguments["prompt"] = prompt
         result = await self._call("agent_launch", arguments)
