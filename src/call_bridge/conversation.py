@@ -167,9 +167,10 @@ async def handoff_operations(host: str = "codex") -> list[dict[str, Any]]:
     return [row for row in rows if isinstance(row, dict)] if isinstance(rows, list) else []
 
 
-# Claude Code の会話が Throughline に引き継がれて、もう仕事をしない状態。後継を立てている所から後。
-# requested は予約だけで、会話はまだ動く（次に道具を使う時に止まる）。failed は、後継が立っていない。
-_CLAUDE_RETIRED = ("launching", "launched", "sent", "unknown")
+# Claude Code の会話が Throughline に引き継がれて、もう仕事をしない状態。道具を止めた所から後（Throughline の担当の説明）。
+# stopped は、道具を止めてから後継を立て始めるまでの数秒。この間も道具は断られ、後継は立て直されない。
+# requested と failed は、次の道具で止まって後継が立つ（立て直す）。その時の入力は後継の記憶へ入るので、渡してよい。
+_CLAUDE_RETIRED = ("stopped", "launching", "launched", "sent", "unknown")
 
 
 async def claude_handoff(session_id: str) -> dict[str, Any] | None:
