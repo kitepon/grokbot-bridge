@@ -2,6 +2,7 @@
 
 Codex の登録は setup.py が公式の設定 API で行う。ここは残りの3つで、各 CLI の公式の登録先だけを書く。
 登録するのは call-bridge の1項目だけで、ほかの MCP とほかの設定は変えない。
+Claude Code には、返信を会話へ自動で渡すための hook も登録する（claude_channel）。
 """
 
 from __future__ import annotations
@@ -14,6 +15,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
+from . import claude_channel
 from .codex_delivery import DeliveryError, grant_user_access, state_root
 
 NAME = "call-bridge"
@@ -104,8 +106,18 @@ def enable(harness: str, run: Runner = _run) -> dict[str, str]:
                     else [cli, "mcp", "add", "--scope", "user", NAME, command[0], "--", *command[1:]])
         if added.returncode:
             raise DeliveryError("HARNESS_SETUP_FAILED", (added.stderr or added.stdout).strip()[-300:])
+    warning = None
+    if harness == "claude-code":
+        # 返信を会話へ自動で渡す hook。入れられない端末（配送のパッケージが無い・古い）でも、登録は済ませる。
+        # その時は今までどおり、会話が自分で取りに来る。
+        try:
+            claude_channel.install(NAME)
+            claude_channel.hooks("enable")
+        except DeliveryError as exc:
+            warning = str(exc)
     grant_user_access()  # 登録した CLI は普段の権限で動く。控えをその権限で開けるようにする
-    return status(harness, run)
+    result = status(harness, run)
+    return {**result, "warning": warning} if warning else result
 
 
 def disable(harness: str, run: Runner = _run) -> dict[str, str]:
@@ -118,12 +130,28 @@ def disable(harness: str, run: Runner = _run) -> dict[str, str]:
             del servers[NAME]
             _cursor_write({**value, "mcpServers": servers})
     else:
+        if harness == "claude-code" and (claude_channel.steer_dir() / claude_channel.CLI).is_file():
+            claude_channel.hooks("disable")
         run([_cli(harness), "mcp", "remove", "--scope", "user", NAME])
     return status(harness, run)
 
 
+def _claude_delivery() -> str:
+    """automatic＝返信を会話へ自動で渡す hook がある。manual＝無い（会話が自分で取りに来る）。"""
+    if not (claude_channel.steer_dir() / claude_channel.CLI).is_file():
+        return "manual"
+    try:
+        found = claude_channel.hooks("status")
+    except DeliveryError:
+        return "manual"
+    return "automatic" if found.get("registered") is True and not found.get("missing") else "manual"
+
+
 def status(harness: str, run: Runner = _run) -> dict[str, str]:
-    """registered＝ローカル MCP として登録がある。restart は、動いている会話には次の起動から効く、の意味。"""
+    """registered＝ローカル MCP として登録がある。restart は、動いている会話には次の起動から効く、の意味。
+
+    Claude Code の delivery は、返信の渡し方（automatic／manual）。どちらも、動いている会話には次の起動から効く。
+    """
     if harness not in HARNESSES:
         raise DeliveryError("HARNESS_UNSUPPORTED", f"{harness} には対応していません")
     if harness == "cursor":
@@ -135,4 +163,5 @@ def status(harness: str, run: Runner = _run) -> dict[str, str]:
             return {"harness": harness, "status": "unavailable"}
         shown = run([binary, "mcp", "get", NAME] if harness == "claude-code" else [binary, "mcp", "list"])
         local = shown.returncode == 0 and "call_bridge.local" in (shown.stdout + shown.stderr)
-    return {"harness": harness, "status": "registered" if local else "not_registered"}
+    result = {"harness": harness, "status": "registered" if local else "not_registered"}
+    return {**result, "delivery": _claude_delivery()} if harness == "claude-code" and local else result

@@ -23,17 +23,19 @@ GrokBot宛ての本文はマリアンを通らない。本文は橋に保存し�
 - 席は Aiterm の session で、端末・ハーネス・フォルダごとに1つ（名前は `cb-<ハーネス>-<フォルダ名>-<8桁>`）。動いていればそこへ送り、無ければ立てる。止まった会話に付いていた通話は、その席へ付け替える。
 - Codex の会話は、キューへ入れる前に状態を読む。会話が無い・途中で止められている時は、Throughline の続きの会話（`throughline auto-handoff status --json`）があればそこへ付け替え、無ければ席へ渡す。中断から120秒以内は待つ。
 - キューへ入れた返信は、50秒後にキューから出たかを確かめる。番が走っていれば待つ。寝たまま・止められたままなら、キューから取り消したのを確かめてから席へ渡す。確かめられない時は `unknown` で止め、渡さない。
-- Claude Code・Cursor・Grok の会話は、返信を自分で `call_poll` する（`call_open` の結果の `parent_delivery.state` が `manual`）。会話が生きている間は、その会話の MCP が通話の鍵を持つ。会話が終わった後に届いた返信は、常駐の受け取り係が席へ渡す。
+- Claude Code の会話は、hook が入っていれば、返信を会話へ自動で渡す（`call_open` の結果の `parent_delivery.state` が `watching`）。番を終えて止まっている会話は、返信で起きる。作業中の会話には、その番へ入る（同じ番の2通目からは、番の終わりに入る）。
+- Claude Code の会話へ入れた返信は、10秒後に会話へ出たかを確かめる。誰も取り出していなくて、会話も生きていない時は、取り下げてから席へ渡す。取り下げた返信が何通かあれば、まとめて1回で渡す。生きている会話（channel を開いた process が居るか、会話の記録がこの2分のうちに書かれている）は、30分まで待つ。会話が終わった時は hook が受け口を閉じるので、次の返信はすぐ席へ渡る。
+- Cursor・Grok と、hook の無い Claude Code の会話は、返信を自分で `call_poll` する（`parent_delivery.state` が `manual`。Claude Code では `reason` に理由が出る）。会話が生きている間は、その会話の MCP が通話の鍵を持つ。会話が終わった後に届いた返信は、常駐の受け取り係が席へ渡す。
 - 確かに届けていない失敗（席が起動の画面で止まった、フォルダが分からない等）では見張りを止めず、同じ通話に新しい返信が来た時に、その返信からやり直す。時間で繰り返す再試行はしない。
 - 立てた結果・送った結果が分からない時は、立て直さない・送り直さない。本文は通話に残る。
 
 member から見える物：
 
 - `call_send(from_party="member")` の結果。相手が BellTeam 以外なら `delivery.status=stored` と、相手が最後に取りに来た時刻（`local_seen_at`）。`stored` は受領を表さない。
-- `call_info` の `local_delivery`。seq ごとに `submitted`（会話のキューか席へ入れた）、`started`（会話が番を始めた）、`fetched`（会話が自分で取りに来た）、`relaunched`（席へ渡した。`detail` に理由）、`failed`、`unknown`。`conversation` は `codex:<会話>` か `hosted:<席>`。
+- `call_info` の `local_delivery`。seq ごとに `submitted`（会話のキューか席へ入れた）、`started`（会話が番を始めた）、`fetched`（会話が自分で取りに来た）、`relaunched`（席へ渡した。`detail` に理由）、`failed`、`unknown`。`conversation` は `codex:<会話>`、`claude:<受け口>`、`hosted:<席>` のどれか。
 - `call_history`。両方の発言を seq の順に読む（既読にしない）。席は、これで前のやりとりを読む。
 
-端末の側の道具：`call_adopt(session_id)` は、新しい Codex の会話が通話を自分へ付け替える。
+端末の側の道具：`call_adopt(session_id)` は、新しい会話（Codex か、hook の入った Claude Code）が通話を自分へ付け替える。席が受け取った通話を、人が見ている会話へ戻す時にも使う。
 
 ### 常駐の受け取り係
 
@@ -64,6 +66,14 @@ call-bridge-setup harness grok enable
 ```
 
 各 CLI の利用者の設定へ、ローカル MCP（`python -m call_bridge.local`）を `call-bridge` の1項目だけ書く。合言葉は、この端末の `auth.json`（Codex で `enable` 済み）か、環境変数から受け取って `auth.json` に置く。席から通話へ返すにも、この登録が要る。
+
+Claude Code には、返信を会話へ自動で渡すための hook も登録する（`status` の `delivery` が `automatic`）。
+
+- 使うのは共通パッケージ aiterm-steer-delivery（0.4.2 以降）の channel。Claude Code の公式の hook（`asyncRewake`）が、止まっている会話を起こして本文を渡す。パッケージの CLI は Codex だけなので、call-bridge の Node の入口（`src/call_bridge/steer/`）から呼ぶ。入口は置き場の `steer/` へ写し、パッケージの場所を隣の `steer.json` に書く。入れ直した後は、もう一度 `enable` を流す。
+- 登録先は Claude Code の利用者の設定（`~/.claude/settings.json`。`CLAUDE_CONFIG_DIR` があればその中）。`PreToolUse`・`PostToolUse`（`call_open` と `call_adopt` だけ）、`Stop`、`SessionStart`、`SessionEnd` に1つずつ足す。ほかの hook は変えない。書き換える前の控えが `settings.json.call-bridge-backup` に残る。
+- 効くのは、登録の後に起きた会話。前から動いている会話は、今までどおり自分で取りに来る。
+- パッケージが無い・古い端末でも、ローカル MCP の登録は済ませる。その時は `warning` に理由が出て、`delivery` は `manual`。
+- 待ち受けは24時間で切れる。丸1日だれも話しかけていない会話は起こさず、返信は30分後に席へ渡る。
 
 ### Windows で入れ直す時
 
