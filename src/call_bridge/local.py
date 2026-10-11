@@ -766,10 +766,13 @@ class Watchers:
                 self.store.note_relaunch(source, target, "failed", str(exc))
                 log.warning("stopped conversation %s was not woken: %s", conversation, exc)
                 return False, None
-            if not conversation.startswith(started):
+            if not started:
+                # 命令は流れたが、起きた印を読めなかった。起きたかは、次に一覧を読んだ時に分かる（動いていなければ席へ渡す）。
+                log.warning("wake of %s could not be confirmed from claude's output; checking the list next", conversation)
+            elif not conversation.startswith(started):
                 # 一覧を読んだ後に、ほかの誰かが同じ会話を開いた。Claude Code は写しを立てる。知らせは写しへ入っている。
                 log.warning("conversation %s was already running; Claude Code started a copy %s", conversation, started)
-            self.store.note_relaunch(source, target, "started", f"{reason}（起きた会話 {started}）")
+            self.store.note_relaunch(source, target, "started", f"{reason}（起きた会話 {started or '確かめ中'}）")
         return True, None
 
     async def _manual(self, subscription: dict[str, Any], message: dict[str, Any], text: str,

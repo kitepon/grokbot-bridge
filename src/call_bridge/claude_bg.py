@@ -36,8 +36,9 @@ def _claude() -> str | None:
     return os.environ.get("CALL_BRIDGE_CLAUDE") or shutil.which("claude")
 
 
-async def _run(args: list[str], cwd: str | None = None, merge: bool = False) -> tuple[int, str] | None:
-    """claude の命令を1回流して、終わりの番号と出力を返す。無い・起こせない・終わらない時は None。
+async def _run(args: list[str], cwd: str | None = None, merge: bool = False) -> tuple[int | None, str] | None:
+    """claude の命令を1回流して、終わりの番号と出力を返す。claude が無い・起こせない時は None（何も始まっていない）。
+    時間切れで止めた時は、終わりの番号が None（どこまで進んだかは分からない）。
 
     出力は file で受ける。`claude --bg` は裏方の process を起こす事があり、pipe で受けると、
     その process が口を持ったままの時に読み終わらない。
@@ -52,12 +53,13 @@ async def _run(args: list[str], cwd: str | None = None, merge: bool = False) -> 
                 stderr=asyncio.subprocess.STDOUT if merge else asyncio.subprocess.DEVNULL, **hidden_child())
         except OSError:
             return None
+        code: int | None
         try:
             code = await asyncio.wait_for(process.wait(), _TIMEOUT)
         except asyncio.TimeoutError:
             process.kill()
             await process.wait()
-            return None
+            code = None
         output.seek(0)
         return code, output.read().decode("utf-8", "replace")
 
@@ -119,7 +121,10 @@ def wake_prompt(calls: list[str]) -> str:
 async def wake(found: Background, calls: list[str]) -> str:
     """止まっている裏の会話を起こす。起きた会話の番号の頭8字を返す（同じ会話なら、会話の番号の頭と同じ）。
 
-    DeliveryError は、起こせなかった時。返信の本文は渡していないので、席へ渡す道はそのまま使える。
+    空の文字が返った時は、命令は流れたが、起きた印を出力から読めなかった（時間切れ、または出力の書き方が変わった）。
+    起きたかは、呼んだ側が次に一覧を読んで確かめる。ここで「起こせなかった」と決めて席へ渡すと、
+    実は起きていた時に、起きた会話と席の両方が同じ返信で動く。
+    DeliveryError は、確かに起きていない時（claude が無い、命令が失敗で終わった）。席へ渡す道はそのまま使える。
     """
     if not _SESSION.match(found.session_id) or not calls or not all(_SESSION.match(call) for call in calls):
         raise DeliveryError("CLAUDE_BG_ARGUMENT", "会話か通話の番号の形が違います")
@@ -129,8 +134,8 @@ async def wake(found: Background, calls: list[str]) -> str:
     if result is None:
         raise DeliveryError("CLAUDE_BG_UNAVAILABLE", "claude の命令を流せませんでした")
     code, output = result
-    started = _STARTED.search(output)
-    if code != 0 or not started:
+    if code not in (0, None):
         detail = " ".join(output.split())[:200]
         raise DeliveryError("CLAUDE_BG_WAKE_FAILED", f"会話を起こせませんでした（exit {code}）: {detail}")
-    return started.group(1)
+    started = _STARTED.search(output)
+    return started.group(1) if started else ""

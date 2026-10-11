@@ -68,6 +68,11 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.store.add(session_id, CHANNEL, Path(""), "リリーバイス", "channel", "bellteam", "claude-code", str(self.folder))
         return session_id
 
+    def _call_on(self, channel: str) -> str:
+        session_id = str(uuid.uuid4())
+        self.store.add(session_id, channel, Path(""), "リリーバイス", "channel", "bellteam", "claude-code", str(self.folder))
+        return session_id
+
     async def _watch(self, session_id: str, bridge: Bridge, receiver: bool = False) -> None:
         with patch.object(local.httpx, "AsyncClient", return_value=bridge):
             await asyncio.wait_for(local.Watchers(self.store, receiver=receiver).watch(session_id), 5)
@@ -169,7 +174,7 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
             return "conversa"
 
         def send(channel, _delivery, _text):
-            if channel == CHANNEL:
+            if channel != ADOPTED:
                 raise DeliveryError("CHANNEL_CLOSED", "channelは閉じています。本文は送っていません")
 
         self.background.side_effect, self.wake.side_effect, self.send.side_effect = background, wake, send
@@ -245,6 +250,35 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
                 await self._watch(session_id, bridge, receiver=True)
                 self.assertEqual(self.wake.await_count, 0)
                 self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])  # 席へ渡る
+
+    async def test_wake_that_could_not_be_confirmed_is_checked_on_the_list_before_any_seat(self):
+        """起きた印を読めなかった時。動いていれば引き取りを待ち、動いていなければ席へ渡す。両方へは渡さない。"""
+        session_id = self._call()
+        seen = self._stopped_background()
+
+        async def unconfirmed(_found, _calls):
+            seen["running"] = True  # 実は起きていた
+            return ""
+
+        self.wake.side_effect = unconfirmed
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        self._adopt_after(bridge, session_id, 4)
+        await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual((self.wake.await_count, self.terminal.launched), (1, []))
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "submitted"), (2, "started")])
+
+        other = self._call_on("33333333-3333-4333-8333-333333333333")
+        seen["running"] = False
+
+        async def nothing(_found, _calls):
+            return ""  # 実は起きていなかった
+
+        self.wake.side_effect = nothing
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(other, bridge, receiver=True)
+        self.assertEqual((self.wake.await_count, len(self.terminal.launched)), (2, 1))
+        self.assertEqual([(r["seq"], r["state"], r["detail"]) for r in bridge.receipts],
+                         [(2, "relaunched", "起こした会話が通話を引き取りませんでした")])
 
     async def test_conversation_that_cannot_be_woken_leaves_the_reply_to_the_folder_seat(self):
         session_id = self._call()
