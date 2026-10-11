@@ -595,6 +595,24 @@ class AitermSeatTest(unittest.IsolatedAsyncioTestCase):
             (Path(root) / "config.json").write_text(json.dumps({"claude_seat_model": "", "claude_seat_effort": None}))
             self.assertEqual(aiterm.seat_settings("claude-code"), {"model": "claude-opus-5-5", "reasoning_effort": "high"})
 
+    def test_node_recorded_at_a_place_that_is_gone_falls_back_to_the_one_on_path(self):
+        """Node を上げると、控えた版つきの場所が無くなる事がある（Mac の Homebrew）。今ある Node で Aiterm を起こす。"""
+        root = Path(os.environ["CALL_BRIDGE_STATE"])
+        package = root / "bin" / "node_modules" / "aiterm-mcp" / "dist"
+        package.mkdir(parents=True)
+        (package / "index.js").write_text("")
+        (root / "bin" / "aiterm-mcp").write_text("")
+        node = root / "node"
+        node.write_text("")
+        (root / "config.json").write_text(json.dumps({"aiterm_mcp": str(root / "bin" / "aiterm-mcp"),
+                                                      "steer_node": str(root / "Cellar" / "node" / "26.10.0_1" / "bin" / "node")}))
+        with patch.object(aiterm.shutil, "which", return_value=str(node)), patch.dict(os.environ, {"CALL_BRIDGE_AITERM": ""}):
+            self.assertEqual(aiterm.aiterm_command(), [str(node), str((package / "index.js").resolve())])
+        with patch.object(aiterm.shutil, "which", return_value=None), patch.dict(os.environ, {"CALL_BRIDGE_AITERM": ""}), \
+                self.assertRaises(aiterm.AitermError) as raised:
+            aiterm.aiterm_command()
+        self.assertEqual((raised.exception.code, raised.exception.sent), ("AITERM_UNAVAILABLE", False))
+
     async def test_other_harnesses_get_the_text_at_launch_as_before(self):
         for harness in ("codex", "cursor", "grok"):
             session = _Session()

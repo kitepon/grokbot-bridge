@@ -84,8 +84,11 @@ def aiterm_command() -> list[str]:
         if not script.is_file():
             return [str(path)]
         path = script.resolve()
-    node = config.get("steer_node") or config.get("node_binary") or shutil.which("node")
-    if not isinstance(node, str) or not Path(node).is_file():
+    # 控えた場所から Node が無くなっている事がある（Homebrew が Node を上げると、版つきの実体の場所が変わる。
+    # 2026-10-12 に Mac で、古い版が控えた場所が無くなり、席を立てられなくなっていた）。今ある物を順に探す。
+    candidates = (config.get("steer_node"), config.get("node_binary"), shutil.which("node"))
+    node = next((item for item in candidates if isinstance(item, str) and Path(item).is_file()), None)
+    if node is None:
         raise AitermError("AITERM_UNAVAILABLE", "aiterm-mcp の Node 実行ファイルが見つかりません", sent=False)
     return [node, str(path)]
 
