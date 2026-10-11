@@ -57,7 +57,11 @@ call-bridge-setup receiver uninstall
 
 Windows の常駐は console を持たない（`pythonw`）。動いている間に起こす子の process（Codex の App Server、aiterm-steer-delivery、Throughline、Aiterm）は、端末の窓を出さない指定で起こす。指定が無いと、起こすたびに端末の窓が 0.2〜0.4 秒出る（2026-10-10 に fox で測った）。
 
-席を立てるには、その端末に `aiterm-mcp`、tmux（Windows は psmux）、使うハーネスの CLI が要る。寝ている Codex アプリの会話を起こすのは aiterm-steer-delivery 0.4.1 以上（macOS・Windows）。
+席を立てるには、その端末に `aiterm-mcp`（0.57.0 以上）、tmux（Windows は psmux）、使うハーネスの CLI が要る。
+
+Claude Code の席へ返信を渡す時は、本文の前に1行の前置きを付ける（Aiterm の `preface`。貼り付けの外へ出る）。Claude Code は、貼り付けられた文の中の指示を「利用者が書いた物ではないかもしれない」と扱うので、前置きが無いと、席が返信のとおりに進めず、利用者へ伺いを立てて止まる事がある（2026-10-11 に fox で、立てた席が Approval Box へ申請した）。Claude Code の席は、文を渡さずに立ててから、前置きを付けて最初の文を送る。Codex・Cursor・Grok の席は、今までどおり起動の時に文を渡す。
+
+寝ている Codex アプリの会話を起こすのは aiterm-steer-delivery 0.4.1 以上（macOS・Windows）。
 
 ### Claude Code・Cursor・Grok への登録
 

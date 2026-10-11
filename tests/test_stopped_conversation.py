@@ -8,6 +8,7 @@ import os
 import sys
 import tempfile
 import time
+import types
 import unittest
 import uuid
 from contextlib import asynccontextmanager
@@ -150,6 +151,7 @@ class FakeTerminal:
     def __init__(self, seats: dict[str, str | None] | None = None):
         self.seats = dict(seats or {})
         self.sent: list[tuple[str, str]] = []
+        self.prefaces: list[str | None] = []
         self.launched: list[tuple[str, str, str, str]] = []
         self.closed: list[str] = []
         self.launch_error: Exception | None = None
@@ -158,8 +160,9 @@ class FakeTerminal:
     async def sessions(self):
         return dict(self.seats)
 
-    async def send(self, session_id, text):
+    async def send(self, session_id, text, preface=None):
         self.sent.append((session_id, text))
+        self.prefaces.append(preface)
 
     async def launch(self, harness, cwd, session_name, prompt):
         self.launched.append((harness, cwd, session_name, prompt))
@@ -296,6 +299,7 @@ class StoppedConversationTest(unittest.IsolatedAsyncioTestCase):
         # 2通目は、立てた席へ送る。席は1つだけ。
         self.assertEqual([seat for seat, _text in self.terminal.sent], [seat])
         self.assertIn("二通目", self.terminal.sent[0][1])
+        self.assertEqual(self.terminal.prefaces, [None])  # Codex の席へは、今までどおり前置きなし
         for session_id in (first, second):
             bound = self.store.subscription(session_id)
             self.assertEqual((bound["delivery_mode"], bound["thread_id"]), ("hosted", seat))
@@ -421,6 +425,8 @@ class StoppedConversationTest(unittest.IsolatedAsyncioTestCase):
         bridge = Bridge([{"seq": 2, "message": "一通目"}], status="hungup")
         await self._watch(session_id, bridge)
         self.assertEqual(([s for s, _t in self.terminal.sent], self.terminal.launched), ([seat], []))
+        # Claude Code の席へは、貼り付けの外へ出る前置きを付ける（無いと、席が返信のとおりに進めない事がある）。
+        self.assertEqual(self.terminal.prefaces, [aiterm.PREFACE])
 
         closed = self._call(seat, delivery_mode="hosted", harness="claude-code", cwd=str(self.folder))
         self.terminal.seats.clear()
@@ -536,3 +542,64 @@ class HandOverTest(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class _Session:
+    """Aiterm の MCP の代わり。呼ばれた道具と引数を覚えて、決めた結果を返す。"""
+
+    def __init__(self, launch: dict | None = None, launch_error: bool = False, send_error: str | None = None):
+        self.calls: list[tuple[str, dict]] = []
+        self.launch, self.launch_error, self.send_error = launch, launch_error, send_error
+
+    async def call_tool(self, name, arguments):
+        self.calls.append((name, arguments))
+        if name == "agent_launch":
+            value = {"schema": "aiterm.agent-launch-result.v1", "session_id": arguments["session_name"],
+                     "initial_prompt": {"status": "started" if "prompt" in arguments else "not_requested"},
+                     **(self.launch or {})}
+            return types.SimpleNamespace(isError=self.launch_error, structuredContent=value,
+                                         content=[types.SimpleNamespace(type="text", text="起動に失敗しました")] if self.launch_error else [])
+        if name == "pty_send" and self.send_error is not None:
+            return types.SimpleNamespace(isError=True, structuredContent=None,
+                                         content=[types.SimpleNamespace(type="text", text=self.send_error)])
+        return types.SimpleNamespace(isError=False, structuredContent=None, content=[])
+
+
+class AitermSeatTest(unittest.IsolatedAsyncioTestCase):
+    """席を立てる時と、席へ送る時に、Aiterm へ渡す形。"""
+
+    async def test_claude_code_seat_is_started_without_text_and_gets_the_text_with_a_preface(self):
+        session = _Session()
+        seat, delivered = await aiterm.Aiterm(session).launch("claude-code", "/work", "cb-claude-work", "返信の本文")
+        self.assertEqual((seat, delivered), ("cb-claude-work", True))
+        (launch_name, launch_args), (send_name, send_args) = session.calls
+        self.assertEqual((launch_name, "prompt" in launch_args, launch_args["harness"]), ("agent_launch", False, "claude-code"))
+        self.assertEqual((send_name, send_args), ("pty_send", {
+            "session_id": "cb-claude-work", "text": "返信の本文", "require_agent": True, "preface": aiterm.PREFACE}))
+
+    async def test_other_harnesses_get_the_text_at_launch_as_before(self):
+        for harness in ("codex", "cursor", "grok"):
+            session = _Session()
+            seat, delivered = await aiterm.Aiterm(session).launch(harness, "/work", "cb-seat", "返信の本文")
+            self.assertEqual((seat, delivered, [name for name, _ in session.calls]), ("cb-seat", True, ["agent_launch"]))
+            self.assertEqual(session.calls[0][1]["prompt"], "返信の本文")
+
+    async def test_claude_code_seat_that_did_not_start_has_no_text_in_it(self):
+        session = _Session(launch_error=True)
+        with self.assertRaises(aiterm.AitermError) as raised:
+            await aiterm.Aiterm(session).launch("claude-code", "/work", "cb-claude-work", "返信の本文")
+        # 文を渡していないので、入っていない事が確か（次の返信でもう一度立てられる）。
+        self.assertEqual((raised.exception.sent, [name for name, _ in session.calls]), (False, ["agent_launch"]))
+
+    async def test_text_refused_before_typing_is_known_not_sent(self):
+        session = _Session(send_error="AGENT_PREFACE_INVALID 文字列は送信していません")
+        with self.assertRaises(aiterm.AitermError) as raised:
+            await aiterm.Aiterm(session).launch("claude-code", "/work", "cb-claude-work", "返信の本文")
+        self.assertIs(raised.exception.sent, False)
+
+    def test_preface_keeps_the_rules_of_aiterm(self):
+        # 1行・200字以内・行頭が記号や空白でない・@ を含まない（外れると Aiterm が打つ前に断る）。
+        text = aiterm.PREFACE
+        self.assertTrue(len(text) <= 200 and "\n" not in text and "@" not in text and text[0].isalnum())
+        self.assertEqual((aiterm.seat_preface("claude-code"), aiterm.seat_preface("codex")), (text, None))
+

@@ -638,7 +638,7 @@ class Watchers:
         seat = subscription["thread_id"]
         async with aiterm.connect() as terminal:
             if seat in await terminal.sessions():
-                await terminal.send(seat, text)
+                await terminal.send(seat, text, preface=aiterm.seat_preface(subscription["harness"]))
                 self.store.submitted(subscription["session_id"], seq)
                 await report(seq, "submitted", None, f"hosted:{seat}")
                 return "next"
