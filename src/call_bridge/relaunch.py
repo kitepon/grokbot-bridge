@@ -79,6 +79,7 @@ async def hand_over(store: Any, subscription: dict[str, Any], texts: list[str], 
     source, name = source_key(subscription), seat_name(harness, cwd)
     calls = store.bound_to(harness, subscription["thread_id"], subscription["session_id"])
     text = first_prompt(calls, texts, reason)
+    preface = aiterm.seat_preface(harness)
     with seat_lock(name):
         store.note_relaunch(source, name, "starting", reason)
         try:
@@ -87,13 +88,13 @@ async def hand_over(store: Any, subscription: dict[str, Any], texts: list[str], 
                 if name in seats:
                     if seats[name] != aiterm.HARNESSES[harness]:
                         raise DeliveryError("RELAUNCH_NAME_TAKEN", f"{name} は別の端末が使っています")
-                    await terminal.send(name, text)
+                    await terminal.send(name, text, preface=preface)
                 else:
                     seat, delivered = await terminal.launch(harness, cwd, name, text)
                     if seat != name:
                         raise DeliveryError("RELAUNCH_RECEIPT_INVALID", "立てた席の名前が違います", outcome_unknown=True)
                     if not delivered:
-                        await terminal.send(name, text)
+                        await terminal.send(name, text, preface=preface)
         except aiterm.AitermError as exc:
             # 起動の画面で止まった席は端末だけが残る。閉じて、次の返信がもう一度立てられるようにする。
             leftover = exc.launch.get("session_id") if exc.launch else None

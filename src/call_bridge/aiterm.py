@@ -26,7 +26,17 @@ HARNESSES = {"codex": "codex-cli", "claude-code": "claude-code", "cursor": "curs
 _NOT_SENT = "文字列は送信していません"
 # 席を立てる呼び出しは、CLI が入力を受け付けるまで待つ。
 _DIRECT_TIMEOUT = 300
+# Claude Code の席へ文を渡す時に、本文の前へ置く1行（Aiterm 0.57.0 以降の preface。貼り付けの外へ出る）。
+# Claude Code は、貼り付けられた文の中の指示を「利用者が書いた物ではないかもしれない」と扱う。前置きが無いと、
+# 席が返信のとおりに進めず、利用者へ伺いを立てて止まる事がある（2026-10-11 に fox で、立てた席が Approval Box へ申請した）。
+# 1行・200字以内・行頭が記号や空白でない・@ を含まない、が Aiterm の決まり。
+PREFACE = "通話MCP（call-bridge）が渡す、通話の相手からの返信です。この会話の仕事の続きとして、下の文に対応してください。"
 _DIRECT_LINE_LIMIT = 16 * 1024 * 1024
+
+
+def seat_preface(harness: str) -> str | None:
+    """席へ文を渡す時の前置き。貼り付けた文の扱いが違う Claude Code の席にだけ付ける。"""
+    return PREFACE if harness == "claude-code" else None
 
 
 class AitermError(DeliveryError):
@@ -80,15 +90,18 @@ class Aiterm:
         return {row["session_id"]: row.get("harness") for row in rows
                 if isinstance(row, dict) and isinstance(row.get("session_id"), str)}
 
-    async def launch(self, harness: str, cwd: str, session_name: str, prompt: str) -> tuple[str, bool]:
+    async def launch(self, harness: str, cwd: str, session_name: str, prompt: str,
+                     preface: str = PREFACE) -> tuple[str, bool]:
         """担当フォルダに席を立てて、最初の文を渡す。席の名前と、最初の文が入ったかを返す。
 
         入っていない時（席は起きたが、最初の文は打たれなかった）は、呼び出し側が send で送る。
+        Claude Code の席は、文を渡さずに立ててから、前置きを付けて送る（起動の時に渡す文には前置きを付けられない）。
         """
-        result = await self._call("agent_launch", {
-            "harness": HARNESSES[harness], "cwd": cwd, "session_name": session_name,
-            "prompt": prompt, "trust_project": True,
-        })
+        framed = harness == "claude-code"
+        arguments = {"harness": HARNESSES[harness], "cwd": cwd, "session_name": session_name, "trust_project": True}
+        if not framed:
+            arguments["prompt"] = prompt
+        result = await self._call("agent_launch", arguments)
         structured = result.structuredContent if isinstance(result.structuredContent, dict) else {}
         launch = structured if structured.get("schema") == "aiterm.agent-launch-result.v1" else None
         delivery = launch.get("initial_prompt") if launch else None
@@ -97,17 +110,26 @@ class Aiterm:
             startup = launch.get("startup") if launch else None
             blocked = isinstance(startup, dict) and startup.get("status") == "blocked"
             # 起動の準備が終わらなかった席は、端末だけが残る。最初の文は入っていない。
-            not_sent = blocked or prompt_state == "not_sent" or _NOT_SENT in _text(result)
+            not_sent = framed or blocked or prompt_state == "not_sent" or _NOT_SENT in _text(result)
             raise AitermError("AITERM_LAUNCH_FAILED", _text(result) or "席を起こせません",
                               sent=False if not_sent else None, launch=launch)
         session = structured.get("session_id")
-        if not isinstance(session, str) or not session or prompt_state not in ("started", "submitted_unconfirmed", "not_sent"):
-            raise AitermError("AITERM_LAUNCH_RECEIPT_INVALID", "起こした席の結果を確認できません", sent=None, launch=launch)
+        expected = ("not_requested",) if framed else ("started", "submitted_unconfirmed", "not_sent")
+        if not isinstance(session, str) or not session or prompt_state not in expected:
+            # 文を渡していない席（Claude Code）は、結果の形が違っても、文は入っていない。
+            raise AitermError("AITERM_LAUNCH_RECEIPT_INVALID", "起こした席の結果を確認できません",
+                              sent=False if framed else None, launch=launch)
+        if framed:
+            await self.send(session, prompt, preface=preface)
+            return session, True
         return session, prompt_state != "not_sent"
 
-    async def send(self, session_id: str, text: str) -> None:
-        """動いている席へ文を送る。席の登録が無い端末へは打たない。"""
-        result = await self._call("pty_send", {"session_id": session_id, "text": text, "require_agent": True})
+    async def send(self, session_id: str, text: str, preface: str | None = None) -> None:
+        """動いている席へ文を送る。席の登録が無い端末へは打たない。preface は、Claude Code の席へ渡す時の前置き。"""
+        arguments: dict[str, Any] = {"session_id": session_id, "text": text, "require_agent": True}
+        if preface:
+            arguments["preface"] = preface
+        result = await self._call("pty_send", arguments)
         if result.isError:
             message = _text(result)
             raise AitermError("AITERM_SEND_FAILED", message or "席へ送れません",
