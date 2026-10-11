@@ -364,7 +364,8 @@ def _steer_command(config: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
     command = [cli]
     node = config.get("steer_node")
     if Path(cli).suffix.lower() in (".js", ".mjs"):
-        node = node or shutil.which("node")
+        if not isinstance(node, str) or not Path(node).is_file():
+            node = shutil.which("node")  # 控えた場所から Node が無くなった（入れ直しなど）。今の PATH から探す
         if not isinstance(node, str) or not Path(node).is_file():
             raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery の Node 実行ファイルが見つかりません")
         command = [node, cli]

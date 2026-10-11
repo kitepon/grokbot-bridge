@@ -317,7 +317,8 @@ def _steer_runtime() -> dict[str, str | None]:
     node = shutil.which("node")
     if not node:
         raise DeliveryError("STEER_DELIVERY_UNAVAILABLE", "aiterm-steer-delivery の Node 実行ファイルが見つかりません")
-    return {"steer_cli": str(path), "steer_node": str(Path(node).resolve())}
+    # Node は、版つきの実体ではなく PATH にある入口を控える。Node を上げても場所が変わらない。
+    return {"steer_cli": str(path), "steer_node": os.path.abspath(node)}
 
 
 def _steer_setup(action: str, config: dict[str, Any]) -> str:
