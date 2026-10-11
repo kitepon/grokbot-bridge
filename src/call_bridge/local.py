@@ -658,9 +658,14 @@ class Watchers:
             if exc.code in ("CHANNEL_CLOSED", "CHANNEL_UNKNOWN"):
                 # 会話が終わった時に、hook が channel を閉じている。本文は入っていない。
                 reason = "通話を開いた会話が終わっていました"
-            elif (exc.code == "CHANNEL_DELIVERY_DUPLICATE"
-                  and (await claude_channel.delivery_state(channel, delivery_id))[0] == "withdrawn"):
-                # 前に入れて取り下げた返信（席へ渡せなかった時のやり直し）。もう一度は入れない。
+            elif exc.code == "CHANNEL_DELIVERY_DUPLICATE":
+                # この返信は、もう受け口に入っている。もう一度は入れない。
+                if (await claude_channel.delivery_state(channel, delivery_id))[0] != "withdrawn":
+                    # 前の送信が、入れた後で誤りを返していた。出たかを確かめる流れへ進む（そこで started か席かが決まる）。
+                    self.store.submitted(session_id, seq, confirmed=False)
+                    await report(seq, "submitted", None, f"claude:{channel}")
+                    return "next"
+                # 前に入れて取り下げた返信（席へ渡せなかった時のやり直し）。
                 reason = "会話が返信を取り出しませんでした"
             else:
                 raise

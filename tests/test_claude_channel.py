@@ -174,6 +174,19 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.withdraw.await_count, 1)  # 取り下げは1回だけ。会話へは入れ直さない
 
 
+    async def test_reply_already_in_the_channel_is_not_counted_as_a_failure(self):
+        # 前の送信が、受け口へ入れた後で誤りを返していた時。パッケージ 0.4.4 からは、入っている間の送り直しを断る。
+        session_id = self._call()
+        self.send.side_effect = DeliveryError("CHANNEL_DELIVERY_DUPLICATE", "同じ配送IDの本文がすでに受信箱にあります")
+        answers = iter([("queued", True), ("emitted", False)])
+        self.state.side_effect = lambda *_a: next(answers)
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge)
+        self.assertEqual((self.send.await_count, self.withdraw.await_count, self.terminal.launched), (1, 0, []))
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "submitted"), (2, "started")])
+        self.assertEqual(self._states(session_id), [(2, "submitted")])
+
+
 class CallOpenTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.temp = tempfile.TemporaryDirectory()
@@ -401,6 +414,12 @@ class NodeEntryTest(unittest.IsolatedAsyncioTestCase):
 
         third = str(uuid.uuid4())
         await claude_channel.send(channel, third, "返信その3")
+        if claude_channel._version(_steer_cli().parent / "index.js") >= (0, 4, 4):
+            # 0.4.4 から：受け口に入っている間に同じ番号で送り直すと断られ、本文は足されない（0.4.3 までは2通入った）。
+            with self.assertRaises(DeliveryError) as caught:
+                await claude_channel.send(channel, third, "返信その3")
+            self.assertEqual((caught.exception.code, caught.exception.outcome_unknown), ("CHANNEL_DELIVERY_DUPLICATE", False))
+            self.assertEqual((await claude_channel.delivery_state(channel, third))[0], "queued")
         self.assertTrue(await claude_channel.withdraw(channel, third))
         self.assertEqual((await claude_channel.delivery_state(channel, third))[0], "withdrawn")
         self.assertFalse(await claude_channel.withdraw(channel, first))  # 会話へ出た物は取り下げられない
