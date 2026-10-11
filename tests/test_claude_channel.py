@@ -242,7 +242,7 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
 
     async def test_conversation_a_person_stopped_in_the_middle_of_its_work_is_not_woken(self):
         """途中で止められた会話は stopped で残る。返信が来たからといって、止めた仕事を動かし直さない。"""
-        for state in ("stopped", "working", "blocked", None):
+        for state in ("stopped", "working", None):
             with self.subTest(state=state):
                 session_id = self._call()
                 self._stopped_background()["state"] = state
@@ -250,6 +250,20 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
                 await self._watch(session_id, bridge, receiver=True)
                 self.assertEqual(self.wake.await_count, 0)
                 self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "relaunched")])  # 席へ渡る
+
+    async def test_conversation_stopped_while_waiting_for_an_answer_is_woken_like_a_finished_one(self):
+        """確認待ち（blocked）で番を終えた会話も、Claude Code は約1時間で止める。返信が来たら、同じ会話を起こす。
+
+        2026-10-12 に fox で、確認待ちで止まった Windows のベルの会話あての返信が席へ渡り、席の中身
+        （Throughline に引き継がれた後の会話）は道具を使えず、返事が出なかった。
+        """
+        session_id = self._call()
+        self._stopped_background()["state"] = "blocked"
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        self._adopt_after(bridge, session_id, 4)
+        await self._watch(session_id, bridge, receiver=True)
+        self.assertEqual((self.wake.await_count, len(self.terminal.launched)), (1, 0))  # 席は立てない
+        self.assertEqual(self.send.call_args_list[-1].args[0], ADOPTED)  # 引き取った後の受け口へ渡る
 
     async def test_wake_that_could_not_be_confirmed_is_checked_on_the_list_before_any_seat(self):
         """起きた印を読めなかった時。動いていれば引き取りを待ち、動いていなければ席へ渡す。両方へは渡さない。"""

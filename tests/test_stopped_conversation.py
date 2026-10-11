@@ -568,14 +568,32 @@ class _Session:
 class AitermSeatTest(unittest.IsolatedAsyncioTestCase):
     """席を立てる時と、席へ送る時に、Aiterm へ渡す形。"""
 
+    def setUp(self):
+        # 席の設定は置き場の config.json から読む。試験では、空の置き場を使う（本物の置き場を読まない・作らない）。
+        root = tempfile.TemporaryDirectory()
+        self.addCleanup(root.cleanup)
+        state = patch.dict(os.environ, {"CALL_BRIDGE_STATE": root.name})
+        state.start()
+        self.addCleanup(state.stop)
+
     async def test_claude_code_seat_is_started_without_text_and_gets_the_text_with_a_preface(self):
         session = _Session()
         seat, delivered = await aiterm.Aiterm(session).launch("claude-code", "/work", "cb-claude-work", "返信の本文")
         self.assertEqual((seat, delivered), ("cb-claude-work", True))
         (launch_name, launch_args), (send_name, send_args) = session.calls
         self.assertEqual((launch_name, "prompt" in launch_args, launch_args["harness"]), ("agent_launch", False, "claude-code"))
+        # 渡さないと、その端末の Claude Code の既定（Mac では sonnet・low だった）で立つ。
+        self.assertEqual((launch_args["model"], launch_args["reasoning_effort"]), ("claude-opus-5-5", "high"))
         self.assertEqual((send_name, send_args), ("pty_send", {
             "session_id": "cb-claude-work", "text": "返信の本文", "require_agent": True, "preface": aiterm.PREFACE}))
+
+    async def test_claude_code_seat_model_and_effort_can_be_set_per_machine(self):
+        with tempfile.TemporaryDirectory() as root, patch.dict(os.environ, {"CALL_BRIDGE_STATE": root}):
+            (Path(root) / "config.json").write_text(json.dumps({"claude_seat_model": "claude-fable-5-1",
+                                                                "claude_seat_effort": "xhigh"}))
+            self.assertEqual(aiterm.seat_settings("claude-code"), {"model": "claude-fable-5-1", "reasoning_effort": "xhigh"})
+            (Path(root) / "config.json").write_text(json.dumps({"claude_seat_model": "", "claude_seat_effort": None}))
+            self.assertEqual(aiterm.seat_settings("claude-code"), {"model": "claude-opus-5-5", "reasoning_effort": "high"})
 
     async def test_other_harnesses_get_the_text_at_launch_as_before(self):
         for harness in ("codex", "cursor", "grok"):
@@ -583,6 +601,8 @@ class AitermSeatTest(unittest.IsolatedAsyncioTestCase):
             seat, delivered = await aiterm.Aiterm(session).launch(harness, "/work", "cb-seat", "返信の本文")
             self.assertEqual((seat, delivered, [name for name, _ in session.calls]), ("cb-seat", True, ["agent_launch"]))
             self.assertEqual(session.calls[0][1]["prompt"], "返信の本文")
+            # ほかのハーネスの席は、その端末の設定のまま立てる。
+            self.assertFalse({"model", "reasoning_effort"} & set(session.calls[0][1]))
 
     async def test_claude_code_seat_that_did_not_start_has_no_text_in_it(self):
         session = _Session(launch_error=True)
