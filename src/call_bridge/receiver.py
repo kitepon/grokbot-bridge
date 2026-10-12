@@ -72,9 +72,15 @@ async def run(scans: int | None = None) -> None:
 
     store = local.LocalStore(state_root())
     watchers = local.Watchers(store, receiver=True)
+    recovered = False
     try:
         while scans is None or scans > 0:
             try:
+                if not recovered:
+                    # 前の受け取り係が、手放すよう頼んだまま落ちた通話を戻す（頼みを下ろすのは、頼んだ受け取り係だけ）。
+                    if store.resume():
+                        log.info("calls left mid-takeover by the previous receiver are active again")
+                    recovered = True
                 for session_id in store.active():
                     if store.subscription(session_id)["delivery_mode"] != "exec":
                         watchers.start(session_id)

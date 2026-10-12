@@ -368,7 +368,8 @@ async def enable() -> dict[str, str]:
     actual = _existing(name)
     if actual["transport"].get("type") != "stdio":
         raise DeliveryError("CODEX_MCP_CONFIG_INVALID", "ローカル MCP への切替を確認できません")
-    binary_path = Path(codex_binary()).resolve()
+    codex_entry = codex_binary()
+    binary_path = Path(codex_entry).resolve()
     node_path = shutil.which("node") if binary_path.suffix.lower() == ".js" else None
     if binary_path.suffix.lower() == ".js" and not node_path:
         raise DeliveryError("CODEX_RUNTIME_UNAVAILABLE", "Codex の Node 実行ファイルが見つかりません")
@@ -377,7 +378,10 @@ async def enable() -> dict[str, str]:
         "mcp_name": name,
         "mcp_url": url, "token_env": token_env,
         "codex_home": str(home),
-        "codex_binary": str(binary_path),
+        # Node の script（npm の入口の先）は、Node で直接起こすので実体を控える。ほかは入口を控える。版つきの実体
+        # （standalone の releases/<版>、Homebrew の Caskroom/<版>）を控えると、Codex を上げた後も古い版で配送し続け、
+        # 古い版が片付けられた時に止まる（2026-10-12 に Mac で、7つ前の版の場所が控えられていた）。
+        "codex_binary": str(binary_path) if binary_path.suffix.lower() == ".js" else os.path.abspath(codex_entry),
         "node_binary": str(Path(node_path).resolve()) if node_path else None,
         "hook_command": command,
         "stale_processes": (running_before if changed or not already_local or

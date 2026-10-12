@@ -208,6 +208,9 @@ class ReceiverLimitsTest(unittest.TestCase):
             def __init__(self, _root):
                 pass
 
+            def resume(self):
+                return 0
+
             def active(self):
                 rounds["n"] += 1
                 if rounds["n"] == 1:

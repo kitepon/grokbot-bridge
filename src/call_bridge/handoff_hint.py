@@ -28,7 +28,7 @@ def _calls() -> list[dict[str, Any]]:
         with sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=5) as db:
             db.row_factory = sqlite3.Row
             rows = db.execute("SELECT session_id, member_name, thread_id FROM subscriptions "
-                              "WHERE state IN ('active', 'paused') AND delivery_mode = 'channel' "
+                              "WHERE state IN ('active', 'yielding', 'paused') AND delivery_mode = 'channel' "
                               "AND harness = 'claude-code' ORDER BY rowid").fetchall()
     except sqlite3.Error:
         return []

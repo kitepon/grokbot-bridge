@@ -95,7 +95,11 @@ def codex_home() -> Path:
 def codex_binary() -> str:
     config_file = state_root() / "config.json"
     config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.exists() else {}
-    binary = os.environ.get("CODEX_CLI_PATH") or config.get("codex_binary") or shutil.which("codex")
+    stored = config.get("codex_binary")
+    # 控えた場所から Codex が無くなっている事がある（版つきの場所を控えた端末で、Codex が古い版を片付けた時）。今ある物を使う。
+    if not isinstance(stored, str) or not Path(stored).is_file():
+        stored = None
+    binary = os.environ.get("CODEX_CLI_PATH") or stored or shutil.which("codex")
     if not binary:
         raise DeliveryError("CODEX_UNAVAILABLE", "Codex CLI が見つかりません")
     return binary
@@ -374,6 +378,8 @@ def _steer_command(config: dict[str, Any]) -> tuple[list[str], dict[str, str]]:
         if isinstance(runtime, str):
             env["PATH"] = os.pathsep.join([str(Path(runtime).parent), env.get("PATH", "")])
     binary = os.environ.get("CODEX_CLI_PATH") or config.get("codex_binary")
+    if isinstance(binary, str) and not Path(binary).is_file():
+        binary = shutil.which("codex")  # 控えた場所から Codex が無くなった。今の PATH から探す
     if isinstance(binary, str) and "CODEX_BIN" not in env:
         env["CODEX_BIN"] = binary
     return command, env
