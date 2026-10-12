@@ -47,7 +47,19 @@ _CHANNEL_CONFIRM_SECONDS = 10.0
 _CHANNEL_BUSY_SECONDS = 1800.0
 # 途中で止められた直後は、Throughline が続きの会話を作っている途中の事がある。これより新しい中断は待つ。
 _INTERRUPT_SETTLE_SECONDS = 120.0
+# 受け取り係が、ほかの process の握っている通話を握り直すまでに待つ長さ。
+_TAKEOVER_SECONDS = 20.0
+# 手放すよう頼んでから、鍵が空くのを待つ長さ。握っている見張りは、次の見回りで降りる。返信を渡している最中なら、渡し終えてから降りる。
+_YIELD_SECONDS = 30.0
+# 鍵が空いたかを見る間隔。
+_YIELD_POLL_SECONDS = 1.0
+# 1本の通話について、手放すよう頼む回数。これだけ頼んでも握ったままの process は、頼みを読まない作り（0.2.0 より前）。
+_TAKEOVER_ATTEMPTS = 3
 _MODES = ("queue", "exec", "hosted", "manual", "channel")
+# どの process が見張っても同じ届け方。manual は、会話の通話MCPが鍵を持っている事が「会話が生きている」印なので、入らない。
+_SHARED_MODES = ("queue", "hosted", "channel")
+# 生きている通話の state。yielding は、受け取り係が見張りを握り直している数秒の間だけ。
+_LIVE = ("active", "yielding")
 _HARNESSES = ("codex", "claude-code", "cursor", "grok")
 _DONE = ("submitted", "injected", "relaunched", "fetched")
 
@@ -342,12 +354,31 @@ class LocalStore:
             db.execute("UPDATE subscriptions SET after_seq = MIN(after_seq, ?), hold_seq = NULL WHERE session_id = ?",
                        (min(seqs) - 1, session_id))
 
+    def ask_to_yield(self, session_id: str) -> bool:
+        """握っている見張りに、手放すよう頼む（active → yielding）。頼めた時に真。
+
+        見張りは、見回りのたびに state を読み、active でなければ降りる（0.2.0 からの作り）。鍵を待っている見張りも降りる。
+        yielding は「生きているが、見張りを替えている途中」。届け先の付け替えや引き継ぎは、active と同じに扱う。
+        """
+        with self.connect() as db:
+            return db.execute("UPDATE subscriptions SET state = 'yielding' WHERE session_id = ? AND state = 'active' "
+                              f"AND delivery_mode IN ({','.join('?' * len(_SHARED_MODES))})",
+                              (session_id, *_SHARED_MODES)).rowcount == 1
+
+    def resume(self, session_id: str | None = None) -> int:
+        """手放す頼みを下ろす（yielding → active）。session_id が無ければ全部。戻した数を返す。"""
+        with self.connect() as db:
+            if session_id is None:
+                return db.execute("UPDATE subscriptions SET state = 'active' WHERE state = 'yielding'").rowcount
+            return db.execute("UPDATE subscriptions SET state = 'active' WHERE session_id = ? AND state = 'yielding'",
+                              (session_id,)).rowcount
+
     def bound_to(self, harness: str, thread_id: str, session_id: str) -> list[dict[str, Any]]:
         """同じ会話に付いている、生きている通話。会話のIDが無い結び付けは、その通話だけ。"""
         with self.connect() as db:
             if thread_id:
-                rows = db.execute("SELECT * FROM subscriptions WHERE state = 'active' AND harness = ? AND thread_id = ? "
-                                  "ORDER BY session_id", (harness, thread_id)).fetchall()
+                rows = db.execute("SELECT * FROM subscriptions WHERE state IN ('active', 'yielding') AND harness = ? "
+                                  "AND thread_id = ? ORDER BY session_id", (harness, thread_id)).fetchall()
             else:
                 rows = db.execute("SELECT * FROM subscriptions WHERE session_id = ?", (session_id,)).fetchall()
         return [dict(row) for row in rows]
@@ -357,7 +388,7 @@ class LocalStore:
         with self.connect() as db:
             if thread_id:
                 done = db.execute("UPDATE subscriptions SET thread_id = ?, delivery_mode = 'hosted', cwd = ? "
-                                  "WHERE state = 'active' AND harness = ? AND thread_id = ? "
+                                  "WHERE state IN ('active', 'yielding') AND harness = ? AND thread_id = ? "
                                   "AND delivery_mode IN ('queue', 'hosted', 'manual', 'channel')",
                                   (seat, cwd, harness, thread_id))
             else:
@@ -368,8 +399,9 @@ class LocalStore:
     def follow(self, thread_id: str, successor: str) -> int:
         """引き継ぎが済んだ Codex の会話に付いていた通話を、続きの会話へ付け替える。"""
         with self.connect() as db:
-            return db.execute("UPDATE subscriptions SET thread_id = ? WHERE state = 'active' AND harness = 'codex' "
-                              "AND delivery_mode = 'queue' AND thread_id = ?", (successor, thread_id)).rowcount
+            return db.execute("UPDATE subscriptions SET thread_id = ? WHERE state IN ('active', 'yielding') "
+                              "AND harness = 'codex' AND delivery_mode = 'queue' AND thread_id = ?",
+                              (successor, thread_id)).rowcount
 
     def adopt(self, session_id: str, thread_id: str, home: Path, cwd: str | None) -> None:
         """新しい Codex の会話が、通話を自分へ付け替える。"""
@@ -427,7 +459,9 @@ class LocalStore:
         with self.connect() as db:
             rows = db.execute("SELECT seq, delivery_id, state, error FROM deliveries WHERE session_id = ? ORDER BY seq",
                               (session_id,)).fetchall()
-        return {"state": subscription["state"], "after_seq": subscription["after_seq"],
+        # yielding は見張りを替えている数秒の間だけ。通話の持ち主から見れば、生きている。
+        state = "active" if subscription["state"] == "yielding" else subscription["state"]
+        return {"state": state, "after_seq": subscription["after_seq"],
                 "last_error": subscription["last_error"], "harness": subscription["harness"],
                 "delivery_mode": subscription["delivery_mode"], "conversation": subscription["thread_id"],
                 "deliveries": [dict(row) for row in rows]}
@@ -481,15 +515,47 @@ class Watchers:
 
     async def watch(self, session_id: str, claimed: int | None = None) -> None:
         fd = claimed if claimed is not None else _claim_session(session_id)
+        waiting_since, asked = time.monotonic(), 0
         while fd is None:
             await asyncio.sleep(_POLL_SECONDS)
-            if self.store.subscription(session_id)["state"] != "active":
+            subscription = self.store.subscription(session_id)
+            if subscription["state"] != "active":
                 return
             fd = _claim_session(session_id)
+            if (fd is None and self.receiver and subscription["delivery_mode"] in _SHARED_MODES
+                    and asked < _TAKEOVER_ATTEMPTS and time.monotonic() - waiting_since >= _TAKEOVER_SECONDS):
+                asked += 1
+                fd = await self._take_over(session_id)
+                waiting_since = time.monotonic()
+                if fd is None and asked == _TAKEOVER_ATTEMPTS:
+                    log.warning("call %s stays with a process that does not let go of it", session_id)
         try:
             await self._watch_claimed(session_id)
         finally:
             os.close(fd)
+
+    async def _take_over(self, session_id: str) -> int | None:
+        """ほかの process が握っている通話を、手放させて握る。握れた時は鍵を返す。
+
+        通話の見張りは、鍵を先に取った process が続ける。会話の中の通話MCPは、起きた時の版のまま何日も動くので、
+        受け取り係が起き直すたびに、待っていた古い版の process が鍵を取り、その通話だけ古い作りで扱われていた
+        （2026-10-12 に Mac で、10/11 と 10/6 に起きた process が 50 本を握り、Node の場所が変わった後の返信を渡せなかった）。
+        受け取り係は、パッケージを入れ直すたびに起き直す。受け取り係が居る端末では、受け取り係が見張る。
+        """
+        if not self.store.ask_to_yield(session_id):
+            return None
+        fd = None
+        try:
+            deadline = time.monotonic() + _YIELD_SECONDS
+            while fd is None and time.monotonic() < deadline:
+                await asyncio.sleep(_YIELD_POLL_SECONDS)
+                fd = _claim_session(session_id)
+        finally:
+            # 頼んだまま終わると、だれも見張らない通話が残る。握れなくても、止められても、必ず下ろす。
+            self.store.resume(session_id)
+        if fd is not None:
+            log.info("call %s is now watched by the receiver", session_id)
+        return fd
 
     async def _watch_claimed(self, session_id: str) -> None:
         token_failures = 0
@@ -1144,7 +1210,7 @@ async def _follow_speaker(session_id: str, ctx: Context | None) -> dict[str, Any
         if harness in ("cursor", "grok"):
             folder = subscription["cwd"]
             if (subscription["delivery_mode"] == "channel" and subscription["harness"] == harness
-                    and subscription["state"] == "active"):
+                    and subscription["state"] in _LIVE):
                 try:
                     info = await claude_channel.wait_info(subscription["thread_id"])
                 except DeliveryError:
@@ -1162,7 +1228,7 @@ async def _follow_speaker(session_id: str, ctx: Context | None) -> dict[str, Any
         if harness == "codex":
             thread_id, home = _parent(ctx)
             if (subscription["harness"] == "codex" and subscription["thread_id"] == thread_id
-                    and subscription["delivery_mode"] in ("queue", "exec") and subscription["state"] == "active"):
+                    and subscription["delivery_mode"] in ("queue", "exec") and subscription["state"] in _LIVE):
                 return None
             if await verify_parent(thread_id, home) == "exec":
                 return None  # codex exec の親へは、次のプロンプトの hook が渡す。付け替えない
@@ -1173,7 +1239,7 @@ async def _follow_speaker(session_id: str, ctx: Context | None) -> dict[str, Any
             mine = await claude_channel.own(params.clientInfo.name if params is not None else None,
                                             dict(meta.model_extra or {}) if meta is not None else {}, channel)
             if (channel and mine.get("channel_open") is True and mine.get("channel_session") == mine.get("session_id")
-                    and subscription["state"] == "active"):
+                    and subscription["state"] in _LIVE):
                 return None  # もうこの会話に付いている
             opened = await _claude_channel(ctx)
             if not isinstance(opened, dict):
