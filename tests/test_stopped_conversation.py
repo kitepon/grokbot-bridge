@@ -154,11 +154,16 @@ class FakeTerminal:
         self.prefaces: list[str | None] = []
         self.launched: list[tuple[str, str, str, str]] = []
         self.closed: list[str] = []
+        # 席の名前 → 席の中の会話の番号（Aiterm が返す版だけ）
+        self.conversations: dict[str, str] = {}
         self.launch_error: Exception | None = None
         self.prompt_delivered = True
 
     async def sessions(self):
         return dict(self.seats)
+
+    async def conversation(self, session_id):
+        return self.conversations.get(session_id)
 
     async def send(self, session_id, text, preface=None):
         self.sent.append((session_id, text))
@@ -173,6 +178,8 @@ class FakeTerminal:
 
     async def close(self, session_id):
         self.closed.append(session_id)
+        self.seats.pop(session_id, None)
+        self.conversations.pop(session_id, None)
 
     def connect(self):
         @asynccontextmanager
@@ -435,6 +442,57 @@ class StoppedConversationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([(row[0], row[2]) for row in self.terminal.launched], [("claude-code", seat)])
         self.assertEqual(bridge.receipts[0]["state"], "relaunched")
 
+    async def test_seat_whose_conversation_was_handed_off_is_closed_and_started_again(self):
+        """席は一覧に居ても、中身が Throughline に引き継がれた後の会話なら、道具を全部断られる。入れずに、立て直す。
+
+        2026-10-12 に fox で、Windows のベルあての返信が3通、そういう席へ入ったまま返事が出なかった。
+        """
+        seat = relaunch.seat_name("claude-code", str(self.folder))
+        session_id = self._call(seat, delivery_mode="hosted", harness="claude-code", cwd=str(self.folder))
+        self.terminal.seats[seat] = "claude-code"
+        self.terminal.conversations[seat] = "d310d07c-old"
+        asked = AsyncMock(return_value={"state": "sent", "successor_session_id": "1dea5653-5211-4450-8c0d-8bebc7f50b0c"})
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        with patch.object(conversation, "claude_handoff", asked):
+            await self._watch(session_id, bridge)
+        asked.assert_awaited_with("d310d07c-old")
+        self.assertEqual((self.terminal.sent, self.terminal.closed), ([], [seat]))  # 古い席へは入れず、閉じる
+        self.assertEqual([(row[0], row[2]) for row in self.terminal.launched], [("claude-code", seat)])
+        self.assertIn("返事", self.terminal.launched[0][3])
+        self.assertEqual([(r["state"], r["detail"]) for r in bridge.receipts],
+                         [("relaunched", "席の会話は Throughline に引き継がれていました（後継 1dea5653）")])
+
+    async def test_seat_whose_conversation_still_works_gets_the_reply_as_before(self):
+        seat = relaunch.seat_name("claude-code", str(self.folder))
+        for handoff in (None, {"state": "requested"}, {"state": "failed"}):  # 記録なし・次の道具で引き継ぐ・立て直す
+            with self.subTest(handoff=handoff):
+                session_id = self._call(seat, delivery_mode="hosted", harness="claude-code", cwd=str(self.folder))
+                self.terminal.seats[seat] = "claude-code"
+                self.terminal.conversations[seat] = "live-conversation"
+                self.terminal.sent.clear()
+                bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+                with patch.object(conversation, "claude_handoff", AsyncMock(return_value=handoff)):
+                    await self._watch(session_id, bridge)
+                self.assertEqual(([s for s, _t in self.terminal.sent], self.terminal.closed, self.terminal.launched),
+                                 ([seat], [], []))
+
+    async def test_seat_of_another_harness_or_of_an_aiterm_without_the_number_is_not_asked_about(self):
+        asked = AsyncMock(return_value={"state": "sent", "successor_session_id": "x"})
+        with patch.object(conversation, "claude_handoff", asked):
+            # Aiterm が席の会話の番号を返さない版。分からないので、今までどおり渡す。
+            seat = relaunch.seat_name("claude-code", str(self.folder))
+            session_id = self._call(seat, delivery_mode="hosted", harness="claude-code", cwd=str(self.folder))
+            self.terminal.seats[seat] = "claude-code"
+            await self._watch(session_id, Bridge([{"seq": 2, "message": "返事"}], status="hungup"))
+            # Codex の席。Throughline の Claude の引き継ぎとは関係が無い。
+            codex = relaunch.seat_name("codex", str(self.folder))
+            session_id = self._call(codex, delivery_mode="hosted", harness="codex", cwd=str(self.folder))
+            self.terminal.seats[codex] = "codex-cli"
+            self.terminal.conversations[codex] = "some-thread"
+            await self._watch(session_id, Bridge([{"seq": 2, "message": "返事"}], status="hungup"))
+        asked.assert_not_awaited()
+        self.assertEqual(([s for s, _t in self.terminal.sent], self.terminal.closed), ([seat, codex], []))
+
     async def test_conversation_that_fetches_by_itself_is_left_alone_while_it_lives(self):
         session_id = self._call("", delivery_mode="manual", harness="grok", cwd=str(self.folder))
         bridge = Bridge([{"seq": 2, "message": "返事", "fetched": False}])
@@ -500,6 +558,21 @@ class HandOverTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(terminal.launched), 1)
         self.assertEqual([seat for seat, _text in terminal.sent], [self.seat])
 
+    async def test_folder_seat_whose_conversation_was_handed_off_is_replaced_before_anything_is_sent(self):
+        """別の会話の通話を席へ渡す時も、同じ。席が居ても、中身が引き継がれた後なら、閉じてから新しく立てる。"""
+        call = str(uuid.uuid4())
+        self.store.add(call, "claude-thread", Path(self.temp.name), "リリーバイス", delivery_mode="channel",
+                       harness="claude-code", cwd=str(self.folder))
+        subscription = self.store.subscription(call)
+        seat = relaunch.seat_name("claude-code", str(self.folder))
+        terminal = FakeTerminal({seat: "claude-code"})
+        terminal.conversations[seat] = "d310d07c-old"
+        with patch.object(conversation, "claude_handoff", AsyncMock(return_value={"state": "launched", "successor_short_id": "1dea5653"})):
+            name = await relaunch.hand_over(self.store, subscription, ["本文"], "理由", terminal.connect)
+        self.assertEqual((name, terminal.closed, terminal.sent), (seat, [seat], []))
+        self.assertEqual([(row[0], row[2]) for row in terminal.launched], [("claude-code", seat)])
+        self.assertEqual(self.store.subscription(subscription["session_id"])["thread_id"], seat)
+
     async def test_launch_that_stopped_at_a_startup_screen_closes_the_leftover_and_binds_nothing(self):
         terminal = FakeTerminal()
         terminal.launch_error = aiterm.AitermError("AITERM_LAUNCH_FAILED", "startup_dialog", sent=False,
@@ -547,9 +620,11 @@ if __name__ == "__main__":
 class _Session:
     """Aiterm の MCP の代わり。呼ばれた道具と引数を覚えて、決めた結果を返す。"""
 
-    def __init__(self, launch: dict | None = None, launch_error: bool = False, send_error: str | None = None):
+    def __init__(self, launch: dict | None = None, launch_error: bool = False, send_error: str | None = None,
+                 seats: list[dict] | None = None):
         self.calls: list[tuple[str, dict]] = []
         self.launch, self.launch_error, self.send_error = launch, launch_error, send_error
+        self.seats = seats
 
     async def call_tool(self, name, arguments):
         self.calls.append((name, arguments))
@@ -559,6 +634,9 @@ class _Session:
                      **(self.launch or {})}
             return types.SimpleNamespace(isError=self.launch_error, structuredContent=value,
                                          content=[types.SimpleNamespace(type="text", text="起動に失敗しました")] if self.launch_error else [])
+        if name == "pty_list" and self.seats is not None:
+            return types.SimpleNamespace(isError=False, content=[], structuredContent={
+                "schema": "aiterm.pty-list-result.v1", "sessions": self.seats})
         if name == "pty_send" and self.send_error is not None:
             return types.SimpleNamespace(isError=True, structuredContent=None,
                                          content=[types.SimpleNamespace(type="text", text=self.send_error)])
@@ -612,6 +690,18 @@ class AitermSeatTest(unittest.IsolatedAsyncioTestCase):
                 self.assertRaises(aiterm.AitermError) as raised:
             aiterm.aiterm_command()
         self.assertEqual((raised.exception.code, raised.exception.sent), ("AITERM_UNAVAILABLE", False))
+
+    async def test_seat_conversation_number_is_read_from_the_list_when_aiterm_gives_it(self):
+        """Aiterm 0.58.3 以降は、席ごとに vendor_session_id を返す。前の版は項目が無い。素の端末は null。"""
+        session = _Session(seats=[
+            {"session_id": "cb-claude-work", "harness": "claude-code", "vendor_session_id": "d310d07c-eda8-45d8-bfae-e4e64c99e296"},
+            {"session_id": "cb-old-aiterm", "harness": "claude-code"},
+            {"session_id": "shell", "harness": None, "vendor_session_id": None}])
+        terminal = aiterm.Aiterm(session)
+        self.assertEqual(await terminal.conversation("cb-claude-work"), "d310d07c-eda8-45d8-bfae-e4e64c99e296")
+        for name in ("cb-old-aiterm", "shell", "no-such-seat"):
+            self.assertIsNone(await terminal.conversation(name))
+        self.assertIsNone(await aiterm.Aiterm(_Session()).conversation("cb-claude-work"))  # 一覧を読めない時
 
     async def test_other_harnesses_get_the_text_at_launch_as_before(self):
         for harness in ("codex", "cursor", "grok"):

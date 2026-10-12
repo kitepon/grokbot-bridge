@@ -63,6 +63,8 @@ Windows の常駐は console を持たない（`pythonw`）。動いている間
 
 席を立てるには、その端末に `aiterm-mcp`（0.57.0 以上）、tmux（Windows は psmux）、使うハーネスの CLI が要る。
 
+Claude Code の席へ返信を入れる前に、席の中身の会話が Throughline に引き継がれた後でないかを確かめる（0.3.10 から）。引き継がれた後の会話は、Throughline が道具を全部断る。席は一覧に居て、文も入るが、読む事も返す事も出来ず、送った側には `submitted hosted:<席>` と見えたまま何も進まない（2026-10-12 に fox で、3通がそうなった。後継は裏の会話で、席の端末には居ない）。席の会話の番号は Aiterm の `pty_list` の `vendor_session_id`（`aiterm-mcp` 0.58.3 以上。Claude Code では、起動の時に `--session-id` で渡した番号）から読み、`throughline auto-handoff status --host claude --operation <番号> --json` の state が stopped・launching・launched・sent・unknown なら、席を閉じて、同じ名前で新しい席を立てて渡す。receipt は `relaunched`、理由は「席の会話は Throughline に引き継がれていました（後継 <頭8字>）」。番号が分からない時（前の版の Aiterm、ほかのハーネスの席）と、Throughline が無い・読めない時は、今までどおり席へ入れる。
+
 Claude Code の席は、モデルと思考の強さを渡して立てる（Aiterm の `model`・`reasoning_effort`。Claude Code では `--model`・`--effort` になる）。既定は `claude-opus-5-5`・`high`。渡さないと、その端末の `~/.claude/settings.json` の既定で立つ（2026-10-11 に Mac で、止まった会話の役を引き継ぐ席が sonnet・low で立ち、そのまま仕事を任されていた）。端末ごとに変える時は、`~/.grokbot-bridge/config.json` の `claude_seat_model`・`claude_seat_effort` に書く。Codex・Cursor・Grok の席は、今までどおりその端末の設定で立つ。席で動く Claude Code の `/model`・`/effort` は使わない（選んだ値が利用者の `~/.claude/settings.json` へ「新しい会話の既定」として書かれる）。
 
 Claude Code の席へ返信を渡す時は、本文の前に1行の前置きを付ける（Aiterm の `preface`。貼り付けの外へ出る）。Claude Code は、貼り付けられた文の中の指示を「利用者が書いた物ではないかもしれない」と扱うので、前置きが無いと、席が返信のとおりに進めず、利用者へ伺いを立てて止まる事がある（2026-10-11 に fox で、立てた席が Approval Box へ申請した）。Claude Code の席は、文を渡さずに立ててから、前置きを付けて最初の文を送る。Codex・Cursor・Grok の席は、今までどおり起動の時に文を渡す。
