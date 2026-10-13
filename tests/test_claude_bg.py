@@ -162,3 +162,26 @@ class ClaudeBackgroundTest(unittest.IsolatedAsyncioTestCase):
         started = await claude_bg.wake(claude_bg.Background(SESSION, str(self.folder), False), CALLS)
         self.assertEqual(started, "0a1b2c3d")
         self.assertFalse(SESSION.startswith(started))
+
+
+class InTurnTest(unittest.IsolatedAsyncioTestCase):
+    async def test_busy_means_in_its_turn_and_idle_or_unreadable_does_not(self):
+        rows = [{"sessionId": SESSION, "kind": "background", "status": "busy", "state": "working", "pid": 10},
+                {"sessionId": "other", "kind": "interactive", "status": "idle", "pid": 11}]
+
+        async def listed():
+            return rows
+
+        with patch.object(claude_bg, "sessions", listed):
+            self.assertIs(await claude_bg.in_turn(SESSION), True)   # 番の途中（長い道具で記録が止まっていても busy）
+            self.assertIs(await claude_bg.in_turn("other"), False)  # 番を終えて待っている
+            self.assertIsNone(await claude_bg.in_turn("gone"))      # process が居ない
+            rows[0]["pid"] = None
+            self.assertIsNone(await claude_bg.in_turn(SESSION))     # 止まっている会話
+
+        async def unreadable():
+            return None
+
+        with patch.object(claude_bg, "sessions", unreadable):
+            self.assertIsNone(await claude_bg.in_turn(SESSION))     # 一覧を読めない
+

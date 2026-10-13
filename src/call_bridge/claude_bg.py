@@ -96,6 +96,22 @@ class Background:
         return self.state in ("done", "blocked") and not self.running
 
 
+async def in_turn(session_id: str) -> bool | None:
+    """その会話が、今、番の途中か。一覧を読めない時・その会話の process が居ない時は None。
+
+    Claude Code の一覧の status は、番の途中が busy、番を終えて待っている時が idle（裏の会話も、端末やアプリの会話も同じ）。
+    長い道具を1つ動かしている間は会話の記録が何分も書かれないので、記録の新しさでは見分けられない
+    （2026-10-13 fox：記録が 185 秒止まっていた会話が busy だった）。
+    """
+    rows = await sessions()
+    if rows is None:
+        return None
+    live = [row for row in rows if row.get("sessionId") == session_id and isinstance(row.get("pid"), int)]
+    if not live:
+        return None
+    return any(row.get("status") == "busy" for row in live)
+
+
 async def background(session_id: str) -> Background | None:
     """その会話が裏の会話なら、フォルダと、動いているか。裏の会話でない・一覧を読めない時は None。"""
     rows = await sessions()
