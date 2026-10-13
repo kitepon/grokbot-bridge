@@ -416,6 +416,27 @@ class StoppedConversationTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((withdraw.await_count, self.terminal.launched), (0, []))
         self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "submitted"), (2, "started")])
 
+    async def test_a_check_that_times_out_is_tried_again_and_the_reply_is_not_handed_over_twice(self):
+        session_id = self._call("thread-a", cwd=str(self.folder))
+        answers = iter([DeliveryError("CODEX_REQUEST_TIMEOUT", "thread/read が時間内に返りませんでした"),
+                        (False, _conversation("completed"))])
+
+        async def queued(*_a):
+            answer = next(answers)
+            if isinstance(answer, Exception):
+                raise answer
+            return answer
+
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        withdraw = AsyncMock()
+        await self._watch(session_id, bridge, codex_queued=queued, codex_withdraw=withdraw)
+        # 読みの時間切れでは、届いていないと決めない。渡し直しも、席も、取り消しも無い。
+        self.assertEqual((self.submit.await_count, withdraw.await_count, self.terminal.launched), (1, 0, []))
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "submitted"), (2, "started")])
+        subscription = self.store.subscription(session_id)
+        self.assertEqual(self.store.status(session_id)["deliveries"][0]["state"], "submitted")
+        self.assertEqual((subscription["hold_seq"], subscription["after_seq"]), (None, 2))
+
     async def test_withdrawal_that_cannot_be_confirmed_stops_without_a_second_delivery(self):
         session_id = self._call("thread-a", cwd=str(self.folder))
         bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")

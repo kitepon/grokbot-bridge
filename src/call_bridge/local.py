@@ -885,6 +885,7 @@ class Watchers:
             return
         thread_id, home = subscription["thread_id"], Path(subscription["codex_home"])
         seq = waiting[0]["seq"]
+        taken_out = None  # キューから取り消した返信の seq。ここから先の失敗だけが「どこにも入っていない」
         try:
             for row in waiting:
                 seq, delivery_id = row["seq"], row["delivery_id"]
@@ -911,6 +912,7 @@ class Watchers:
                 if withdrawn != "withdrawn":
                     raise DeliveryError("CODEX_QUEUE_WITHDRAW_UNCONFIRMED", "キューからの取り消しを確かめられません",
                                         outcome_unknown=True)
+                taken_out = seq
                 text = reply_text(subscription, seq, await fetch_body(session_id, seq))
                 if handoff.current:
                     self.store.follow(thread_id, handoff.current)
@@ -935,6 +937,12 @@ class Watchers:
             if exc.outcome_unknown:
                 self.store.stop(session_id, "unknown", str(exc), seq)
                 await report(seq, "unknown", str(exc), None)
+                return
+            if taken_out != seq:
+                # キューを読む所で失敗した（時間切れなど）。返信はキューに在るか、もう番へ入っている。
+                # 何も変えていないので、届いていないとは決めない。後でもう一度確かめる。
+                # （2026-10-13 Mac：番へ入って答えも返った返信を、読みの時間切れで「渡し直し待ち」に書き直していた。）
+                self._later(session_id)
                 return
             # キューから取り消した後で、席へも入らなかった。次の返信が来た時に、この返信からもう一度渡す。
             self.store.rewind(session_id, seq, str(exc))
