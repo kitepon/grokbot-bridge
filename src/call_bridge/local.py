@@ -798,6 +798,16 @@ class Watchers:
             return None
         return talk.claude_retired(await talk.claude_handoff(session))
 
+    async def _in_turn(self, subscription: dict[str, Any]) -> bool:
+        """受け口の会話（Claude Code）が、今、番の途中だと確かめられた時だけ真。読めない時は偽（今までどおりに扱う）。"""
+        if subscription["harness"] != "claude-code":
+            return False
+        try:
+            conversation = await claude_channel.owner(subscription["thread_id"])
+        except DeliveryError:
+            return False
+        return bool(conversation) and await claude_bg.in_turn(conversation) is True
+
     async def _wake(self, subscription: dict[str, Any], reason: str) -> tuple[bool, str | None]:
         """受け口の会話が、Claude Code に止められた裏の会話なら、同じ会話のまま起こす。
 
@@ -977,6 +987,12 @@ class Watchers:
                 if state == "queued":
                     if not withdrawn and alive and time.time() - (row["at"] or 0.0) < _CHANNEL_BUSY_SECONDS:
                         self._later(session_id)  # 番の途中。番の終わりに、会話の待ち受けが取り出す
+                        return
+                    if not withdrawn and alive and await self._in_turn(subscription):
+                        # 待つ長さを過ぎても、会話は番の途中。働いている会話の横に席を立てない。
+                        # 番の終わりか、会話が通話の道具を使った時に、会話の待ち受けが取り出す。
+                        # （2026-10-13 fox：長い番でコードを書いていた会話の横に席が立ち、同じ作業フォルダで2つの会話が動いた。）
+                        self._later(session_id)
                         return
                     if alive:
                         reason = "会話が返信を取り出さないまま止まっています"

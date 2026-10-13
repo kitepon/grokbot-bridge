@@ -46,8 +46,10 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.handoff = AsyncMock(return_value=None)
         self.background = AsyncMock(return_value=None)  # 裏の会話ではない（今までどおり席へ渡す）
         self.wake = AsyncMock(return_value="conversa")
+        self.in_turn = AsyncMock(return_value=False)  # 番を終えている（今までどおり）
         for target, name, value in ((local.claude_channel, "send", self.send),
                                     (local.claude_bg, "background", self.background),
+                                    (local.claude_bg, "in_turn", self.in_turn),
                                     (local.claude_bg, "wake", self.wake),
                                     (local.claude_channel, "owner", self.owner),
                                     (local.talk, "claude_handoff", self.handoff),
@@ -360,6 +362,27 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
             await self._watch(session_id, bridge)
         self.assertEqual((self.withdraw.await_count, len(self.terminal.launched)), (1, 1))
         self.assertEqual(bridge.receipts[-1]["detail"], "会話が返信を取り出さないまま止まっています")
+
+    async def test_conversation_still_in_its_turn_past_the_limit_gets_no_seat_beside_it(self):
+        session_id = self._call()
+        answers = iter([("queued", True), ("queued", True), ("emitted", False)])  # 待つ長さを過ぎても番の途中 → 番の終わりに取り出した
+        self.state.side_effect = lambda *_a: next(answers)
+        self.in_turn.return_value = True
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        with patch.object(local, "_CHANNEL_BUSY_SECONDS", 0.0):
+            await self._watch(session_id, bridge)
+        self.assertEqual((self.withdraw.await_count, self.terminal.launched), (0, []))
+        self.assertEqual(self.in_turn.await_args.args, ("conversation-1",))
+        self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "submitted"), (2, "started")])
+
+    async def test_conversation_whose_turn_cannot_be_read_is_handled_as_before(self):
+        session_id = self._call()
+        self.state.return_value = ("queued", True)
+        self.in_turn.return_value = None  # 一覧を読めない・process が見つからない
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        with patch.object(local, "_CHANNEL_BUSY_SECONDS", 0.0):
+            await self._watch(session_id, bridge)
+        self.assertEqual((self.withdraw.await_count, len(self.terminal.launched)), (1, 1))
 
     async def test_reply_taken_while_withdrawing_is_left_to_the_conversation(self):
         session_id = self._call()
