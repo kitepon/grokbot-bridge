@@ -672,6 +672,7 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(setup, "_existing", return_value=transport), \
                  patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
                  patch.object(setup, "check_steer_version"), \
+                 patch.object(setup, "current_steer_cli", return_value=Path("/test-only/cli.js")), \
                  patch.object(setup, "_steer_setup", return_value="restart_required"):
                 self.assertEqual((await setup.status())["status"], "restart_required")
 
