@@ -1,5 +1,9 @@
 # grokbot-bridge
 
+Standalone Docker image candidates retain their own archive, config and OCI
+manifest identities. See [Identifying downloaded image candidates](docs/image-identities.md)
+when comparing a loaded image across Docker Engine image stores.
+
 ## BellTeamとの直通
 
 電話帳はGrokBotのプロフィールとBellTeamのBot一覧を要求ごとに合わせて返す。各項目の`system`と`id`で宛先を区別する。BellTeam側のUNIXソケットを`CALL_BRIDGE_BELLTEAM_UNIX`に設定し、その親ディレクトリをコンテナの`/run/bellteam`へマウントする。BellTeam側には`BELLTEAM_CALL_BRIDGE_SOCKET`を設定する。BellTeam宛ての本文とBellTeam発信者宛ての返信はこのソケットを通り、マリアンは通らない。
