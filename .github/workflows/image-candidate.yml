@@ -48,9 +48,9 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          printf 'FROM grokbot-bridge:candidate-%s-%s\nCOPY tests /tests\nCOPY scripts /scripts\nRUN pip install --no-cache-dir "pytest>=8,<9" "pytest-asyncio>=1,<2"\nWORKDIR /tmp\n' "$GITHUB_SHA" "$ARCH" > build/Dockerfile.tests
+          printf 'FROM grokbot-bridge:candidate-%s-%s\nCOPY tests /tests\nCOPY scripts /scripts\nRUN pip install --no-cache-dir "pytest>=8,<9" "pytest-asyncio>=1,<2"\nWORKDIR /app\n' "$GITHUB_SHA" "$ARCH" > build/Dockerfile.tests
           docker build -f build/Dockerfile.tests -t bridge-candidate-tests .
-          docker run --rm --network none --read-only --tmpfs /tmp:rw,exec --tmpfs /root:rw,nosuid,nodev -e CALL_BRIDGE_DB=/tmp/calls.db -e CALL_BRIDGE_STATE=/tmp/bridge bridge-candidate-tests python -m pytest /tests -q | tee "dist/tests-$ARCH.log"
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,exec --tmpfs /root:rw,nosuid,nodev -e CALL_BRIDGE_DB=/tmp/calls.db -e CALL_BRIDGE_STATE=/tmp/bridge bridge-candidate-tests python -m pytest /tests -q -o cache_dir=/tmp/pytest-cache | tee "dist/tests-$ARCH.log"
       - name: Export the tested image and its fixed identity
         env:
           ARCH: ${{ matrix.arch }}
