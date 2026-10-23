@@ -1,0 +1,69 @@
+name: Standalone image candidates
+
+on:
+  workflow_dispatch:
+    inputs:
+      baseline:
+        description: Source revision used to verify update and rollback
+        required: true
+        default: ed2142d219d4df2a0ca40e20e6f3bc8727319ae5
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          fetch-depth: 0
+      - name: Build the baseline and candidate on the native runner
+        env:
+          BASELINE: ${{ inputs.baseline }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          baseline_sha=$(git rev-parse --verify "$BASELINE^{commit}")
+          mkdir -p build/baseline dist
+          git archive "$baseline_sha" | tar -x -C build/baseline
+          docker build --build-arg VCS_REF="$baseline_sha" -t bridge-baseline build/baseline
+          docker build --build-arg VCS_REF="$GITHUB_SHA" -t "grokbot-bridge:candidate-$GITHUB_SHA-$ARCH" .
+      - name: Check standalone startup, restart, update, rollback and update again
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          python3 scripts/check_image_candidate.py bridge-baseline "grokbot-bridge:candidate-$GITHUB_SHA-$ARCH" > "dist/runtime-$ARCH.json"
+      - name: Run the product suite in the installed candidate
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          printf 'FROM grokbot-bridge:candidate-%s-%s\nCOPY tests /tests\nCOPY scripts /scripts\nRUN pip install --no-cache-dir "pytest>=8,<9" "pytest-asyncio>=1,<2"\nWORKDIR /tmp\n' "$GITHUB_SHA" "$ARCH" > build/Dockerfile.tests
+          docker build -f build/Dockerfile.tests -t bridge-candidate-tests .
+          docker run --rm --network none --read-only --tmpfs /tmp:rw,exec --tmpfs /root:rw,nosuid,nodev -e CALL_BRIDGE_DB=/tmp/calls.db -e CALL_BRIDGE_STATE=/tmp/bridge bridge-candidate-tests python -m pytest /tests -q | tee "dist/tests-$ARCH.log"
+      - name: Export the tested image and its fixed identity
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          image="grokbot-bridge:candidate-$GITHUB_SHA-$ARCH"
+          docker image inspect "$image" > "dist/image-$ARCH.json"
+          docker save "$image" | gzip -n > "dist/grokbot-bridge-$GITHUB_SHA-linux-$ARCH.docker.tar.gz"
+          cd dist
+          sha256sum *.docker.tar.gz > "SHA256SUMS-$ARCH"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: standalone-image-${{ matrix.arch }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
