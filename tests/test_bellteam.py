@@ -68,9 +68,31 @@ class BellTeamTests(unittest.TestCase):
                 with mock.patch.dict(os.environ, {"CALL_BRIDGE_BELLTEAM_UNIX": path}):
                     members = fetch_directory()
                     self.assertEqual(members[0]["system"], "bellteam")
-                    receipt = send_delivery({"schema": "call-bridge.delivery.v1", "event": "session.message"})
-                    self.assertEqual(receipt["delivery"], "running")
-                    self.assertEqual(server.received["event"], "session.message")
+                    store = CallStore(Path(root) / "calls.db")
+                    session = store.open_session("bot-caller", "発信者", "トロニー",
+                                                 member_system="bellteam", member_id="bot-a",
+                                                 local_system="bellteam")
+                    sid = session["session_id"]
+                    sent = dispatch_send(store, sid, "local", "確認して\n本文", False)
+                    self.assertEqual(sent["delivery"]["status"], "delivered")
+                    self.assertEqual(server.received, {
+                        "schema": "call-bridge.delivery.v1", "event": "session.message",
+                        "session_id": sid, "target_id": "bot-a",
+                        "source_system": "bellteam", "source_id": "bot-caller",
+                        "source_label": "発信者", "message": "確認して\n本文", "reply_required": False,
+                    })
+                    reply = dispatch_send(store, sid, "member", "確認した", False)
+                    self.assertEqual(reply["delivery"]["status"], "delivered")
+                    self.assertEqual(server.received, {
+                        "schema": "call-bridge.delivery.v1", "event": "session.reply",
+                        "session_id": sid, "seq": reply["seq"], "target_id": "bot-caller",
+                        "source_system": "bellteam", "source_id": "bot-a",
+                        "source_label": "トロニー", "message": "確認した", "reply_required": False,
+                    })
+                    self.assertEqual(store.poll_messages(sid, "member")["messages"][0]["message"],
+                                     "確認して\n本文")
+                    self.assertEqual(store.poll_messages(sid, "local")["messages"][0]["message"],
+                                     "確認した")
             finally:
                 server.shutdown()
                 server.server_close()
