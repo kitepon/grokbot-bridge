@@ -20,6 +20,17 @@ def docker(*arguments: str, **kwargs):
                           capture_output=True, timeout=60, **kwargs)
 
 
+def wait_ready(name: str) -> None:
+    for _ in range(60):
+        probe = subprocess.run(["docker", "exec", name, "python", "-c",
+                                "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health',timeout=1)"],
+                               capture_output=True, timeout=5)
+        if probe.returncode == 0:
+            return
+        time.sleep(.1)
+    raise AssertionError("Candidate did not become ready")
+
+
 CHECK = r'''
 import asyncio, json, os, urllib.request, urllib.error
 from mcp import ClientSession
@@ -91,21 +102,14 @@ def main() -> None:
                    "-e", "CALL_BRIDGE_DIRECTORY=/fixture/directory.json",
                    "-e", "CALL_BRIDGE_AGENTS_ROOT=/fixture/absent-agents", image)
             try:
-                for _ in range(60):
-                    probe = subprocess.run(["docker", "exec", name, "python", "-c",
-                                            "import urllib.request; urllib.request.urlopen('http://127.0.0.1:18910/health',timeout=1)"],
-                                           capture_output=True, timeout=5)
-                    if probe.returncode == 0:
-                        break
-                    time.sleep(.1)
-                else:
-                    raise AssertionError("Candidate did not become ready")
+                wait_ready(name)
                 result = docker("exec", "-e", f"CHECK_PHASE={phase}", "-e", f"CHECK_SESSION={sid or ''}",
                                 name, "python", "-B", "-c", CHECK)
                 outcome = json.loads(result.stdout)
                 sid = outcome["session_id"]
                 if phase == 2:
                     docker("restart", "--time", "10", name)
+                    wait_ready(name)
                     check_restart = "from call_bridge.db import CallStore; s=CallStore('/app/data/calls.db'); assert s.history(" + repr(sid) + ")[\"latest_seq\"]==2"
                     docker("exec", name, "python", "-B", "-c", check_restart)
                     outcome["restart_keeps_latest_db"] = True
@@ -117,6 +121,10 @@ def main() -> None:
                 outcome["sigterm_exit"] = state["ExitCode"]
                 outcome["session_id"] = "synthetic"
                 phases.append(outcome)
+            except Exception:
+                logs = docker("logs", name)
+                print(f"Image check failed in phase {phase}:\n{logs.stdout}{logs.stderr}", file=sys.stderr)
+                raise
             finally:
                 docker("rm", "--force", name)
     print(json.dumps({"images": identities, "phases": phases, "bellteam_required": False,
