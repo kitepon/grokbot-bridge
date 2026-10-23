@@ -1,4 +1,9 @@
-"""BellTeam directory and delivery over a mounted UNIX socket."""
+"""BellTeam wire payloads, directory and delivery over a mounted UNIX socket.
+
+Payload builders only translate a bridge session into the existing connector
+protocol. Call storage, send ordering and retry decisions belong to deliver.py;
+Bot-to-conversation mapping belongs to the receiving BellTeam application.
+"""
 
 from __future__ import annotations
 
@@ -89,6 +94,30 @@ def fetch_directory() -> list[dict[str, Any]]:
             raise BellTeamError("BellTeam directory invalid")
         result.append({**item, "system": "bellteam"})
     return result
+
+
+def message_payload(session: dict[str, Any], message: str, reply_required: bool) -> dict[str, Any]:
+    """A local party's message to a resolved BellTeam member (no seq yet)."""
+    return {
+        "schema": "call-bridge.delivery.v1", "event": "session.message",
+        "session_id": session["session_id"], "target_id": session["member_id"],
+        "source_system": session.get("local_system") or "local",
+        "source_id": session["local_id"], "source_label": session["local_label"],
+        "message": message, "reply_required": reply_required,
+    }
+
+
+def reply_payload(session: dict[str, Any], seq: int, message: str, reply_required: bool) -> dict[str, Any]:
+    """A stored member reply to the BellTeam caller, including its saved seq."""
+    return {
+        "schema": "call-bridge.delivery.v1", "event": "session.reply",
+        "session_id": session["session_id"], "seq": seq,
+        "target_id": session["local_id"],
+        "source_system": session.get("member_system") or "grokbot",
+        "source_id": session.get("member_id") or session["member_name"],
+        "source_label": session["member_name"],
+        "message": message, "reply_required": reply_required,
+    }
 
 
 def send_delivery(payload: dict[str, Any]) -> dict[str, Any]:
