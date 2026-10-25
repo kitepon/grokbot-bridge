@@ -248,23 +248,35 @@ class CodexRPC:
             )
         except OSError as exc:
             raise DeliveryError("CODEX_UNAVAILABLE", "Codex App Server を起動できません") from exc
-        await self.request("initialize", {
-            "clientInfo": {"name": "grokbot_bridge_parent_delivery", "version": "1"},
-            "capabilities": {"experimentalApi": True},
-        })
-        assert self.process.stdin is not None
-        self.process.stdin.write(b'{"method":"initialized"}\n')
-        await self.process.stdin.drain()
+        try:
+            await self.request("initialize", {
+                "clientInfo": {"name": "grokbot_bridge_parent_delivery", "version": "1"},
+                "capabilities": {"experimentalApi": True},
+            })
+            assert self.process.stdin is not None
+            self.process.stdin.write(b'{"method":"initialized"}\n')
+            await self.process.stdin.drain()
+        except BaseException:
+            # A failed __aenter__ never reaches __aexit__. Reap only the
+            # App Server child owned by this connection, including cancellation.
+            await self._close()
+            raise
         return self
 
     async def __aexit__(self, *_exc: object) -> None:
+        await self._close()
+
+    async def _close(self) -> None:
         assert self.process is not None
         if self.process.stdin is not None:
             self.process.stdin.close()
         try:
             await asyncio.wait_for(self.process.wait(), 2)
         except asyncio.TimeoutError:
-            self.process.kill()
+            try:
+                self.process.kill()
+            except ProcessLookupError:
+                pass  # The owned child exited between wait timing out and kill.
             await self.process.wait()
 
     async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
