@@ -194,6 +194,25 @@ When a real MCP or REST request finds the directory unix socket unreachable (`un
 REST の `POST /v0/sessions/{session_id}/messages` でも本文に
 `{"from_party":"local","message":"共有のみです","reply_required":false}` を渡せる。
 
+### Retrying a failed GrokBot call_open
+
+When the directory UNIX link is down and the fallback cannot resolve a nonempty
+target, `call_open` (also `POST /v0/sessions`) returns the existing `error` and
+`detail` plus `code="directory_link_down"`, `retryable=true`,
+`retry_after_seconds=30`, and `session_created=false`. The failure creates no
+session, stores no message, and sends no recipient ring; the body-free operator
+notification above may still occur. The directory also retains
+`directory_unix_error` when using a fallback.
+
+A caller receiving all these retry fields may retry **only call_open** after the
+delay, with a finite attempt or time limit. The hint means the primary directory
+was unreachable; it does not promise that the target exists or that recovery will
+succeed. A healthy directory with no matching target, an empty name, an ambiguous
+name, or a matched entry without an ID does not receive the hint. Older servers
+do not provide it; do not infer retry permission by parsing `detail` or `note`.
+This contract does not apply to transport failures with no confirmed response,
+to `call_send`, or to `delivery.status=unknown`.
+
 ### Codex 親への返信自動配送
 
 Codex から通話する端末では、ローカル MCP を登録すると `call_open` が親タスクを識別する。

@@ -177,7 +177,7 @@ def _open(
     else:
         resolved = resolve_member_agent_id(member_name)
         if not resolved.get("ok"):
-            return resolved
+            return {**resolved, "session_created": False}
         member_id = resolved["id"]
         member_name = resolved.get("name") or member_name
     sess = store.open_session(local_id, local_label, member_name, purpose, member_system, member_id, local_system)
