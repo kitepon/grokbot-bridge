@@ -454,6 +454,7 @@ def _note_unix_link_down(book: dict[str, Any], detail: str | None) -> dict[str, 
         return book
     notify_link_down("directory", detail)
     book["note"] = LINK_DOWN_NOTE
+    book["directory_unix_error"] = detail
     return book
 
 
@@ -537,8 +538,12 @@ def _agent_id_of(member: dict[str, Any]) -> str:
     return ""
 
 
-def _resolve_failure(book: dict[str, Any], error: str, detail: str) -> dict[str, Any]:
+def _resolve_failure(
+    book: dict[str, Any], error: str, detail: str, *, retryable_on_link_down: bool = False,
+) -> dict[str, Any]:
     out: dict[str, Any] = {"ok": False, "error": error, "detail": detail}
+    if retryable_on_link_down and is_unix_link_down(book.get("directory_unix_error")):
+        out.update(code="directory_link_down", retryable=True, retry_after_seconds=30)
     note = book.get("note")
     if isinstance(note, str) and note and note not in detail:
         out["note"] = note
@@ -558,7 +563,7 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
     book = _load_grok_directory()
     if not book.get("ok"):
         detail = str(book.get("detail") or book.get("error") or "directory unavailable")
-        return _resolve_failure(book, "error", f"directory unavailable: {detail}")
+        return _resolve_failure(book, "error", f"directory unavailable: {detail}", retryable_on_link_down=bool(name))
     members = [m for m in (book.get("members") or []) if isinstance(m, dict)]
     if not name:
         return _resolve_failure(book, "target_not_found", "member name is empty")
@@ -586,7 +591,7 @@ def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
     for member in members:
         if _agent_id_of(member) == name:
             return {"ok": True, "id": name, "name": str(member.get("name") or name)}
-    return _resolve_failure(book, "target_not_found", f"no directory entry for {name}")
+    return _resolve_failure(book, "target_not_found", f"no directory entry for {name}", retryable_on_link_down=True)
 
 
 def resolve_bellteam_member(value: str) -> dict[str, Any]:

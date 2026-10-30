@@ -19,6 +19,8 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from call_bridge.db import CallStore  # noqa: E402
+from call_bridge import server as call_server  # noqa: E402
+from call_bridge.auth import OPEN  # noqa: E402
 from call_bridge.deliver import dispatch_send  # noqa: E402
 from call_bridge.directory import load_directory, search_directory  # noqa: E402
 from call_bridge.wake import (  # noqa: E402
@@ -327,6 +329,74 @@ class LinkDownTests(unittest.TestCase):
         self.assertEqual(bad_json["directory_unix_error"], "invalid directory json")
         self.assertNotIn("note", bad_json)
         self.assertEqual(webhook.requests, [])  # type: ignore[attr-defined]
+
+    def test_open_missing_from_fallback_can_retry_after_link_recovers(self) -> None:
+        sock = str(Path(self.temp.name) / "d200.sock")
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = sock
+        self._snapshot([{"id": "old-seat", "name": "Old seat"}])
+        store = CallStore(Path(self.temp.name) / "retry.sqlite")
+        with mock.patch.object(call_server, "store", store), \
+             mock.patch.object(store, "open_session", wraps=store.open_session) as opened, \
+             mock.patch.object(store, "send_message", wraps=store.send_message) as sent, \
+             mock.patch("call_bridge.directory.notify_link_down") as down, \
+             mock.patch("call_bridge.deliver.notify_ring") as ring:
+            failed = call_server._open(OPEN, "approval-box", "Approval Box", "cocoa", None, "grokbot", "local")
+            self.assertFalse(failed["ok"])
+            self.assertEqual(failed["error"], "target_not_found")
+            self.assertEqual(failed["code"], "directory_link_down")
+            self.assertIs(failed["retryable"], True)
+            self.assertEqual(failed["retry_after_seconds"], 30)
+            self.assertIs(failed["session_created"], False)
+            self.assertNotIn("session_id", failed)
+            opened.assert_not_called()
+            sent.assert_not_called()
+            ring.assert_not_called()
+            down.assert_called_once_with("directory", "unix socket not found")
+
+            self._unix(status=200, payload=json.dumps({"members": [{"id": "cocoa", "name": "Cocoa"}]}).encode())
+            recovered = call_server._open(OPEN, "approval-box", "Approval Box", "cocoa", None, "grokbot", "local")
+            self.assertEqual(recovered["member_id"], "cocoa")
+            self.assertEqual(store.session_info(recovered["session_id"])["message_count"], 0)
+            opened.assert_called_once()
+            sent.assert_not_called()
+            ring.assert_not_called()
+            self.assertNotIn("retryable", recovered)
+
+    def test_healthy_directory_missing_target_does_not_offer_retry(self) -> None:
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = self._unix(status=200, payload=b'{"members": []}')
+        with mock.patch.object(call_server, "store") as store:
+            result = call_server._open(OPEN, "approval-box", "Approval Box", "missing", None, "grokbot", "local")
+        self.assertEqual(result["error"], "target_not_found")
+        self.assertNotIn("retryable", result)
+        self.assertNotIn("code", result)
+        self.assertIs(result["session_created"], False)
+        store.open_session.assert_not_called()
+
+    def test_bad_target_during_link_down_does_not_offer_retry(self) -> None:
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self.temp.name) / "missing.sock")
+        self._snapshot([{"id": "a", "name": "Same"}, {"id": "b", "name": "Same"}, {"name": "No ID"}])
+        with mock.patch.object(call_server, "store") as store, \
+             mock.patch("call_bridge.directory.notify_link_down"):
+            for name in ("", "Same", "No ID"):
+                with self.subTest(name=name):
+                    result = call_server._open(OPEN, "approval-box", "Approval Box", name, None, "grokbot", "local")
+                    self.assertNotIn("retryable", result)
+                    self.assertIs(result["session_created"], False)
+        store.open_session.assert_not_called()
+
+    def test_no_fallback_on_down_link_offers_retry_only_for_nonempty_target(self) -> None:
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self.temp.name) / "missing.sock")
+        with mock.patch.object(call_server, "store") as store, \
+             mock.patch("call_bridge.directory._load_snapshot", return_value=None), \
+             mock.patch("call_bridge.directory.notify_link_down"):
+            result = call_server._open(OPEN, "approval-box", "Approval Box", "cocoa", None, "grokbot", "local")
+            empty = call_server._open(OPEN, "approval-box", "Approval Box", "", None, "grokbot", "local")
+        self.assertEqual(result["error"], "error")
+        self.assertEqual(result["code"], "directory_link_down")
+        self.assertIs(result["retryable"], True)
+        self.assertIs(result["session_created"], False)
+        self.assertNotIn("retryable", empty)
+        store.open_session.assert_not_called()
 
     def test_url_only_failure_does_not_wake(self) -> None:
         webhook = self._webhook(204)

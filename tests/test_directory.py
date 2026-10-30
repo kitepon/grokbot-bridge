@@ -286,7 +286,7 @@ class DirectoryTests(unittest.TestCase):
         self.assertEqual(book["agents_root"], "/via-url")
         self.assertEqual(book["members"][0]["title"], "URL最新")
         self.assertNotIn("directory_unix", book)
-        self.assertNotIn("directory_unix_error", book)
+        self.assertEqual(book["directory_unix_error"], "unix socket not found")
 
     def test_unix_and_url_failure_uses_local_profiles(self) -> None:
         root = self._agents()
@@ -300,7 +300,7 @@ class DirectoryTests(unittest.TestCase):
         self.assertEqual(book["source"], "agent-profiles")
         self.assertEqual(book["agents_root"], str(root))
         self.assertEqual(book["members"][0]["title"], "ローカル最新")
-        self.assertNotIn("directory_unix_error", book)
+        self.assertEqual(book["directory_unix_error"], "unix socket not found")
         self.assertNotIn("directory_url_error", book)
 
     def test_remote_failures_then_snapshot_records_both_errors(self) -> None:
