@@ -172,6 +172,57 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.send.await_count, 0)
         self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "fetched")])
 
+    async def test_normal_fetch_resolves_unknown_without_resending_and_preserves_the_cause(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.stop(sid, "unknown", "DELIVERY_PREVIOUSLY_STARTED", 2)
+        self.store.adopt_channel(sid, CHANNEL, str(self.folder))  # 本人の通常取得後に既存経路が見張りを再開する。
+        bridge = Bridge([{"seq": 2, "message": "取得済み", "fetched": True},
+                         {"seq": 4, "message": "新しい返信", "fetched": False}], status="hungup")
+        await self._watch(sid, bridge)
+        self.send.assert_awaited_once()
+        self.assertIn("新しい返信", self.send.await_args.args[2])
+        rows = self.store.status(sid)["deliveries"]
+        self.assertEqual((rows[0]["state"], rows[0]["error"]), ("fetched", "DELIVERY_PREVIOUSLY_STARTED"))
+        self.assertEqual(self.store.subscription(sid)["after_seq"], 4)
+
+    async def test_unknown_is_not_resolved_without_a_boolean_fetch_record(self):
+        for fetched in (False, None, 1, "true"):
+            with self.subTest(fetched=fetched):
+                sid = self._call()
+                self.store.reserve(sid, 2)
+                self.store.stop(sid, "unknown", "DELIVERY_PREVIOUSLY_STARTED", 2)
+                report = AsyncMock()
+                outcome = await local.Watchers(self.store)._handle(
+                    self.store.subscription(sid), {"seq": 2, "message": "返事", "fetched": fetched}, 2, report)
+                self.assertEqual(outcome, "stop")
+                self.assertEqual(self.store.subscription(sid)["after_seq"], 0)
+        self.send.assert_not_awaited()
+
+    async def test_manual_fetch_recovers_only_the_requested_delivery(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.reserve(sid, 4)
+        self.store.stop(sid, "unknown", "older cause", 2)
+        subscription = {**self.store.subscription(sid), "delivery_mode": "manual"}
+        outcome = await local.Watchers(self.store)._handle(
+            subscription, {"seq": 2, "message": "取得済み", "fetched": True}, 4, AsyncMock())
+        self.assertEqual(outcome, "next")
+        self.assertEqual(self._states(sid), [(2, "fetched"), (4, "sending")])
+        self.assertEqual(self.store.subscription(sid)["after_seq"], 2)
+        self.send.assert_not_awaited()
+
+    async def test_codex_unknown_is_not_recovered_by_the_channel_fetch_rule(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.stop(sid, "unknown", "original cause", 2)
+        subscription = {**self.store.subscription(sid), "delivery_mode": "queue", "harness": "codex"}
+        outcome = await local.Watchers(self.store)._handle(
+            subscription, {"seq": 2, "message": "返事", "fetched": True}, 2, AsyncMock())
+        self.assertEqual(outcome, "stop")
+        self.assertEqual(self.store.subscription(sid)["after_seq"], 0)
+        self.send.assert_not_awaited()
+
     async def test_owner_read_timeout_does_not_leave_a_started_reservation(self):
         session_id = self._call()
         self.owner.side_effect = DeliveryError("CLAUDE_CHANNEL_TIMEOUT", "owner read timed out")
@@ -592,6 +643,21 @@ class FollowSpeakerTest(CallOpenTest):
     def _bound(self) -> tuple[str, str, str]:
         saved = self.store.subscription(self.session_id)
         return saved["delivery_mode"], saved["thread_id"], saved["harness"]
+
+    async def test_poll_finishes_before_restarting_a_stopped_watch(self):
+        events = []
+
+        async def poll(*_args):
+            events.append("fetched")
+            return {"messages": []}
+
+        async def follow(*_args):
+            events.append("watch")
+
+        with patch.object(local, "_remote_tool", side_effect=poll), \
+             patch.object(local, "_follow_speaker", side_effect=follow):
+            await local.call_poll(self.session_id, "local", ctx=self._ctx())
+        self.assertEqual(events, ["fetched", "watch"])
 
     async def test_conversation_that_sends_on_an_older_call_gets_the_replies_from_then_on(self):
         self._old_call()  # 前の会話が開いた通話。前の会話は、もう居ない

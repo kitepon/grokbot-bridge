@@ -296,8 +296,10 @@ class LocalStore:
         if state not in _DONE:
             raise ValueError(state)
         with self.connect() as db:
-            db.execute("UPDATE deliveries SET state = ?, error = NULL, confirmed = MIN(confirmed, ?), at = ? "
-                       "WHERE session_id = ? AND seq = ?", (state, int(confirmed), time.time(), session_id, seq))
+            # 本人取得でunknownを解消しても、元の失敗原因は配送行へ残す。
+            db.execute("UPDATE deliveries SET state = ?, error = CASE WHEN state = 'unknown' AND ? = 'fetched' "
+                       "THEN error ELSE NULL END, confirmed = MIN(confirmed, ?), at = ? "
+                       "WHERE session_id = ? AND seq = ?", (state, state, int(confirmed), time.time(), session_id, seq))
             db.execute("UPDATE subscriptions SET after_seq = MAX(after_seq, ?), last_error = NULL, hold_seq = NULL "
                        "WHERE session_id = ?", (seq, session_id))
 
@@ -657,6 +659,10 @@ class Watchers:
         if state in _DONE:
             self.store.advance(session_id, seq)
             return "next"
+        if subscription["delivery_mode"] in ("channel", "manual") and message.get("fetched") is True:
+            self.store.submitted(session_id, seq, "fetched")
+            await report(seq, "fetched", None, None)
+            return "next"
         if state not in ("new", "waiting"):
             self.store.stop(session_id, "unknown", "DELIVERY_PREVIOUSLY_STARTED", seq)
             await report(seq, "unknown", "DELIVERY_PREVIOUSLY_STARTED", None)
@@ -738,10 +744,6 @@ class Watchers:
                        report: "_Reporter") -> str:
         """生きている Claude Code の会話へ入れる。会話の hook が取り出して、止まっている会話を起こす。"""
         session_id, seq, channel = subscription["session_id"], message["seq"], subscription["thread_id"]
-        if message.get("fetched") is True:
-            self.store.submitted(session_id, seq, "fetched")
-            await report(seq, "fetched", None, None)
-            return "next"
         successor = await self._retired(subscription)
         if successor:
             # Throughline に引き継がれて止まった会話。ここへ入れると、道具を使えない会話が起きて文で答えるだけになり、
@@ -860,10 +862,6 @@ class Watchers:
                       report: "_Reporter") -> str:
         """自分で取りに来る会話。待っても取りに来なければ、担当フォルダの席へ渡す。"""
         session_id, seq = subscription["session_id"], message["seq"]
-        if message.get("fetched") is True:
-            self.store.submitted(session_id, seq, "fetched")
-            await report(seq, "fetched", None, None)
-            return "next"
         if not self.receiver:
             # この MCP を起こした会話が生きている。返信は会話が call_poll で取りに来る。
             self.store.defer(session_id, seq)
@@ -1409,8 +1407,8 @@ async def call_send(session_id: str, from_party: Literal["local", "member"], mes
                       "Codex か、hook の入った Claude Code の会話が local として取りに来ると、以後の返信はその会話へ届く")
 async def call_poll(session_id: str, party: Literal["local", "member"], after_seq: int = 0,
                     ctx: Context | None = None) -> dict[str, Any]:
-    extra = await _follow_speaker(session_id, ctx) if party == "local" else None
     result = await _remote_tool("call_poll", {"session_id": session_id, "party": party, "after_seq": after_seq})
+    extra = await _follow_speaker(session_id, ctx) if party == "local" else None
     return {**result, **extra} if extra else result
 
 
