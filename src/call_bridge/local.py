@@ -221,6 +221,11 @@ class LocalStore:
                     source TEXT NOT NULL, target TEXT NOT NULL, state TEXT NOT NULL,
                     detail TEXT, at REAL NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS superseded_replies (
+                    session_id TEXT NOT NULL, seq INTEGER NOT NULL,
+                    reason TEXT NOT NULL, at REAL NOT NULL,
+                    PRIMARY KEY (session_id, seq)
+                );
             """)
             columns = {row[1] for row in db.execute("PRAGMA table_info(subscriptions)")}
             if "delivery_mode" not in columns:
@@ -316,6 +321,9 @@ class LocalStore:
     def reserve(self, session_id: str, seq: int) -> tuple[str, str]:
         delivery_id = str(uuid.uuid5(_DELIVERY_NAMESPACE, f"{session_id}:{seq}"))
         with self.connect() as db:
+            if db.execute("SELECT 1 FROM superseded_replies WHERE session_id = ? AND seq = ?",
+                          (session_id, seq)).fetchone():
+                return delivery_id, "superseded"
             row = db.execute("SELECT state FROM deliveries WHERE session_id = ? AND seq = ?",
                              (session_id, seq)).fetchone()
             if row is None:
@@ -328,6 +336,22 @@ class LocalStore:
                            (session_id, seq))
                 return delivery_id, "new"
             return delivery_id, row["state"]
+
+    def supersede(self, subscription: dict[str, Any], deliveries: list[dict[str, Any]],
+                  seqs: list[int], reason: str) -> None:
+        """見張りの鍵を持つ回復処理だけが呼ぶ。旧配送の成否は変更しない。"""
+        session_id = subscription["session_id"]
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM subscriptions WHERE session_id = ?", (session_id,)).fetchone()
+            rows = [dict(row) for row in db.execute(
+                "SELECT * FROM deliveries WHERE session_id = ? ORDER BY seq", (session_id,))]
+            if current is None or dict(current) != subscription or rows != deliveries:
+                raise DeliveryError("CALL_CHANGED", "通話か配送が変わりました。失効していません")
+            db.executemany("INSERT INTO superseded_replies(session_id,seq,reason,at) VALUES(?,?,?,?)",
+                           [(session_id, seq, reason, time.time()) for seq in seqs])
+            db.execute("UPDATE subscriptions SET after_seq = ?, hold_seq = NULL WHERE session_id = ?",
+                       (max(seqs), session_id))
 
     def reserved_at(self, session_id: str, seq: int) -> float:
         """この返信を最初に見た時刻。前の版が作った行には無いので、その時は今。"""
@@ -505,12 +529,14 @@ class LocalStore:
         with self.connect() as db:
             rows = db.execute("SELECT seq, delivery_id, state, error FROM deliveries WHERE session_id = ? ORDER BY seq",
                               (session_id,)).fetchall()
+            superseded = [dict(row) for row in db.execute(
+                "SELECT seq,reason,at FROM superseded_replies WHERE session_id = ? ORDER BY seq", (session_id,))]
         # yielding は見張りを替えている数秒の間だけ。通話の持ち主から見れば、生きている。
         state = "active" if subscription["state"] == "yielding" else subscription["state"]
         return {"state": state, "after_seq": subscription["after_seq"],
                 "last_error": subscription["last_error"], "harness": subscription["harness"],
                 "delivery_mode": subscription["delivery_mode"], "conversation": subscription["thread_id"],
-                "deliveries": [dict(row) for row in rows]}
+                "deliveries": [dict(row) for row in rows], "superseded_replies": superseded}
 
     async def delivery_status(self, session_id: str) -> dict[str, Any]:
         """キューの受付後に hook が取り出し中・中断した配送を、その状態で示す。"""
@@ -731,7 +757,7 @@ class Watchers:
         """返信を1通扱う。next＝次へ進む、wait＝後でもう一度見る、stop＝見張りを止めた。"""
         session_id, seq = subscription["session_id"], message["seq"]
         delivery_id, state = self.store.reserve(session_id, seq)
-        if state in _DONE:
+        if state in (*_DONE, "superseded"):
             self.store.advance(session_id, seq)
             return "next"
         if subscription["delivery_mode"] in ("channel", "manual") and message.get("fetched") is True:
