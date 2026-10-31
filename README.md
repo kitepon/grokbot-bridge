@@ -511,7 +511,7 @@ MIT © kitepon.dev
 
 ### 実行不要となった旧返信で配送が止まった時
 
-Codex の旧返信が `CODEX_DELIVERY_DUPLICATE` で止まり、その依頼を再実行してはいけない場合は、端末の管理者が、依頼元と失効対象を確認してから `call-bridge-recover` を使える。
+Codex の旧返信が `CODEX_DELIVERY_DUPLICATE` または本文投入前の `CODEX_REQUEST_TIMEOUT: initialize が時間内に返りませんでした` で止まり、その依頼を再実行してはいけない場合は、端末の管理者が、依頼元と失効対象を確認してから `call-bridge-recover` を使える。
 
 ```bash
 call-bridge-recover --session <通話UUID> --seq <旧返信のseq> --reason '別経路で完了したため失効' \

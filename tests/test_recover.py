@@ -87,6 +87,23 @@ class RecoverTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual([r['seq'] for r in self.store.status(SID)['superseded_replies']], SEQS)
         self.assertEqual(self.store.reserve(SID, 675)[1], 'superseded')
 
+    async def test_initialize_timeout_can_be_superseded_without_changing_failure(self):
+        self.store.hold(SID, 675, 679, 'CODEX_REQUEST_TIMEOUT: initialize が時間内に返りませんでした')
+        before = self.snapshot()['deliveries']
+        await self.apply()
+        self.assertEqual(self.snapshot()['deliveries'], before)
+        self.assertEqual(self.store.reserve(SID, 675)[1], 'superseded')
+
+    async def test_other_timeouts_and_errors_are_refused(self):
+        for error in ['CODEX_REQUEST_TIMEOUT: thread/queue/add が時間内に返りませんでした',
+                      'CODEX_REQUEST_TIMEOUT: thread/read が時間内に返りませんでした',
+                      'CODEX_REQUEST_TIMEOUT: initialize', 'CODEX_TRANSPORT_FAILED: failed']:
+            with self.subTest(error=error):
+                self.store.hold(SID, 675, 679, error)
+                before = self.snapshot()
+                with self.assertRaises(DeliveryError): await self.apply()
+                self.assertEqual(self.snapshot(), before)
+
     async def test_mismatched_or_incomplete_request_changes_nothing(self):
         for args in ({'expected_thread':str(uuid.uuid4())}, {'expected_after':672}, {'expected_hold':677},
                      {'seqs':[]}, {'seqs':[675,677]}, {'seqs':[675,676,677,677]},

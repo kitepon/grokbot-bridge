@@ -59,7 +59,8 @@ async def supersede(session_id: str, seqs: list[int], reason: str,
         deliveries = [dict(row) for row in db.execute('SELECT * FROM deliveries WHERE session_id=? ORDER BY seq', (session_id,))]
     pending = [row for row in deliveries if row['seq'] > expected_after]
     if (not pending or pending[0]['seq'] != seqs[0]
-            or not (pending[0]['error'] or '').startswith('CODEX_DELIVERY_DUPLICATE:')
+            or not ((pending[0]['error'] or '').startswith('CODEX_DELIVERY_DUPLICATE:')
+                    or pending[0]['error'] == 'CODEX_REQUEST_TIMEOUT: initialize が時間内に返りませんでした')
             or any(row['state'] != 'failed' or row['seq'] not in seqs for row in pending)
             or any(row['delivery_id'] != str(uuid.uuid5(local._DELIVERY_NAMESPACE,
                        f"{session_id}:{row['seq']}")) for row in pending)
