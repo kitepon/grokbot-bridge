@@ -523,3 +523,9 @@ call-bridge-recover --session <通話UUID> --seq <旧返信のseq> --reason '別
 この命令は、その通話の見張りへ鍵の解放を頼み、公式キューが最初の1ページで空（data=[]、nextCursor=null）であること、処理中の hook claim が無いこと、通話と予約が確認中に変わっていないことを確かめる。条件が揃わなければ失効しない。送信・キュー削除・hook実行は行わず、pending/settledにも触れない。キューが非空・複数ページ・不正な応答なら適用しない。同じIDをほかの送信元が新規投入しないことも、実行前に確認する。
 
 失効対象の番号・理由・時刻は端末台帳の `superseded_replies` に保存し、元の配送状態・エラー・予約時刻はそのまま残す。サーバーへ成功や取得済みの receipt は送らない。以後の `call_info.parent_delivery.superseded_replies` に失効記録を表示し、後続の返信は通常の受け取り処理に戻す。現在版の受け取り処理は失効IDを再予約しても送信しない。旧MCPはafter_seqを読み直す通常経路で旧返信を飛ばすが、旧コードのreserveを直接呼ぶ操作まで防ぐものではない。これは旧依頼の失効であり、過去の未実行や配送成功の証明ではない。古い MCP には追加した表示項目がないので、更新した受け取り処理・CLIで確認する。
+
+### Claude channel入口timeout後の照合
+
+新しい予約は送信先channelを保持する。入口timeoutなどでunknown/sendingになった場合、receiverは保存されたchannelの公的emittedを確認できた時だけ再送無しで通常配送へ戻す。queued（hookが未取得）やstate無しの行は復帰の対象外で、unknownのまま残す。元error/初回at/IDは保持し、startedはhook出力の確証であり、本人の業務完了を表さない。
+
+旧台帳でchannelが欠ける場合は自動推測しない。管理者が初回送信先と現在の本人を確かめた上で `python -m call_bridge.channel_recover --session <UUID> --seq <番号> --expected-current <現channelUUID> --expected-owner <Claude会話UUID> --source-channel <元channelUUID> --expected-after <cursor>` を使う。公的channel集合とownerの前後一致、同ownerで唯一のemitted、他の配送状態無し、session lockと全台帳snapshot一致を条件に、送信先の結合だけを保存する。unknown/error/atを保持し送信しない。以後receiverが固定先の公的emittedを再確認して通常状態へ戻す。読取失敗・曖昧なowner・関連状態あり・通話変更なら拒否する。旧MCPの予約はchannelを保存しないため、更新したreceiverが通常のsession排他を取得して扱う。

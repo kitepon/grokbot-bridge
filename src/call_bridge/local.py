@@ -243,6 +243,8 @@ class LocalStore:
             if "confirmed" not in columns:
                 # 前からある行は確かめ済みとして扱う。キューへ入れた後の確かめは、新しい配送にだけ行う。
                 db.execute("ALTER TABLE deliveries ADD COLUMN confirmed INTEGER NOT NULL DEFAULT 1")
+            if "channel_id" not in columns:
+                db.execute("ALTER TABLE deliveries ADD COLUMN channel_id TEXT")
             if "at" not in columns:
                 db.execute("ALTER TABLE deliveries ADD COLUMN at REAL")
 
@@ -327,14 +329,20 @@ class LocalStore:
             row = db.execute("SELECT state FROM deliveries WHERE session_id = ? AND seq = ?",
                              (session_id, seq)).fetchone()
             if row is None:
-                db.execute("INSERT INTO deliveries(session_id,seq,delivery_id,state,at) VALUES(?,?,?,'sending',?)",
-                           (session_id, seq, delivery_id, time.time()))
+                db.execute("INSERT INTO deliveries(session_id,seq,delivery_id,state,at,channel_id) "
+                           "SELECT ?,?,?, 'sending',?, CASE WHEN delivery_mode='channel' THEN thread_id END "
+                           "FROM subscriptions WHERE session_id=?",
+                           (session_id, seq, delivery_id, time.time(), session_id))
                 return delivery_id, "new"
             if row["state"] == "failed":
                 # 確かに届けられなかった返信は、新しい返信が来た時にもう一度試せる。
-                db.execute("UPDATE deliveries SET state = 'sending', error = NULL WHERE session_id = ? AND seq = ?",
-                           (session_id, seq))
+                db.execute("UPDATE deliveries SET state = 'sending', error = NULL,channel_id="
+                           "(SELECT CASE WHEN delivery_mode='channel' THEN thread_id END FROM subscriptions WHERE session_id=?) "
+                           "WHERE session_id = ? AND seq = ?", (session_id, session_id, seq))
                 return delivery_id, "new"
+            if row["state"] == "waiting":
+                db.execute("UPDATE deliveries SET channel_id=(SELECT CASE WHEN delivery_mode='channel' THEN thread_id END "
+                           "FROM subscriptions WHERE session_id=?) WHERE session_id=? AND seq=?", (session_id, session_id, seq))
             return delivery_id, row["state"]
 
     def supersede(self, subscription: dict[str, Any], deliveries: list[dict[str, Any]],
@@ -637,7 +645,8 @@ class Watchers:
                 subscription = self.store.subscription(session_id)
                 if (self.receiver and subscription["state"] == "unknown"
                         and subscription["delivery_mode"] == "channel" and subscription["harness"] == "claude-code"):
-                    if not await self._recover_fetched(subscription, client):
+                    if not (await self._recover_fetched(subscription, client)
+                            or await self._recover_emitted(subscription, _Reporter(client, _headers(), session_id))):
                         return
                     continue
                 if subscription["state"] != "active":
@@ -718,6 +727,40 @@ class Watchers:
                                 log.warning("channel for %s was not closed: %s", session_id, exc)
                         return
                 await asyncio.sleep(_POLL_SECONDS)
+
+    async def _recover_emitted(self, subscription: dict[str, Any], report: "_Reporter") -> bool:
+        session_id = subscription["session_id"]
+        with self.store.connect() as db:
+            rows = [dict(row) for row in db.execute("SELECT * FROM deliveries WHERE session_id=? "
+                    "AND state IN ('unknown','sending') ORDER BY seq", (session_id,))]
+        if not rows:
+            return False
+        channels = []
+        try:
+            for row in rows:
+                if row['delivery_id'] != str(uuid.uuid5(_DELIVERY_NAMESPACE, f"{session_id}:{row['seq']}")):
+                    return False
+                channel = await claude_channel.emitted_channel(row['delivery_id'], row['channel_id'])
+                if channel is None:
+                    return False
+                channels.append(channel)
+        except DeliveryError:
+            return False
+        with self.store.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            current = db.execute('SELECT * FROM subscriptions WHERE session_id=?', (session_id,)).fetchone()
+            pending = [dict(row) for row in db.execute("SELECT * FROM deliveries WHERE session_id=? "
+                       "AND state IN ('unknown','sending') ORDER BY seq", (session_id,))]
+            if current is None or dict(current) != subscription or pending != rows:
+                return False
+            # 出力済みの確証で再送せず再開する。元のerror/atとcursorは残す。
+            db.executemany("UPDATE deliveries SET state='submitted',confirmed=1,channel_id=? "
+                           "WHERE session_id=? AND seq=?", [(channel, session_id, row['seq'])
+                           for row, channel in zip(rows, channels)])
+            db.execute("UPDATE subscriptions SET state='active',last_error=NULL WHERE session_id=?", (session_id,))
+        for row, channel in zip(rows, channels):
+            await report(row['seq'], 'started', None, f'claude:{channel}')
+        return True
 
     async def _recover_fetched(self, subscription: dict[str, Any], client: httpx.AsyncClient) -> bool:
         session_id = subscription["session_id"]
@@ -844,7 +887,13 @@ class Watchers:
     async def _channel(self, subscription: dict[str, Any], message: dict[str, Any], delivery_id: str, text: str,
                        report: "_Reporter") -> str:
         """生きている Claude Code の会話へ入れる。会話の hook が取り出して、止まっている会話を起こす。"""
-        session_id, seq, channel = subscription["session_id"], message["seq"], subscription["thread_id"]
+        session_id, seq = subscription["session_id"], message["seq"]
+        with self.store.connect() as db:
+            channel = db.execute('SELECT channel_id FROM deliveries WHERE session_id=? AND seq=?',
+                                 (session_id, seq)).fetchone()['channel_id']
+        if not channel:
+            raise DeliveryError('CHANNEL_BINDING_MISSING', '配送先の予約がありません')  # 送る前の失敗。次の返信で予約し直す
+        subscription = {**subscription, 'thread_id': channel}
         successor = await self._retired(subscription)
         if successor:
             # Throughline に引き継がれて止まった会話。ここへ入れると、道具を使えない会話が起きて文で答えるだけになり、
