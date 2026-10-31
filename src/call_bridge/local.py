@@ -740,7 +740,7 @@ class Watchers:
             for row in rows:
                 if row['delivery_id'] != str(uuid.uuid5(_DELIVERY_NAMESPACE, f"{session_id}:{row['seq']}")):
                     return False
-                channel = await claude_channel.emitted_channel(subscription['thread_id'], row['delivery_id'], row['channel_id'])
+                channel = await claude_channel.emitted_channel(row['delivery_id'], row['channel_id'])
                 if channel is None:
                     return False
                 channels.append(channel)
@@ -892,7 +892,7 @@ class Watchers:
             channel = db.execute('SELECT channel_id FROM deliveries WHERE session_id=? AND seq=?',
                                  (session_id, seq)).fetchone()['channel_id']
         if not channel:
-            raise DeliveryError('CHANNEL_BINDING_MISSING', '配送先の予約がありません', outcome_unknown=True)
+            raise DeliveryError('CHANNEL_BINDING_MISSING', '配送先の予約がありません')  # 送る前の失敗。次の返信で予約し直す
         subscription = {**subscription, 'thread_id': channel}
         successor = await self._retired(subscription)
         if successor:

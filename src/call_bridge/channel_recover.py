@@ -25,7 +25,7 @@ async def claude_owners(ids):
     """Claude Code の受け口ごとの会話。Cursor/背景/Codex の受け口は対象外。読めない・形の崩れた受け口は拒否。"""
     owners={}
     for channel in ids:
-        kind, session = await claude_channel.owner(channel)
+        kind, session = await claude_channel.owner_kind(channel)
         if kind == 'claude':
             if session is None: refuse()
             owners[channel]=session

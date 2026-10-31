@@ -19,7 +19,7 @@ class BindingTest(unittest.IsolatedAsyncioTestCase):
         report=AsyncMock()
         with patch.object(claude_channel,'emitted_channel',AsyncMock(return_value='old')) as check:
             self.assertTrue(await self.watcher._recover_emitted(self.store.subscription(SID),report))
-        self.assertEqual(check.await_args.args[2],'old')
+        self.assertEqual(check.await_args.args,('ed8221bf-ddff-5d23-b2d6-20c0cc0dbbbc','old'))
         row=self.store.status(SID)['deliveries'][0]
         self.assertEqual((row['state'],row['error'],self.store.reserved_at(SID,224)),('submitted',before['error'],before['at']))
         self.assertEqual(self.store.subscription(SID)['after_seq'],0)
@@ -41,10 +41,27 @@ class BindingTest(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(await self.watcher._recover_emitted(self.store.subscription(SID),AsyncMock()))
         self.assertEqual(self.store.status(SID)['deliveries'][0]['state'],'unknown')
 
+class OwnerReadTest(unittest.IsolatedAsyncioTestCase):
+    """owner は会話IDの文字列のまま。種類付きの読取は別名で、既存の呼び手（後継判定・番の途中判定・起こし直し）を変えない。"""
+    async def test_owner_stays_a_string_for_existing_callers(self):
+        from call_bridge import claude_bg
+        from call_bridge import local as module
+        run=AsyncMock(return_value={'ok':True,'channel_id':'ch','kind':'claude','session':'conv','closed':False})
+        handoff=AsyncMock(return_value=None);background=AsyncMock(return_value=None)
+        watcher=local.Watchers(local.LocalStore(Path(tempfile.mkdtemp())))
+        with patch.object(claude_channel,'run',run),patch.object(local,'talk',create=True) as talk,patch.object(claude_bg,'background',background):
+            talk.claude_handoff=handoff;talk.claude_retired=lambda value: None
+            self.assertEqual(await claude_channel.owner('ch'),'conv')
+            self.assertEqual(await claude_channel.owner_kind('ch'),('claude','conv'))
+            subscription={'thread_id':'ch','session_id':SID,'harness':'claude-code','delivery_mode':'channel'}
+            self.assertIsNone(await watcher._retired(subscription))
+            self.assertEqual(await watcher._wake(subscription,'why'),(False,None))
+        handoff.assert_awaited_once_with('conv');background.assert_awaited_once_with('conv')
+
 class LegacyTest(unittest.IsolatedAsyncioTestCase):
     async def test_missing_binding_is_not_guessed(self):
         with patch.object(claude_channel,'delivery_state',AsyncMock()) as read:
-            self.assertIsNone(await claude_channel.emitted_channel('new','delivery',None))
+            self.assertIsNone(await claude_channel.emitted_channel('delivery',None))
         read.assert_not_awaited()
 
 class LegacyBindTest(unittest.IsolatedAsyncioTestCase):

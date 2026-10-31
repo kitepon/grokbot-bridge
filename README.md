@@ -526,6 +526,6 @@ call-bridge-recover --session <通話UUID> --seq <旧返信のseq> --reason '別
 
 ### Claude channel入口timeout後の照合
 
-新しい予約は送信先channelを保持する。入口timeoutなどでunknown/sendingになった場合、receiverは保存されたchannelの公的emittedを確認できた時だけ再送無しで通常配送へ戻す。元error/初回at/IDは保持し、startedはhook出力の確証であり、本人の業務完了を表さない。
+新しい予約は送信先channelを保持する。入口timeoutなどでunknown/sendingになった場合、receiverは保存されたchannelの公的emittedを確認できた時だけ再送無しで通常配送へ戻す。queued（hookが未取得）やstate無しの行は復帰の対象外で、unknownのまま残す。元error/初回at/IDは保持し、startedはhook出力の確証であり、本人の業務完了を表さない。
 
 旧台帳でchannelが欠ける場合は自動推測しない。管理者が初回送信先と現在の本人を確かめた上で `python -m call_bridge.channel_recover --session <UUID> --seq <番号> --expected-current <現channelUUID> --expected-owner <Claude会話UUID> --source-channel <元channelUUID> --expected-after <cursor>` を使う。公的channel集合とownerの前後一致、同ownerで唯一のemitted、他の配送状態無し、session lockと全台帳snapshot一致を条件に、送信先の結合だけを保存する。unknown/error/atを保持し送信しない。以後receiverが固定先の公的emittedを再確認して通常状態へ戻す。読取失敗・曖昧なowner・関連状態あり・通話変更なら拒否する。旧MCPの予約はchannelを保存しないため、更新したreceiverが通常のsession排他を取得して扱う。
