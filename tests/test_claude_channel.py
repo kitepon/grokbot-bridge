@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
@@ -15,6 +16,8 @@ import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock, patch
+
+import httpx
 
 from call_bridge import claude_bg, claude_channel, harness_setup, local, relaunch
 from call_bridge.codex_delivery import DeliveryError
@@ -190,6 +193,184 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         rows = self.store.status(sid)["deliveries"]
         self.assertEqual((rows[0]["state"], rows[0]["error"]), ("fetched", "DELIVERY_PREVIOUSLY_STARTED"))
         self.assertEqual(self.store.subscription(sid)["after_seq"], 4)
+
+    async def test_receiver_reflects_normal_fetch_without_restarting_the_old_mcp(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.stop(sid, "unknown", "original cause", 2)
+        bridge = Bridge([{"seq": 2, "message": "本人が通常取得済み", "fetched": True},
+                         {"seq": 4, "message": "本人が通常取得済み", "fetched": True}], status="hungup")
+        with patch.object(local, "_follow_speaker", AsyncMock()) as follow:
+            await self._watch(sid, bridge, receiver=True)
+        self.assertEqual(self._states(sid), [(2, "fetched"), (4, "fetched")])
+        self.assertEqual(self.store.status(sid)["deliveries"][0]["error"], "original cause")
+        self.assertEqual(self.store.subscription(sid)["after_seq"], 4)
+        self.assertEqual(self.store.subscription(sid)["thread_id"], CHANNEL)
+        follow.assert_not_awaited()
+        self.send.assert_not_awaited()
+        self.owner.assert_not_awaited()
+        self.state.assert_not_awaited()
+        self.withdraw.assert_not_awaited()
+        self.assertTrue(all(bridge.peeks))
+
+    async def test_receiver_does_not_skip_an_unfetched_reply_between_resolved_reservations(self):
+        sid = self._call()
+        for seq in (2, 6):
+            self.store.reserve(sid, seq)
+            self.store.stop(sid, "unknown", f"cause {seq}", seq)
+        bridge = Bridge([{"seq": 2, "message": "取得済み", "fetched": True},
+                         {"seq": 4, "message": "新着", "fetched": False},
+                         {"seq": 6, "message": "取得済み", "fetched": True}], status="hungup")
+        await self._watch(sid, bridge, receiver=True)
+        self.send.assert_awaited_once()
+        self.assertIn("新着", self.send.await_args.args[2])
+        self.assertEqual(self._states(sid), [(2, "fetched"), (4, "submitted"), (6, "fetched")])
+        self.assertEqual(self.store.subscription(sid)["after_seq"], 6)
+
+    async def test_receiver_recovers_a_reserved_send_and_a_failure_before_the_cursor(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.submitted(sid, 2, confirmed=False)
+        self.store.stop(sid, "unknown", "unknown after submit", 2)
+        self.store.reserve(sid, 4)
+        bridge = Bridge([{"seq": 2, "message": "取得済み", "fetched": True},
+                         {"seq": 4, "message": "取得済み", "fetched": True}], status="hungup")
+        await self._watch(sid, bridge, receiver=True)
+        self.assertEqual(self._states(sid), [(2, "fetched"), (4, "fetched")])
+        self.assertEqual(self.store.subscription(sid)["after_seq"], 4)
+        self.assertEqual(self.store.status(sid)["deliveries"][0]["error"], "unknown after submit")
+        self.send.assert_not_awaited()
+
+    async def test_reservation_recovery_rolls_back_all_rows_if_one_update_fails(self):
+        sid = self._call()
+        for seq in (2, 4):
+            self.store.reserve(sid, seq)
+            self.store.stop(sid, "unknown", f"cause {seq}", seq)
+        with self.store.connect() as db:
+            db.execute("CREATE TRIGGER fail_recovery BEFORE UPDATE OF state ON deliveries "
+                       "WHEN NEW.state='fetched' AND NEW.seq=4 BEGIN SELECT RAISE(ABORT,'test rollback'); END")
+        before = self.store.status(sid)
+        bridge = Bridge([{"seq": 2, "message": "取得済み", "fetched": True},
+                         {"seq": 4, "message": "取得済み", "fetched": True}])
+        with self.assertRaises(sqlite3.IntegrityError):
+            await self._watch(sid, bridge, receiver=True)
+        self.assertEqual(self.store.status(sid), before)
+        self.assertEqual(bridge.receipts, [])
+        self.send.assert_not_awaited()
+
+    async def test_recovery_does_not_accept_an_id_from_another_delivery(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.stop(sid, "unknown", "original cause", 2)
+        with self.store.connect() as db:
+            db.execute("UPDATE deliveries SET delivery_id=? WHERE session_id=?", (str(uuid.uuid4()), sid))
+        before = self.store.status(sid)
+        await self._watch(sid, Bridge([{"seq": 2, "message": "取得済み", "fetched": True}]), receiver=True)
+        self.assertEqual(self.store.status(sid), before)
+        self.send.assert_not_awaited()
+
+    async def test_unknown_recovery_requires_every_reservation_to_be_fetched(self):
+        for messages in ([], [{"seq": 2, "fetched": True}],
+                         [{"seq": 2, "fetched": True}, {"seq": 4, "fetched": False}],
+                         [{"seq": 2, "fetched": True}, {"seq": 4}],
+                         [{"seq": 2, "fetched": True}, {"seq": 4, "fetched": None}],
+                         [{"seq": 2, "fetched": True}, {"seq": 4, "fetched": 1}],
+                         [{"seq": 2, "fetched": True}, {"seq": 4, "fetched": "true"}]):
+            with self.subTest(messages=messages):
+                sid = self._call()
+                for seq in (2, 4):
+                    self.store.reserve(sid, seq)
+                    self.store.stop(sid, "unknown", f"cause {seq}", seq)
+                before = self.store.status(sid)
+                bridge = Bridge([{"message": "返事", **row} for row in messages])
+                await self._watch(sid, bridge, receiver=True)
+                self.assertEqual(self.store.status(sid), before)
+                self.assertEqual(bridge.receipts, [])
+        self.send.assert_not_awaited()
+
+    async def test_recovery_rechecks_subscription_and_reservations_after_awaiting_peek(self):
+        for mutation in ("pause", "channel", "mode", "harness", "cursor", "new-reservation", "reservation-id", "reservation-state"):
+            with self.subTest(mutation=mutation):
+                sid = self._call()
+                self.store.reserve(sid, 2)
+                self.store.stop(sid, "unknown", "original cause", 2)
+                bridge = Bridge([{"seq": 2, "message": "取得済み", "fetched": True}])
+                observed = {}
+
+                def change():
+                    if mutation == "pause":
+                        self.store.stop(sid, "paused", "operator paused")
+                    elif mutation == "channel":
+                        self.store.adopt_channel(sid, ADOPTED, str(self.folder))
+                    elif mutation == "cursor":
+                        self.store.advance(sid, 2)
+                    elif mutation == "new-reservation":
+                        self.store.reserve(sid, 4)
+                    else:
+                        with self.store.connect() as db:
+                            if mutation == "harness":
+                                db.execute("UPDATE subscriptions SET harness='cursor' WHERE session_id=?", (sid,))
+                            elif mutation == "mode":
+                                db.execute("UPDATE subscriptions SET delivery_mode='manual' WHERE session_id=?", (sid,))
+                            elif mutation == "reservation-id":
+                                db.execute("UPDATE deliveries SET delivery_id=? WHERE session_id=?", (str(uuid.uuid4()), sid))
+                            else:
+                                db.execute("UPDATE deliveries SET state='waiting' WHERE session_id=?", (sid,))
+                    observed["after_change"] = self.store.status(sid)
+
+                bridge.on_poll = change
+                await self._watch(sid, bridge, receiver=True)
+                self.assertIn("after_change", observed)
+                self.assertEqual(self.store.status(sid), observed["after_change"])
+                self.assertEqual(bridge.receipts, [])
+        self.send.assert_not_awaited()
+
+    async def test_unknown_recovery_does_not_run_without_the_lock(self):
+        sid = self._call()
+        self.store.reserve(sid, 2)
+        self.store.stop(sid, "unknown", "original cause", 2)
+        before = self.store.status(sid)
+        with patch.object(local, "_claim_session", return_value=None), \
+             patch.object(self.store, "ask_to_yield", wraps=self.store.ask_to_yield) as yielding, \
+             patch.object(self.store, "resume", wraps=self.store.resume) as resume:
+            await self._watch(sid, Bridge([{ "seq": 2, "message": "取得済み", "fetched": True}]), receiver=True)
+        self.assertEqual(self.store.status(sid), before)
+        yielding.assert_not_called()
+        resume.assert_not_called()
+        self.send.assert_not_awaited()
+
+    async def test_empty_reservations_or_non_receiver_never_recover_unknown(self):
+        for reserved, receiver in ((False, True), (True, False)):
+            sid = self._call()
+            if reserved:
+                self.store.reserve(sid, 2)
+            self.store.stop(sid, "unknown", "original cause", 2 if reserved else None)
+            before = self.store.status(sid)
+            bridge = Bridge([{"seq": 2, "message": "取得済み", "fetched": True}])
+            await self._watch(sid, bridge, receiver=receiver)
+            self.assertEqual(bridge.peeks, [])
+            self.assertEqual(self.store.status(sid), before)
+
+    async def test_recovery_keeps_unknown_on_bad_or_unauthorized_poll_responses(self):
+        for payload in ({"ok": False, "error": "forbidden"},
+                        {"ok": True, "session_id": "another-call", "party": "local", "status": "open",
+                         "latest_seq": 2, "messages": [{"seq": 2, "message": "返事", "from_party": "member", "fetched": True}]},
+                        {"ok": True, "messages": None}, httpx.ConnectError("offline"), 403):
+            sid = self._call()
+            self.store.reserve(sid, 2)
+            self.store.stop(sid, "unknown", "original cause", 2)
+            before = self.store.status(sid)
+            bridge = Bridge([])
+            if isinstance(payload, Exception):
+                bridge.get = AsyncMock(side_effect=payload)
+            else:
+                bridge.get = AsyncMock(return_value=httpx.Response(
+                    403 if payload == 403 else 200, json=payload,
+                    request=httpx.Request("GET", "http://localhost/peek")))
+            await self._watch(sid, bridge, receiver=True)
+            self.assertEqual(self.store.status(sid), before)
+            self.assertEqual(bridge.receipts, [])
+        self.send.assert_not_awaited()
 
     async def test_unknown_is_not_resolved_without_a_boolean_fetch_record(self):
         for fetched in (False, None, 1, "true"):

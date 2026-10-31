@@ -98,6 +98,38 @@ class ReceiverPlanTest(unittest.TestCase):
             asyncio.run(scenario())
         self.assertEqual(set(watched), {first, later})
 
+    def test_receiver_observes_only_unknown_claude_channels_with_reservations(self):
+        store = local.LocalStore(Path(self.tmp.name))
+        watched = []
+        expected = []
+        for mode, harness, state, reserved in (
+                ("channel", "claude-code", "unknown", True), ("channel", "claude-code", "unknown", False),
+                ("channel", "cursor", "unknown", True), ("manual", "claude-code", "unknown", True),
+                ("queue", "codex", "unknown", True), ("channel", "claude-code", "paused", True),
+                ("channel", "claude-code", "failed", True), ("channel", "claude-code", "closed", True)):
+            sid = str(uuid.uuid4())
+            store.add(sid, "channel", Path(""), "member", mode, harness=harness)
+            if reserved:
+                store.reserve(sid, 2)
+            store.stop(sid, state, "original cause", 2 if reserved else None)
+            if mode == "channel" and harness == "claude-code" and state == "unknown" and reserved:
+                expected.append(sid)
+
+        class Recorder:
+            def __init__(self, *_args, **_kwargs):
+                pass
+
+            def start(self, session_id):
+                watched.append(session_id)
+
+            async def close(self):
+                pass
+
+        with patch.object(local, "Watchers", Recorder), patch.object(receiver, "_SCAN_SECONDS", 0):
+            asyncio.run(receiver.run(scans=1))
+        self.assertEqual(watched, expected)
+        self.assertEqual(store.active(), [])
+
 
 class StateAccessTest(unittest.TestCase):
     """置き場は、同じ利用者の普段の権限の process から開けなければならない。"""
@@ -215,6 +247,9 @@ class ReceiverLimitsTest(unittest.TestCase):
                 rounds["n"] += 1
                 if rounds["n"] == 1:
                     raise sqlite3.OperationalError("unable to open database file")
+                return []
+
+            def unknown_channels(self):
                 return []
 
         class Quiet:

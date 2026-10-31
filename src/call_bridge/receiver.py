@@ -81,7 +81,7 @@ async def run(scans: int | None = None) -> None:
                     if store.resume():
                         log.info("calls left mid-takeover by the previous receiver are active again")
                     recovered = True
-                for session_id in store.active():
+                for session_id in store.active() + store.unknown_channels():
                     if store.subscription(session_id)["delivery_mode"] != "exec":
                         watchers.start(session_id)
             except sqlite3.Error as exc:

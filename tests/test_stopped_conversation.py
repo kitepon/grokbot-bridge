@@ -208,7 +208,11 @@ class Bridge:
         if self.on_poll is not None:
             self.on_poll()
         rows = [row for row in self.messages if row["seq"] > params["after_seq"]]
-        return httpx.Response(200, json={"ok": True, "status": self.status, "messages": rows},
+        return httpx.Response(200, json={"ok": True, "status": self.status,
+                                       "session_id": url.split("/sessions/")[-1].split("/")[0],
+                                       "party": params["party"],
+                                       "latest_seq": rows[-1]["seq"] if rows else params["after_seq"],
+                                       "messages": [{"from_party": "member", **row} for row in rows]},
                               request=httpx.Request("GET", url))
 
     async def post(self, url, headers=None, json=None):
