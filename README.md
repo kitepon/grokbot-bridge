@@ -508,3 +508,18 @@ Compose sets `extra_hosts: ["host.docker.internal:host-gateway"]` so that hostna
 ## License
 
 MIT © kitepon.dev
+
+### 実行不要となった旧返信で配送が止まった時
+
+Codex の旧返信が `CODEX_DELIVERY_DUPLICATE` で止まり、その依頼を再実行してはいけない場合は、端末の管理者が、依頼元と失効対象を確認してから `call-bridge-recover` を使える。
+
+```bash
+call-bridge-recover --session <通話UUID> --seq <旧返信のseq> --reason '別経路で完了したため失効' \
+  --expected-thread <現在のCodex会話UUID> --expected-after <現在のafter_seq> --expected-hold <現在のhold_seq>
+```
+
+複数の旧返信を失効させる場合は `--seq` を昇順で繰り返す。`after_seq` より後から最後に指定した seq までの全 member 返信を、漏れなく指定する。新しい返信を失効対象へ混ぜない。
+
+この命令は、その通話の見張りへ鍵の解放を頼み、公式キューが最初の1ページで空（data=[]、nextCursor=null）であること、処理中の hook claim が無いこと、通話と予約が確認中に変わっていないことを確かめる。条件が揃わなければ失効しない。送信・キュー削除・hook実行は行わず、pending/settledにも触れない。キューが非空・複数ページ・不正な応答なら適用しない。同じIDをほかの送信元が新規投入しないことも、実行前に確認する。
+
+失効対象の番号・理由・時刻は端末台帳の `superseded_replies` に保存し、元の配送状態・エラー・予約時刻はそのまま残す。サーバーへ成功や取得済みの receipt は送らない。以後の `call_info.parent_delivery.superseded_replies` に失効記録を表示し、後続の返信は通常の受け取り処理に戻す。現在版の受け取り処理は失効IDを再予約しても送信しない。旧MCPはafter_seqを読み直す通常経路で旧返信を飛ばすが、旧コードのreserveを直接呼ぶ操作まで防ぐものではない。これは旧依頼の失効であり、過去の未実行や配送成功の証明ではない。古い MCP には追加した表示項目がないので、更新した受け取り処理・CLIで確認する。
