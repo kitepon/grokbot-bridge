@@ -14,7 +14,7 @@ import unittest
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from call_bridge import claude_bg, claude_channel, harness_setup, local, relaunch
 from call_bridge.codex_delivery import DeliveryError
@@ -23,6 +23,26 @@ from test_stopped_conversation import Bridge, FakeTerminal
 
 CHANNEL = "11111111-1111-4111-8111-111111111111"
 ADOPTED = "22222222-2222-4222-8222-222222222222"  # 起こした会話が、通話を引き取って開いた受け口
+
+
+class ChannelProcessTest(unittest.IsolatedAsyncioTestCase):
+    async def test_timeout_keeps_its_delivery_outcome_when_the_child_already_exited(self):
+        for sends in (False, True):
+            with self.subTest(sends=sends):
+                process = SimpleNamespace(kill=Mock(side_effect=ProcessLookupError), wait=AsyncMock(return_value=0))
+
+                async def communicate(_input):
+                    await asyncio.sleep(60)
+
+                process.communicate = communicate
+                with patch.object(claude_channel, "_command", return_value=["node", "entry.mjs"]), \
+                     patch.object(claude_channel.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
+                     patch.object(claude_channel, "_TIMEOUT", 0.001):
+                    with self.assertRaises(DeliveryError) as caught:
+                        await claude_channel.run(["send" if sends else "owner"], sends=sends)
+                self.assertEqual(caught.exception.code, "CLAUDE_CHANNEL_TIMEOUT")
+                self.assertEqual(caught.exception.outcome_unknown, sends)
+                process.wait.assert_awaited_once()
 
 
 class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
@@ -151,6 +171,15 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         await self._watch(session_id, bridge)
         self.assertEqual(self.send.await_count, 0)
         self.assertEqual([(r["seq"], r["state"]) for r in bridge.receipts], [(2, "fetched")])
+
+    async def test_owner_read_timeout_does_not_leave_a_started_reservation(self):
+        session_id = self._call()
+        self.owner.side_effect = DeliveryError("CLAUDE_CHANNEL_TIMEOUT", "owner read timed out")
+        bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
+        await self._watch(session_id, bridge)
+        self.send.assert_awaited_once()
+        self.assertEqual(self._states(session_id), [(2, "submitted")])
+        self.assertEqual(self.store.subscription(session_id)["after_seq"], 2)
 
     async def test_ended_conversation_hands_the_reply_to_the_folder_seat(self):
         session_id = self._call()

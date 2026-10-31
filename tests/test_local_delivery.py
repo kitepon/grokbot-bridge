@@ -649,6 +649,7 @@ class ProcessTest(unittest.IsolatedAsyncioTestCase):
                  patch.object(setup, "_verify_hooks", new_callable=AsyncMock), \
                  patch.object(setup, "_steer_runtime", return_value={"steer_cli": "/cli.js", "steer_node": "/node"}), \
                  patch.object(setup, "check_steer_version"), \
+                 patch.object(setup, "_receiver", return_value="running"), \
                  patch.object(setup, "_steer_setup", return_value="unsupported") as steer:
                 self.assertEqual(await setup.enable(), {"status": "restart_required", "mcp": "call-bridge",
                                                         "steer": "unsupported", "receiver": "running"})

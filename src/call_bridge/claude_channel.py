@@ -124,7 +124,10 @@ async def run(args: list[str], *, text: str | None = None, sends: bool = False) 
         stdout, stderr = await asyncio.wait_for(
             process.communicate(text.encode() if text is not None else None), _TIMEOUT)
     except asyncio.TimeoutError as exc:
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass  # communicateの待機中に子が終了しても、元のtimeout結果を保つ。
         await process.wait()
         raise DeliveryError("CLAUDE_CHANNEL_TIMEOUT", "Claude Code への配送の入口が時間内に終わりませんでした",
                             outcome_unknown=sends) from exc
