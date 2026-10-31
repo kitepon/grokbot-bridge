@@ -1,4 +1,4 @@
-"""別経路で済んだ旧依頼を、配送成功とは記録せず、明示的に失効させる。"""
+"""実行不要となった旧依頼を、配送成功とは記録せず、明示的に失効させる。"""
 from __future__ import annotations
 
 import argparse
@@ -35,25 +35,12 @@ async def _queue_absent(subscription: dict, seqs: list[int]) -> None:
                 _refuse()
     check_records()
     async with CodexRPC(home) as rpc:
-        cursor = None
-        seen = set()
-        for _ in range(100):
-            page = await rpc.request('thread/queue/list', {'threadId': subscription['thread_id'], 'cursor': cursor, 'limit': 100})
-            if not isinstance(page, dict) or 'nextCursor' not in page:
-                _refuse()
-            rows = page.get('data')
-            if not isinstance(rows, list) or any(not isinstance(row, dict) for row in rows):
-                _refuse()
-            if any(row.get('clientUserMessageId') in ids for row in rows):
-                _refuse()
-            cursor = page.get('nextCursor')
-            if cursor is None:
-                check_records()
-                return
-            if not isinstance(cursor, str) or not cursor or cursor in seen:
-                _refuse()
-            seen.add(cursor)
-    _refuse()
+        # ページ間に別consumerが削除するとoffsetが動く。最初の空ページだけを許可する。
+        page = await rpc.request('thread/queue/list', {'threadId': subscription['thread_id'], 'cursor': None, 'limit': 100})
+        if (not isinstance(page, dict) or page.get('data') != []
+                or 'nextCursor' not in page or page['nextCursor'] is not None):
+            _refuse()
+        check_records()
 
 
 async def supersede(session_id: str, seqs: list[int], reason: str,

@@ -104,16 +104,18 @@ class RecoverTest(unittest.IsolatedAsyncioTestCase):
                 with self.assertRaises(DeliveryError): await self.apply()
                 self.assertEqual(self.snapshot(), before)
 
-    async def test_all_queue_pages_are_checked_and_old_queue_entry_is_not_removed(self):
+    async def test_paginated_queue_is_refused_without_reading_later_pages(self):
         self.rpc.request.side_effect = [{'data':[], 'nextCursor':'page2'},
             {'data':[{'clientUserMessageId':str(uuid.uuid5(local._DELIVERY_NAMESPACE, f'{SID}:675'))}], 'nextCursor':None}]
         before = self.snapshot()
         with self.assertRaises(DeliveryError): await self.apply()
         self.assertEqual(self.snapshot(), before)
-        self.assertEqual([call.args[0] for call in self.rpc.request.await_args_list], ['thread/queue/list']*2)
+        self.assertEqual([call.args[0] for call in self.rpc.request.await_args_list], ['thread/queue/list'])
 
     async def test_malformed_queue_is_refused(self):
-        for page in [{'data':None}, {'data':[1], 'nextCursor':None}, {'data':[], 'nextCursor':42}]:
+        for page in [{'data':None}, {'data':[1], 'nextCursor':None}, {'data':[], 'nextCursor':42},
+                     {'data':[{}], 'nextCursor':None}, {'data':[{'clientUserMessageId':7}], 'nextCursor':None},
+                     {'data':[], 'nextCursor':False}, {'data':[]}]:
             with self.subTest(page=page):
                 self.rpc.request.return_value = page
                 before = self.snapshot()
@@ -204,3 +206,26 @@ class RecoverTest(unittest.IsolatedAsyncioTestCase):
         before = self.snapshot()
         with self.assertRaises(DeliveryError): await self.apply()
         self.assertEqual(self.snapshot(), before)
+
+
+    async def test_even_valid_unrelated_queue_rows_prevent_supersession(self):
+        self.rpc.request.return_value = {'data':[{'id':'other', 'clientUserMessageId':None}], 'nextCursor':None}
+        before = self.snapshot()
+        with self.assertRaises(DeliveryError): await self.apply()
+        self.assertEqual(self.snapshot(), before)
+
+    async def test_offset_deletion_cannot_hide_target_on_later_page(self):
+        target = str(uuid.uuid5(local._DELIVERY_NAMESPACE, f'{SID}:675'))
+        queue = [{'id':str(i), 'clientUserMessageId':None} for i in range(100)] + [{'id':'old', 'clientUserMessageId':target}]
+        async def read(_method, params):
+            offset = int(params['cursor'] or 0)
+            rows = queue[offset:offset+100]
+            cursor = str(offset+100) if offset+100 < len(queue) else None
+            if offset == 0: del queue[0]
+            return {'data':rows, 'nextCursor':cursor}
+        self.rpc.request.side_effect = read
+        before = self.snapshot()
+        with self.assertRaises(DeliveryError): await self.apply()
+        self.assertEqual(self.snapshot(), before)
+        self.assertEqual(self.rpc.request.await_count, 1)
+        self.assertTrue(any(row['clientUserMessageId'] == target for row in queue))
