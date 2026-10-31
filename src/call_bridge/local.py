@@ -142,6 +142,20 @@ async def _remote_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     raise DeliveryError("BRIDGE_RESPONSE_INVALID", f"{name} の応答を認識できません")
 
 
+def _valid_poll_result(value: Any, session_id: str, party: str, after_seq: int) -> bool:
+    if (not isinstance(value, dict) or "error" in value
+            or value.get("session_id") != session_id or value.get("party") != party
+            or value.get("status") not in ("ringing", "open", "hungup")
+            or not isinstance(value.get("messages"), list) or type(value.get("latest_seq")) is not int
+            or any(not isinstance(message, dict) or type(message.get("seq")) is not int
+                   or message["seq"] <= after_seq or not isinstance(message.get("message"), str)
+                   or message.get("from_party") != ("member" if party == "local" else "local")
+                   for message in value["messages"])):
+        return False
+    seqs = [message["seq"] for message in value["messages"]]
+    return seqs == sorted(set(seqs)) and value["latest_seq"] == (seqs[-1] if seqs else after_seq)
+
+
 async def codex_conversation(thread_id: str, home: Path) -> talk.Conversation:
     async with CodexRPC(home) as rpc:
         return await talk.read_conversation(rpc.request, thread_id, conversation_missing)
@@ -255,6 +269,36 @@ class LocalStore:
     def active(self) -> list[str]:
         with self.connect() as db:
             return [row[0] for row in db.execute("SELECT session_id FROM subscriptions WHERE state = 'active'")]
+
+    def unknown_channels(self) -> list[str]:
+        with self.connect() as db:
+            return [row[0] for row in db.execute(
+                "SELECT session_id FROM subscriptions WHERE state = 'unknown' AND delivery_mode = 'channel' "
+                "AND harness = 'claude-code' AND EXISTS (SELECT 1 FROM deliveries WHERE "
+                "deliveries.session_id = subscriptions.session_id AND state IN ('unknown','sending'))")]
+
+    def resume_fetched(self, subscription: dict[str, Any], reservations: list[dict[str, Any]], fetched: set[int]) -> bool:
+        """取得印を観測した後も宛先と予約が同じ時だけ、未確定配送をまとめて取得済みにする。"""
+        session_id = subscription["session_id"]
+        if ((subscription["state"], subscription["delivery_mode"], subscription["harness"])
+                != ("unknown", "channel", "claude-code") or not reservations
+                or any(row["seq"] not in fetched or row["delivery_id"] != str(uuid.uuid5(
+                    _DELIVERY_NAMESPACE, f"{session_id}:{row['seq']}")) for row in reservations)):
+            return False
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT * FROM subscriptions WHERE session_id = ?", (session_id,)).fetchone()
+            pending = [dict(row) for row in db.execute(
+                "SELECT seq,delivery_id,state,error FROM deliveries WHERE session_id = ? "
+                "AND state IN ('unknown','sending') ORDER BY seq", (session_id,))]
+            if current is None or dict(current) != subscription or pending != reservations:
+                return False
+            # 元errorとcursorを残す。取得済みの間にある未取得返信を飛ばさない。
+            db.executemany("UPDATE deliveries SET state = 'fetched' WHERE session_id = ? AND seq = ?",
+                           [(session_id, row["seq"]) for row in reservations])
+            db.execute("UPDATE subscriptions SET state = 'active', last_error = NULL, hold_seq = NULL "
+                       "WHERE session_id = ?", (session_id,))
+        return True
 
     def active_exec(self, thread_id: str) -> list[dict[str, Any]]:
         with self.connect() as db:
@@ -565,6 +609,11 @@ class Watchers:
             while True:
                 # 結び付けは、同じ会話に付いたほかの通話の見張りが付け替える事がある。毎回読み直す。
                 subscription = self.store.subscription(session_id)
+                if (self.receiver and subscription["state"] == "unknown"
+                        and subscription["delivery_mode"] == "channel" and subscription["harness"] == "claude-code"):
+                    if not await self._recover_fetched(subscription, client):
+                        return
+                    continue
                 if subscription["state"] != "active":
                     return
                 # Read the token per poll so a rotated auth.json reaches a long-lived watcher.
@@ -643,6 +692,32 @@ class Watchers:
                                 log.warning("channel for %s was not closed: %s", session_id, exc)
                         return
                 await asyncio.sleep(_POLL_SECONDS)
+
+    async def _recover_fetched(self, subscription: dict[str, Any], client: httpx.AsyncClient) -> bool:
+        session_id = subscription["session_id"]
+        reservations = [row for row in self.store.status(session_id)["deliveries"]
+                        if row["state"] in ("unknown", "sending")]
+        if not reservations:
+            return False
+        after_seq = min(row["seq"] for row in reservations) - 1
+        try:
+            headers = _headers()
+            response = await client.get(_rest_url(session_id), headers=headers,
+                                        params={"party": "local", "after_seq": after_seq, "peek": "1"})
+            response.raise_for_status()
+            value = response.json()
+            if not _valid_poll_result(value, session_id, "local", after_seq) or value.get("ok") is not True:
+                return False
+        except (httpx.HTTPError, DeliveryError, ValueError, OSError):
+            return False
+        fetched = {message["seq"] for message in value["messages"] if message.get("fetched") is True}
+        if not self.store.resume_fetched(subscription, reservations, fetched):
+            return False
+        report = _Reporter(client, headers, session_id)
+        for row in reservations:
+            await report(row["seq"], "fetched", None, None)
+        log.info("call %s resumes after normal retrieval of %s reserved replies", session_id, len(reservations))
+        return True
 
     def _due(self, session_id: str) -> bool:
         return time.monotonic() >= self.recheck_at.get(session_id, 0.0)
@@ -1410,14 +1485,7 @@ async def call_poll(session_id: str, party: Literal["local", "member"], after_se
     result = await _remote_tool("call_poll", {"session_id": session_id, "party": party, "after_seq": after_seq})
     if "error" in result:
         return result
-    if (result.get("session_id") != session_id or result.get("party") != party
-            or result.get("status") not in ("ringing", "open", "hungup")
-            or not isinstance(result.get("messages"), list) or type(result.get("latest_seq")) is not int
-            or result["latest_seq"] < after_seq
-            or any(not isinstance(message, dict) or type(message.get("seq")) is not int
-                   or message["seq"] <= after_seq or not isinstance(message.get("message"), str)
-                   or message.get("from_party") != ("member" if party == "local" else "local")
-                   for message in result["messages"])):
+    if not _valid_poll_result(result, session_id, party, after_seq):
         raise DeliveryError("BRIDGE_RESPONSE_INVALID", "call_poll の応答を認識できません")
     extra = await _follow_speaker(session_id, ctx) if party == "local" else None
     return {**result, **extra} if extra else result
