@@ -29,7 +29,9 @@ class ChannelProcessTest(unittest.IsolatedAsyncioTestCase):
     async def test_timeout_keeps_its_delivery_outcome_when_the_child_already_exited(self):
         for sends in (False, True):
             with self.subTest(sends=sends):
-                process = SimpleNamespace(kill=Mock(side_effect=ProcessLookupError), wait=AsyncMock(return_value=0))
+                process = SimpleNamespace(pid=123, returncode=0, stdout=SimpleNamespace(at_eof=lambda: True),
+                                          stderr=SimpleNamespace(at_eof=lambda: False),
+                                          kill=Mock(side_effect=ProcessLookupError), wait=AsyncMock(return_value=0))
 
                 async def communicate(_input):
                     await asyncio.sleep(60)
@@ -38,11 +40,14 @@ class ChannelProcessTest(unittest.IsolatedAsyncioTestCase):
                 with patch.object(claude_channel, "_command", return_value=["node", "entry.mjs"]), \
                      patch.object(claude_channel.asyncio, "create_subprocess_exec", AsyncMock(return_value=process)), \
                      patch.object(claude_channel, "_TIMEOUT", 0.001):
-                    with self.assertRaises(DeliveryError) as caught:
-                        await claude_channel.run(["send" if sends else "owner"], sends=sends)
+                    with self.assertLogs(claude_channel.log, level="WARNING") as logged, \
+                         self.assertRaises(DeliveryError) as caught:
+                        await claude_channel.run(["send" if sends else "owner"], text="private payload", sends=sends)
                 self.assertEqual(caught.exception.code, "CLAUDE_CHANNEL_TIMEOUT")
                 self.assertEqual(caught.exception.outcome_unknown, sends)
                 process.wait.assert_awaited_once()
+                self.assertIn("pid=123 returncode=0 stdout_eof=True stderr_eof=False", logged.output[0])
+                self.assertNotIn("private payload", str(logged.output))
 
 
 class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
@@ -644,12 +649,15 @@ class FollowSpeakerTest(CallOpenTest):
         saved = self.store.subscription(self.session_id)
         return saved["delivery_mode"], saved["thread_id"], saved["harness"]
 
+    def _polled(self, party="local"):
+        return {"session_id": self.session_id, "party": party, "status": "open", "messages": [], "latest_seq": 0}
+
     async def test_poll_finishes_before_restarting_a_stopped_watch(self):
         events = []
 
         async def poll(*_args):
             events.append("fetched")
-            return {"messages": []}
+            return self._polled()
 
         async def follow(*_args):
             events.append("watch")
@@ -658,6 +666,34 @@ class FollowSpeakerTest(CallOpenTest):
              patch.object(local, "_follow_speaker", side_effect=follow):
             await local.call_poll(self.session_id, "local", ctx=self._ctx())
         self.assertEqual(events, ["fetched", "watch"])
+
+    async def test_rejected_polls_do_not_rebind_or_restart_the_watch(self):
+        for error in ("forbidden", "not_found", "rejected"):
+            with self.subTest(error=error):
+                response = {"error": error, "detail": "拒否"}
+                with patch.object(local, "_remote_tool", AsyncMock(return_value=response)), \
+                     patch.object(local, "_follow_speaker", AsyncMock(return_value=None)) as follow:
+                    self.assertEqual(await local.call_poll(self.session_id, "local", ctx=self._ctx()), response)
+                follow.assert_not_awaited()
+
+    async def test_invalid_poll_responses_do_not_rebind_or_restart_the_watch(self):
+        for change in ({"session_id": "another-call"}, {"party": "member"}, {"messages": None},
+                       {"status": "unknown"}, {"latest_seq": "0"}, {"latest_seq": True}, {"latest_seq": -1},
+                       {"messages": [{}]}, {"messages": [{"seq": 2, "message": "返事", "from_party": "local"}]}):
+            with self.subTest(change=change):
+                with patch.object(local, "_remote_tool", AsyncMock(return_value={**self._polled(), **change})), \
+                     patch.object(local, "_follow_speaker", AsyncMock(return_value=None)) as follow:
+                    with self.assertRaises(DeliveryError) as caught:
+                        await local.call_poll(self.session_id, "local", ctx=self._ctx())
+                self.assertEqual(caught.exception.code, "BRIDGE_RESPONSE_INVALID")
+                follow.assert_not_awaited()
+
+    async def test_poll_transport_failure_does_not_rebind_or_restart_the_watch(self):
+        with patch.object(local, "_remote_tool", AsyncMock(side_effect=OSError("connection lost"))), \
+             patch.object(local, "_follow_speaker", AsyncMock(return_value=None)) as follow:
+            with self.assertRaises(OSError):
+                await local.call_poll(self.session_id, "local", ctx=self._ctx())
+        follow.assert_not_awaited()
 
     async def test_conversation_that_sends_on_an_older_call_gets_the_replies_from_then_on(self):
         self._old_call()  # 前の会話が開いた通話。前の会話は、もう居ない
@@ -672,6 +708,7 @@ class FollowSpeakerTest(CallOpenTest):
 
     async def test_fetching_as_local_moves_the_call_too_and_a_seat_gives_it_back(self):
         self._old_call("hosted", "cb-claude-seat-12345678")
+        local._remote_tool.return_value = self._polled()
         own = AsyncMock(return_value={"session_id": "conversation-2", "channel_open": False, "channel_session": None})
         opened = AsyncMock(return_value={"channel_id": CHANNEL, "session_id": "conversation-2"})
         with patch.object(local.claude_channel, "own", own), patch.object(local.claude_channel, "open_channel", opened):
@@ -753,6 +790,7 @@ class FollowSpeakerTest(CallOpenTest):
         # もう受け口がある時は、作り直さずに同じ待ち受けの命令を返す（張り直しの案内）
         info = AsyncMock(return_value={"closed": False, "wait": "node receive.mjs --channel new", "kind": "background"})
         again = AsyncMock()
+        local._remote_tool.return_value = self._polled()
         with patch.object(local.claude_channel, "wait_info", info), patch.object(local.claude_channel, "open_wait", again):
             polled = await local.call_poll(self.session_id, "local", ctx=self._ctx("grok-cli"))
         self.assertEqual((again.await_count, polled["parent_delivery"]["wait_command"]), (0, "node receive.mjs --channel new"))
@@ -769,6 +807,7 @@ class FollowSpeakerTest(CallOpenTest):
         own = AsyncMock()
         with patch.object(local.claude_channel, "own", own):
             await local.call_send(self.session_id, "member", "返事", ctx=self._ctx())
+            local._remote_tool.return_value = self._polled("member")
             await local.call_poll(self.session_id, "member", ctx=self._ctx())
             self.store.stop(self.session_id, "closed")
             await local.call_send(self.session_id, "local", "やあ", ctx=self._ctx())

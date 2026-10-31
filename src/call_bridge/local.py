@@ -1408,6 +1408,17 @@ async def call_send(session_id: str, from_party: Literal["local", "member"], mes
 async def call_poll(session_id: str, party: Literal["local", "member"], after_seq: int = 0,
                     ctx: Context | None = None) -> dict[str, Any]:
     result = await _remote_tool("call_poll", {"session_id": session_id, "party": party, "after_seq": after_seq})
+    if "error" in result:
+        return result
+    if (result.get("session_id") != session_id or result.get("party") != party
+            or result.get("status") not in ("ringing", "open", "hungup")
+            or not isinstance(result.get("messages"), list) or type(result.get("latest_seq")) is not int
+            or result["latest_seq"] < after_seq
+            or any(not isinstance(message, dict) or type(message.get("seq")) is not int
+                   or message["seq"] <= after_seq or not isinstance(message.get("message"), str)
+                   or message.get("from_party") != ("member" if party == "local" else "local")
+                   for message in result["messages"])):
+        raise DeliveryError("BRIDGE_RESPONSE_INVALID", "call_poll の応答を認識できません")
     extra = await _follow_speaker(session_id, ctx) if party == "local" else None
     return {**result, **extra} if extra else result
 

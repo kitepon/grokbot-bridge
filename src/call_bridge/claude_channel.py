@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import shutil
 import subprocess
@@ -21,6 +22,8 @@ from typing import Any
 
 from .codex_delivery import (DeliveryError, _bridge_config, _steer_result, current_steer_cli, hidden_child,
                              private_dir, state_root, steer_profile)
+
+log = logging.getLogger(__name__)
 
 HOOK = "call-bridge-claude-hook.mjs"
 CURSOR_HOOK = "call-bridge-cursor-hook.mjs"
@@ -124,6 +127,8 @@ async def run(args: list[str], *, text: str | None = None, sends: bool = False) 
         stdout, stderr = await asyncio.wait_for(
             process.communicate(text.encode() if text is not None else None), _TIMEOUT)
     except asyncio.TimeoutError as exc:
+        log.warning("channel timeout action=%s pid=%s returncode=%s stdout_eof=%s stderr_eof=%s sends=%s",
+                    args[0], process.pid, process.returncode, process.stdout.at_eof(), process.stderr.at_eof(), sends)
         try:
             process.kill()
         except ProcessLookupError:
