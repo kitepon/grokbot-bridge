@@ -199,6 +199,13 @@ async def owners(channel_ids: list[str]) -> dict[str, str | None]:
             for key, found in value.items()} if isinstance(value, dict) else {}
 
 
+async def owner(channel_id: str) -> tuple[str | None, str | None]:
+    """受け口の種類と、開いた Claude Code の会話。読めない受け口は例外（owners は None に潰す）。"""
+    value = await run(["owner", "--channel", channel_id])
+    kind, session = value.get("kind"), value.get("session")
+    return (kind if isinstance(kind, str) else None), (session if isinstance(session, str) and session else None)
+
+
 async def send(channel_id: str, delivery_id: str, text: str) -> None:
     await run(["send", "--channel", channel_id, "--delivery", delivery_id], text=text, sends=True)
 
@@ -226,3 +233,10 @@ async def withdraw(channel_id: str, delivery_id: str) -> bool:
 
 async def close(channel_id: str) -> None:
     await run(["close", "--channel", channel_id])
+
+
+async def emitted_channel(current: str, delivery_id: str, original: str | None) -> str | None:
+    """元の受け口の出力印だけで再開する。旧台帳は同じ本人の一意の印を探す。"""
+    if original:
+        return original if (await delivery_state(original, delivery_id))[0] == 'emitted' else None
+    return None

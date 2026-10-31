@@ -75,7 +75,8 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
         self.background = AsyncMock(return_value=None)  # 裏の会話ではない（今までどおり席へ渡す）
         self.wake = AsyncMock(return_value="conversa")
         self.in_turn = AsyncMock(return_value=False)  # 番を終えている（今までどおり）
-        for target, name, value in ((local.claude_channel, "send", self.send),
+        for target, name, value in ((local.claude_channel, "emitted_channel", AsyncMock(return_value=None)),
+                                    (local.claude_channel, "send", self.send),
                                     (local.claude_bg, "background", self.background),
                                     (local.claude_bg, "in_turn", self.in_turn),
                                     (local.claude_bg, "wake", self.wake),
