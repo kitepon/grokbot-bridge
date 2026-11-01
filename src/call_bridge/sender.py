@@ -26,7 +26,15 @@ TEAM_BY_SYSTEM = {
     "local": "ローカル",
 }
 
-_MAX_LABEL = 80
+# BellTeam accepts a bot name of at most 100 UTF-16 code units, which is
+# JavaScript's string length. Python len() counts code points, so a
+# character outside the Basic Multilingual Plane is 1 there and 2 here.
+_MAX_LABEL_UNITS = 100
+
+
+def utf16_code_units(text: str) -> int:
+    """Length in UTF-16 code units. Not ``len(text)``."""
+    return len(text.encode("utf-16-le", "surrogatepass")) // 2
 
 
 def with_sender_preface(message: str, team: str, name: str) -> str:
@@ -48,7 +56,7 @@ def canonical_team(value: str) -> str | None:
 def _label(value: str, field: str) -> str | dict[str, str]:
     if not value:
         return {"error": "rejected", "detail": f"{field} is required"}
-    if len(value) > _MAX_LABEL or any(ch in value for ch in "\r\n\x00"):
+    if utf16_code_units(value) > _MAX_LABEL_UNITS or any(ch in value for ch in "\r\n\x00"):
         return {"error": "rejected", "detail": f"{field} is not a usable label"}
     return value
 

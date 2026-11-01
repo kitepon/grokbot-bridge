@@ -17,7 +17,7 @@ from call_bridge.auth import OPEN, Principal  # noqa: E402
 from call_bridge.db import CallStore  # noqa: E402
 from call_bridge.deliver import dispatch_send  # noqa: E402
 from call_bridge import server  # noqa: E402
-from call_bridge.sender import PREFACE, with_sender_preface  # noqa: E402
+from call_bridge.sender import PREFACE, utf16_code_units, with_sender_preface  # noqa: E402
 
 
 class SenderTests(unittest.TestCase):
@@ -166,6 +166,80 @@ class SenderTests(unittest.TestCase):
                     else:
                         ring.assert_not_called()
                         self.assertEqual(sent["delivery"]["status"], "queued")
+
+    def test_sender_name_limit_follows_utf16_code_units(self) -> None:
+        """80, 81, and 100 UTF-16 units pass. 101 does not. Names are not shortened."""
+        session = self.store.open_session("local-1", "Cursor", "ラピ", member_id="rapi-agent")
+        before = self.store.session_info(session["session_id"])["message_count"]
+
+        def send(name: str) -> dict:
+            with mock.patch.object(server, "store", self.store):
+                return server._send(OPEN, session["session_id"], "local", "本文", False, name, "ローカル")
+
+        for units in (80, 81, 100):
+            name = "A" * units
+            self.assertEqual(len(name), units)
+            self.assertEqual(utf16_code_units(name), units)
+            sent = send(name)
+            self.assertNotIn("error", sent, sent)
+            self.assertIn(name + "からのメッセージです。\n本文", sent["message"])
+
+        seat = self.agents / "long-bot"
+        seat.mkdir()
+        (seat / "profile.json").write_text('{"name":"%s"}' % ("B" * 81), encoding="utf-8")
+        booked = self.store.open_session(
+            "long-bot", "席", "ラピ", member_id="rapi-agent", local_system="grokbot",
+        )
+        principal = Principal(name="grokbot", system="grokbot", id="long-bot")
+        with mock.patch.object(server, "store", self.store):
+            from_book = server._send(principal, booked["session_id"], "local", "本文", False, None, None)
+            spoofed = server._send(principal, booked["session_id"], "local", "本文", False, "C" * 81, None)
+        self.assertNotIn("error", from_book, from_book)
+        self.assertIn("GrokBotチームの" + ("B" * 81) + "からのメッセージです。", from_book["message"])
+        self.assertEqual(spoofed["error"], "forbidden")
+
+        too_long = "A" * 101
+        rejected = send(too_long)
+        self.assertEqual(rejected["error"], "rejected")
+        self.assertNotIn(too_long, rejected.get("detail", ""))
+        stored = self.store.history(session["session_id"])["messages"]
+        self.assertEqual(len(stored), before + 3)
+        self.assertTrue(all("A" * 101 not in item["message"] for item in stored))
+
+        kana = "あ" * 100
+        self.assertEqual(utf16_code_units(kana), 100)
+        sent = send(kana)
+        self.assertNotIn("error", sent, sent)
+        self.assertIn(kana, sent["message"])
+        self.assertEqual(send("あ" * 101)["error"], "rejected")
+
+        # U+1F600 is one Python code point and one UTF-16 surrogate pair.
+        pair = "\U0001F600"
+        self.assertEqual(len(pair), 1)
+        self.assertEqual(utf16_code_units(pair), 2)
+        fifty = pair * 50
+        self.assertEqual(len(fifty), 50)
+        self.assertEqual(utf16_code_units(fifty), 100)
+        sent = send(fifty)
+        self.assertNotIn("error", sent, sent)
+        self.assertIn(fifty, sent["message"])
+        one_over = fifty + "x"
+        self.assertEqual(len(one_over), 51)
+        self.assertEqual(utf16_code_units(one_over), 101)
+        self.assertEqual(send(one_over)["error"], "rejected")
+        hundred_pairs = pair * 100
+        self.assertEqual(len(hundred_pairs), 100)
+        self.assertEqual(utf16_code_units(hundred_pairs), 200)
+        self.assertEqual(send(hundred_pairs)["error"], "rejected")
+        exact = pair * 49 + "あ" * 2
+        self.assertEqual(utf16_code_units(exact), 100)
+        self.assertNotEqual(len(exact), 100)
+        sent = send(exact)
+        self.assertNotIn("error", sent, sent)
+        self.assertIn(exact, sent["message"])
+
+        for broken in ("行\n名", "行\r名", "行\x00名"):
+            self.assertEqual(send(broken)["error"], "rejected", broken)
 
     def test_member_reply_has_no_preface_and_does_not_need_a_sender(self) -> None:
         session = self.store.open_session("local-1", "Cursor", "ラピ", member_id="rapi-agent")
