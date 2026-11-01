@@ -12,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from contextlib import asynccontextmanager, suppress
 from pathlib import Path
 from typing import Any, Literal
 
@@ -33,6 +34,7 @@ from .directory import (
     store_directory_push,
 )
 from .sender import resolve_sender
+from . import courier_watch
 
 log = logging.getLogger("call_bridge")
 
@@ -90,6 +92,18 @@ except AuthError as _e:
     raise SystemExit(f"call-bridge: {_e}") from None
 
 store = CallStore(DB_PATH)
+
+
+@asynccontextmanager
+async def _lifespan(_server):
+    task = asyncio.create_task(courier_watch.watch(store)) if courier_watch.enabled() else None
+    try:
+        yield {}
+    finally:
+        if task is not None:
+            task.cancel()
+            with suppress(asyncio.CancelledError):
+                await task
 
 # Stateless: every tool reads its caller from the request itself, so there is
 # nothing to keep per MCP session. With sessions, a restart invalidated every
@@ -713,7 +727,9 @@ class BearerAuthMiddleware(BaseHTTPMiddleware):
                 headers={"WWW-Authenticate": "Bearer"},
             )
         request.state.principal = principal
-        return await call_next(request)
+        response = await call_next(request)
+        await courier_watch.record_activity(store, principal, path, response.status_code)
+        return response
 
 
 def main() -> None:
@@ -779,7 +795,8 @@ def main() -> None:
             log_level="info",
         )
         server = uvicorn.Server(config)
-        await server.serve()
+        async with _lifespan(mcp):
+            await server.serve()
 
     asyncio.run(_serve())
 

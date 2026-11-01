@@ -130,6 +130,13 @@ class CallStore:
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_grokbot_outbox_state ON grokbot_outbox(state);
+
+                CREATE TABLE IF NOT EXISTS courier_monitor (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    started_at REAL NOT NULL,
+                    last_seen REAL,
+                    notified INTEGER NOT NULL DEFAULT 0
+                );
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
@@ -141,6 +148,32 @@ class CallStore:
                 conn.execute("ALTER TABLE sessions ADD COLUMN local_system TEXT NOT NULL DEFAULT 'local'")
             if "local_seen_at" not in columns:
                 conn.execute("ALTER TABLE sessions ADD COLUMN local_seen_at TEXT")
+
+    def start_courier_monitor(self, now: float) -> None:
+        with self._conn() as conn:
+            conn.execute("INSERT OR IGNORE INTO courier_monitor (singleton, started_at) VALUES (1, ?)", (now,))
+
+    def record_courier_seen(self, now: float) -> None:
+        with self._conn() as conn:
+            conn.execute(
+                """INSERT INTO courier_monitor (singleton, started_at, last_seen) VALUES (1, ?, ?)
+                   ON CONFLICT(singleton) DO UPDATE SET last_seen = excluded.last_seen, notified = 0""",
+                (now, now),
+            )
+
+    def claim_courier_silence(self, cutoff: float) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            changed = conn.execute(
+                """UPDATE courier_monitor SET notified = 1
+                   WHERE singleton = 1 AND notified = 0 AND COALESCE(last_seen, started_at) <= ?""",
+                (cutoff,),
+            ).rowcount
+            if not changed:
+                return None
+            seen = conn.execute("SELECT last_seen FROM courier_monitor WHERE singleton = 1").fetchone()[0]
+            return {"event": "courier_silent", "last_seen": (
+                datetime.fromtimestamp(seen, timezone.utc).isoformat() if seen is not None else None
+            )}
 
     def open_session(
         self,
