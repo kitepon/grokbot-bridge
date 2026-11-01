@@ -21,7 +21,14 @@ if str(SRC) not in sys.path:
 from call_bridge.db import CallStore  # noqa: E402
 from call_bridge import server as call_server  # noqa: E402
 from call_bridge.auth import OPEN  # noqa: E402
-from call_bridge.deliver import dispatch_send  # noqa: E402
+from call_bridge.deliver import dispatch_send as _dispatch_send  # noqa: E402
+
+
+def dispatch_send(*args, **kwargs):
+    if len(args) >= 3 and args[2] == "local":
+        kwargs.setdefault("sender_name", "Cursor")
+        kwargs.setdefault("sender_team", "ローカル")
+    return _dispatch_send(*args, **kwargs)
 from call_bridge.directory import load_directory, search_directory  # noqa: E402
 from call_bridge.wake import (  # noqa: E402
     LINK_DOWN_EVENT,
@@ -49,6 +56,8 @@ _ENV_KEYS = (
     "CALL_BRIDGE_DIRECTORY",
     "GROKBOT_GATEWAY_URL",
     "GROKBOT_GATEWAY_TOKEN",
+    "CALL_BRIDGE_DIRECTORY_PUSH",
+    "CALL_BRIDGE_GROKBOT_DELIVERY",
 )
 
 _MISSING_AGENTS = "/nonexistent/call-bridge-agents-root"
@@ -126,8 +135,10 @@ class LinkDownTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CALL_BRIDGE_AGENTS_ROOT"] = _MISSING_AGENTS
         os.environ["CALL_BRIDGE_DIRECTORY"] = _MISSING_SNAPSHOT
+        os.environ["CALL_BRIDGE_GROKBOT_DELIVERY"] = "marian"
         reset_link_down_limiter()
         self.temp = tempfile.TemporaryDirectory()
+        os.environ["CALL_BRIDGE_DIRECTORY_PUSH"] = str(Path(self.temp.name) / "no-push.json")
         self.logs = _ListHandler()
         logging.getLogger("call_bridge.wake").addHandler(self.logs)
         logging.getLogger("call_bridge.wake").setLevel(logging.DEBUG)

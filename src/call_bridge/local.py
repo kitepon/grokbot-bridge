@@ -1270,6 +1270,9 @@ async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
 
 
 mcp = FastMCP("grokbot-bridge-local", instructions=(
+    "届ける相手は、橋の call_directory で選び、call_open で開き、call_send で直接届ける。"
+    "GrokBot にも BellTeam にも、この順で届く。"
+    "local として call_send する時は sender_name を渡す。本文の冒頭には、オーナー本人ではない旨が付く。"
     "call_open は、GrokBot または BellTeam の返信をこの端末で受け取ります。"
     "親が Codex の時は、返信を親のタスクへ自動で渡します。親は call_poll や待機ループを実行せず、作業を続けるかターンを終えてください。"
     "親が Claude Code の時も、hook が入っていれば自動で渡します（call_open の結果の parent_delivery.state が watching）。"
@@ -1550,13 +1553,26 @@ async def call_adopt(session_id: str, ctx: Context | None = None) -> dict[str, A
             "parent_delivery": {"state": "watching", "thread_id": thread_id}}
 
 
-@mcp.tool(description="通話へメッセージを送信。local は返信依頼が既定。返信不要なら reply_required=false。"
+@mcp.tool(description="通話へメッセージを送る。call_directory で相手を選び、call_open で開いた通話へ、"
+                      "GrokBot にも BellTeam にも直接届く。"
+                      "local として送る時は sender_name が必要。所属は、橋の接続トークンに結び付いていればそのチームになり、"
+                      "別のチームは拒否する。結び付いていない接続では sender_team も必要。"
+                      "本文の冒頭に、オーナー本人ではなくそのチームのその人からだと付く。"
+                      "返信不要なら reply_required=false。"
                       "Codex か、hook の入った Claude Code の会話が local として送ると、以後の返信はその会話へ届く")
 async def call_send(session_id: str, from_party: Literal["local", "member"], message: str,
-                    reply_required: bool = True, ctx: Context | None = None) -> dict[str, Any]:
+                    reply_required: bool = True, sender_name: str | None = None,
+                    sender_team: str | None = None, ctx: Context | None = None) -> dict[str, Any]:
     extra = await _follow_speaker(session_id, ctx) if from_party == "local" else None
-    result = await _remote_tool("call_send", {"session_id": session_id, "from_party": from_party,
-                                              "message": message, "reply_required": reply_required})
+    arguments: dict[str, Any] = {
+        "session_id": session_id, "from_party": from_party,
+        "message": message, "reply_required": reply_required,
+    }
+    if sender_name:
+        arguments["sender_name"] = sender_name
+    if sender_team:
+        arguments["sender_team"] = sender_team
+    result = await _remote_tool("call_send", arguments)
     return {**result, **extra} if extra else result
 
 

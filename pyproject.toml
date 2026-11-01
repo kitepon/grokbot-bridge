@@ -1,6 +1,6 @@
 [project]
 name = "grokbot-bridge"
-version = "0.3.19"
+version = "0.4.0"
 description = "Shared phone-call bridge MCP for Grok Bot — wake a teammate, then talk direct over the same endpoint."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -24,6 +24,7 @@ call-bridge-local = "call_bridge.local:main"
 call-bridge-setup = "call_bridge.setup:main"
 call-bridge-receiver = "call_bridge.receiver:main"
 call-bridge-recover = "call_bridge.recover:main"
+call-bridge-box-courier = "call_bridge.box_courier:main"
 
 [build-system]
 requires = ["hatchling"]

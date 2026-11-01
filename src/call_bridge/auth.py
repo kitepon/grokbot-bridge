@@ -5,6 +5,7 @@
     {"tokens": [
       {"name": "bellteam", "sha256": "<hex>", "system": "bellteam", "caller_id_header": true},
       {"name": "grokbot", "sha256": "<hex>", "system": "grokbot"},
+      {"name": "grokbot-courier", "sha256": "<hex>", "system": "grokbot", "courier": true},
       {"name": "macbook", "sha256": "<hex>", "system": "local"},
       {"name": "ops", "sha256": "<hex>", "ops": true}
     ]}
@@ -12,8 +13,10 @@
 A principal with ``system`` may act only as a party of that system in a call.
 ``caller_id_header`` lets that system's infrastructure name the exact caller in
 ``X-Call-Bridge-Caller-Id`` (BellTeam sets it per Bot). Without the header the
-principal is system-wide. An entry without ``system`` is unrestricted and needs
-``ops: true``.
+principal is system-wide. ``courier: true`` is only valid on ``system: grokbot``
+with no ``id``: that token may pull GrokBot deliveries, push the phone book,
+and report sendPrompt. Member tokens do not get it. An entry without
+``system`` is unrestricted and needs ``ops: true``.
 
 ``CALL_BRIDGE_TOKEN`` stays accepted as an unrestricted legacy token during
 migration; once the file has entries its use logs a warning every 5 minutes.
@@ -46,6 +49,7 @@ class Principal:
     system: str | None = None
     id: str | None = None
     ops: bool = False
+    courier: bool = False
 
     @property
     def unrestricted(self) -> bool:
@@ -71,6 +75,7 @@ class _Entry:
     id: str | None
     caller_id_header: bool
     ops: bool
+    courier: bool
 
 
 def _flag(raw: dict[str, Any], key: str, name: str) -> bool:
@@ -121,15 +126,22 @@ def _load_entries(path: str) -> list[_Entry]:
         if system is not None and system not in SYSTEMS:
             raise AuthError(f"token entry {name}: unknown system {system}")
         ops = _flag(raw, "ops", name)
+        courier = _flag(raw, "courier", name)
+        caller_id = _text(raw, "id", name)
         if system is None and not ops:
             raise AuthError(f"token entry {name}: an entry without system must set ops")
+        if courier and system != "grokbot":
+            raise AuthError(f"token entry {name}: courier requires system grokbot")
+        if courier and caller_id:
+            raise AuthError(f"token entry {name}: courier must not set id")
         entries.append(_Entry(
             name=name,
             digest=digest,
             system=system,
-            id=_text(raw, "id", name),
+            id=caller_id,
             caller_id_header=_flag(raw, "caller_id_header", name),
             ops=ops,
+            courier=courier,
         ))
     return entries
 
@@ -189,7 +201,9 @@ class Authenticator:
             if caller_id and header_id != caller_id:
                 raise AuthError(f"{CALLER_ID_HEADER} does not match token {entry.name}")
             caller_id = header_id
-        return Principal(name=entry.name, system=entry.system, id=caller_id, ops=entry.ops)
+        return Principal(
+            name=entry.name, system=entry.system, id=caller_id, ops=entry.ops, courier=entry.courier
+        )
 
 
 def is_party(principal: Principal, sess: dict[str, Any], party: str) -> bool:

@@ -69,12 +69,21 @@ class AuthenticatorTest(unittest.TestCase):
         p = self.auth.authenticate(_request(BELLTEAM))
         self.assertEqual((p.system, p.id), ("bellteam", None))
         self.assertEqual(self.auth.authenticate(_request(GROKBOT)).system, "grokbot")
+        self.assertFalse(self.auth.authenticate(_request(GROKBOT)).courier)
 
     def test_wrong_token_and_header_without_permission_are_refused(self) -> None:
         self.assertIsNone(self.auth.authenticate(_request("nope")))
         self.assertIsNone(self.auth.authenticate({}))
         with self.assertRaises(AuthError):
             self.auth.authenticate(_request(GROKBOT, "someone"))
+
+    def test_courier_flag_is_grokbot_without_an_id(self) -> None:
+        path = Path(self.tmp.name) / "courier.json"
+        path.write_text(json.dumps({"tokens": [
+            {"name": "courier", "sha256": _sha("courier-token"), "system": "grokbot", "courier": True},
+        ]}), encoding="utf-8")
+        principal = Authenticator("", str(path)).authenticate(_request("courier-token"))
+        self.assertEqual((principal.system, principal.id, principal.courier), ("grokbot", None, True))
 
     def test_legacy_token_is_unrestricted_and_ignores_the_header(self) -> None:
         with self.assertLogs("call_bridge.auth", "WARNING"):
@@ -122,6 +131,8 @@ class AuthenticatorTest(unittest.TestCase):
             "bad sha": json.dumps({"tokens": [{**entry, "sha256": "zz"}]}),
             "duplicate sha": json.dumps({"tokens": [entry, {**entry, "name": "y"}]}),
             "no system without ops": json.dumps({"tokens": [{"name": "x", "sha256": _sha("x")}]}),
+            "courier on bellteam": json.dumps({"tokens": [{"name": "x", "sha256": _sha("x"), "system": "bellteam", "courier": True}]}),
+            "courier with id": json.dumps({"tokens": [{**entry, "courier": True, "id": "g-1"}]}),
         }
         for label, content in cases.items():
             with self.subTest(label), self.assertRaises(AuthError) as caught:
@@ -292,8 +303,12 @@ class HttpIdentityTest(unittest.TestCase):
                             member_name="マリアン")
         self.assertEqual(opened["local_system"], "grokbot", opened)
         sent = self._tool(_headers(GROKBOT), "call_send", session_id=opened["session_id"],
-                          from_party="local", message="x")
-        self.assertNotEqual(sent.get("error"), "forbidden", sent)
+                          from_party="local", message="x", sender_name="ラピ")
+        self.assertNotIn("error", sent, sent)
+        self.assertTrue(sent["message"].startswith("これはオーナー本人ではなく、GrokBotチームのラピからのメッセージです。"), sent)
+        spoofed = self._tool(_headers(GROKBOT), "call_send", session_id=opened["session_id"],
+                             from_party="local", message="x", sender_name="ラピ", sender_team="BellTeam")
+        self.assertEqual(spoofed["error"], "forbidden", spoofed)
 
     def test_forbidden_header_body_does_not_name_the_token(self) -> None:
         with httpx.Client(base_url=self.base, timeout=10) as client:

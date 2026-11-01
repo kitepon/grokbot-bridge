@@ -21,6 +21,7 @@ if str(SRC) not in sys.path:
 from call_bridge.bellteam import BellTeamError, BellTeamOutcomeUnknown, fetch_directory, send_delivery
 from call_bridge.db import CallStore
 from call_bridge.deliver import dispatch_send
+from call_bridge.sender import with_sender_preface
 from call_bridge.directory import load_directory, resolve_bellteam_member
 from call_bridge import server as call_server
 
@@ -73,13 +74,17 @@ class BellTeamTests(unittest.TestCase):
                                                  member_system="bellteam", member_id="bot-a",
                                                  local_system="bellteam")
                     sid = session["session_id"]
-                    sent = dispatch_send(store, sid, "local", "確認して\n本文", False)
+                    sent = dispatch_send(
+                        store, sid, "local", "確認して\n本文", False,
+                        sender_name="発信者", sender_team="BellTeam",
+                    )
+                    headed = with_sender_preface("確認して\n本文", "BellTeam", "発信者")
                     self.assertEqual(sent["delivery"]["status"], "delivered")
                     self.assertEqual(server.received, {
                         "schema": "call-bridge.delivery.v1", "event": "session.message",
                         "session_id": sid, "target_id": "bot-a",
                         "source_system": "bellteam", "source_id": "bot-caller",
-                        "source_label": "発信者", "message": "確認して\n本文", "reply_required": False,
+                        "source_label": "発信者", "message": headed, "reply_required": False,
                     })
                     reply = dispatch_send(store, sid, "member", "確認した", False)
                     self.assertEqual(reply["delivery"]["status"], "delivered")
@@ -90,7 +95,7 @@ class BellTeamTests(unittest.TestCase):
                         "source_label": "トロニー", "message": "確認した", "reply_required": False,
                     })
                     self.assertEqual(store.poll_messages(sid, "member")["messages"][0]["message"],
-                                     "確認して\n本文")
+                                     headed)
                     self.assertEqual(store.poll_messages(sid, "local")["messages"][0]["message"],
                                      "確認した")
             finally:
@@ -162,7 +167,7 @@ class BellTeamTests(unittest.TestCase):
             session = store.open_session("bot-caller", "エレグ", "トロニー", member_system="bellteam", member_id="bot-a", local_system="bellteam")
             sid = session["session_id"]
             with mock.patch("call_bridge.deliver.send_delivery", return_value={"delivery": "running"}) as send:
-                sent = dispatch_send(store, sid, "local", "確認して")
+                sent = dispatch_send(store, sid, "local", "確認して", sender_name="エレグ", sender_team="BellTeam")
                 self.assertEqual(sent["delivery"]["status"], "delivered")
                 self.assertEqual(send.call_args.args[0]["target_id"], "bot-a")
                 self.assertEqual(send.call_args.args[0]["source_system"], "bellteam")
@@ -171,11 +176,11 @@ class BellTeamTests(unittest.TestCase):
                 self.assertEqual(send.call_args.args[0]["target_id"], "bot-caller")
                 self.assertEqual(send.call_args.args[0]["event"], "session.reply")
             with mock.patch("call_bridge.deliver.send_delivery", side_effect=BellTeamError("BellTeam unavailable")):
-                failed = dispatch_send(store, sid, "local", "届かない")
+                failed = dispatch_send(store, sid, "local", "届かない", sender_name="エレグ", sender_team="BellTeam")
                 self.assertEqual(failed["delivery"]["status"], "error")
                 self.assertEqual(len(store.poll_messages(sid, "member")["messages"]), 1)
             with mock.patch("call_bridge.deliver.send_delivery", side_effect=BellTeamOutcomeUnknown("receipt timed out")) as send:
-                unknown = dispatch_send(store, sid, "local", "届いたか不明")
+                unknown = dispatch_send(store, sid, "local", "届いたか不明", sender_name="エレグ", sender_team="BellTeam")
                 self.assertEqual(unknown["delivery"]["status"], "unknown")
                 self.assertEqual(unknown["seq"], 3)
                 send.assert_called_once()
@@ -203,7 +208,7 @@ class BellTeamTests(unittest.TestCase):
                  mock.patch("call_bridge.wake._post_json") as post:
                 result = call_server.call_open("bot-caller", "トロニー", "grok-a", local_system="bellteam")
                 post.assert_not_called()
-                self.assertEqual(result["wake"], {"status": "skipped", "detail": "rings on the first call_send"})
+                self.assertEqual(result["wake"], {"status": "skipped", "detail": "direct delivery on the first call_send"})
                 self.assertEqual(result["member_id"], "grok-a")
                 self.assertEqual(result["member_name"], "ラピ")
                 self.assertEqual(store.get_session(result["session_id"])["local_system"], "bellteam")
