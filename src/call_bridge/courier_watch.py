@@ -1,4 +1,4 @@
-"""One body-free webhook attempt per courier outage, retained across restarts."""
+"""Wake once per courier outage with queued mail, retained across restarts."""
 from __future__ import annotations
 
 import asyncio
