@@ -165,7 +165,14 @@ class CallStore:
         with self._conn() as conn:
             changed = conn.execute(
                 """UPDATE courier_monitor SET notified = 1
-                   WHERE singleton = 1 AND notified = 0 AND COALESCE(last_seen, started_at) <= ?""",
+                   WHERE singleton = 1 AND notified = 0 AND COALESCE(last_seen, started_at) <= ?
+                     AND EXISTS (
+                       SELECT 1 FROM grokbot_outbox o
+                       JOIN messages m ON m.session_id = o.session_id AND m.seq = o.seq
+                       JOIN sessions s ON s.session_id = o.session_id
+                       WHERE o.state = 'queued' AND s.status != 'hungup'
+                         AND s.member_system = 'grokbot' AND m.from_party = 'local'
+                     )""",
                 (cutoff,),
             ).rowcount
             if not changed:

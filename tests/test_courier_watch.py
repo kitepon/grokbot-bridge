@@ -39,20 +39,49 @@ class CourierWatchTest(unittest.TestCase):
         self.env.stop()
         self.tmp.cleanup()
 
+    def queue_message(self, member_system='grokbot'):
+        session = self.store.open_session('sender', 'Sender', 'Recipient',
+                                          member_system=member_system, member_id='g-1')
+        return self.store.send_message(session['session_id'], 'local', 'Test mail', grokbot_outbox=True)
+
     def test_initial_grace_exact_boundary_and_durable_one_attempt(self):
         self.store.start_courier_monitor(1000)
+        self.assertIsNone(self.store.claim_courier_silence(10000))
+        self.queue_message()
         self.assertIsNone(self.store.claim_courier_silence(999.999))
         self.assertEqual(self.store.claim_courier_silence(1000), {
             'event': 'courier_silent', 'last_seen': None,
         })
         restarted = CallStore(self.path)
         restarted.start_courier_monitor(9000)
+        self.queue_message()
         self.assertIsNone(restarted.claim_courier_silence(9000))
+        restarted.claim_grokbot_deliveries('test', limit=10)
         restarted.record_courier_seen(10000)
+        self.assertIsNone(restarted.claim_courier_silence(20000))
+        self.queue_message()
         self.assertIsNone(restarted.claim_courier_silence(9999.999))
         payload = restarted.claim_courier_silence(10000)
         self.assertEqual(payload['last_seen'], '1970-01-01T02:46:40+00:00')
         self.assertIsNone(self.store.claim_courier_silence(20000))
+
+    def test_only_deliverable_queued_grokbot_mail_can_wake(self):
+        self.store.start_courier_monitor(1000)
+        self.queue_message(member_system='bellteam')
+        message = self.queue_message()
+        for state in ('inflight', 'submitted', 'failed', 'unknown'):
+            with self.subTest(state=state), self.store._conn() as db:
+                db.execute('UPDATE grokbot_outbox SET state = ? WHERE session_id = ?',
+                           (state, message['session_id']))
+            self.assertIsNone(self.store.claim_courier_silence(10000))
+        with self.store._conn() as db:
+            db.execute("UPDATE grokbot_outbox SET state = 'queued' WHERE session_id = ?",
+                       (message['session_id'],))
+            db.execute("UPDATE sessions SET status = 'hungup' WHERE session_id = ?",
+                       (message['session_id'],))
+        self.assertIsNone(self.store.claim_courier_silence(10000))
+        self.queue_message()
+        self.assertIsNotNone(self.store.claim_courier_silence(10000))
 
     def test_only_successful_courier_requests_reset_timer_through_real_auth(self):
         tokens = Path(self.tmp.name) / 'tokens.json'
@@ -63,6 +92,7 @@ class CourierWatchTest(unittest.TestCase):
              'sha256': hashlib.sha256(b'member-token').hexdigest()},
         ]}))
         self.store.start_courier_monitor(1000)
+        self.queue_message()
         app = Starlette(routes=[
             Route('/v0/grokbot/deliveries/inflight', server.rest_inflight_deliveries),
             Route('/v0/grokbot/deliveries/claim', server.rest_claim_deliveries, methods=['POST']),
@@ -96,6 +126,7 @@ class CourierWatchTest(unittest.TestCase):
                 ]:
                     response = getattr(client, method)(path, headers=courier, **kwargs)
                     self.assertEqual(response.status_code, 200)
+                    self.queue_message()
                     self.assertIsNone(self.store.claim_courier_silence(1199.999))
                     self.assertIsNotNone(self.store.claim_courier_silence(1200))
 
@@ -110,11 +141,14 @@ class CourierWatchTest(unittest.TestCase):
 
     def test_timer_fires_without_requests_and_does_not_retry_failure(self):
         async def exercise():
-            ticks = iter([1000, 1299.999, 1300, 9000])
+            ticks = iter([1000, 1300, 9000, 9010])
             count = 0
             async def sleep(_seconds):
                 nonlocal count
                 count += 1
+                if count == 2:
+                    notify.assert_not_called()
+                    self.queue_message()
                 if count == 4:
                     raise asyncio.CancelledError
             with mock.patch.object(watch, 'time', mock.Mock(time=mock.Mock(side_effect=lambda: next(ticks)))), \
