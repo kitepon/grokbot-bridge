@@ -25,6 +25,9 @@ from call_bridge.box_courier import (  # noqa: E402
     CourierBusy,
     CourierLock,
     Journal,
+    format_pass,
+    main as courier_main,
+    pass_exit_code,
     restart_action,
     run_once,
 )
@@ -314,6 +317,93 @@ class CourierLoopTests(unittest.TestCase):
         self.assertNotIn("gw-secret", result.stderr)
         holder.kill()
 
+    def test_exit_codes_name_the_failed_step(self) -> None:
+        self.assertEqual(pass_exit_code({}), 0)
+        self.assertEqual(pass_exit_code({"inflight_error": "http 401", "claim_error": "http 401"}), 2)
+        self.assertEqual(pass_exit_code({"push_error": "http 401"}), 3)
+        self.assertEqual(pass_exit_code({"receipt_error": "http 401", "push_error": "agents root not found"}), 4)
+        line = format_pass({
+            "reconciled": 0, "sent": 0, "pushed": 0,
+            "inflight_error": "http 401", "claim_error": "http 401",
+            "receipt_error": "", "push_error": "http 401",
+        })
+        self.assertIn("pass failed exit=4", line)
+        self.assertIn("inflight=http 401", line)
+        self.assertIn("claim=http 401", line)
+        self.assertIn("directory=http 401", line)
+        self.assertNotIn("token", line)
+
+    def test_once_exits_nonzero_when_the_bridge_or_the_directory_fails(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            seat = root / "agents" / "rapi-agent"
+            seat.mkdir(parents=True)
+            (seat / "profile.json").write_text('{"name":"ラピ"}', encoding="utf-8")
+            (root / "gateway.json").write_text(
+                json.dumps({"port": 9, "token": "gw-test-do-not-log"}), encoding="utf-8",
+            )
+            (root / "bridge.token").write_text("bridge-test-do-not-log\n", encoding="utf-8")
+            state = root / "state"
+            state.mkdir()
+            journal_path = state / "journal.json"
+            armed = {"sess-kept:1": {"phase": "armed", "nonce": "nonce-kept", "claim_token": "token-kept"}}
+            journal_path.write_text(json.dumps(armed), encoding="utf-8")
+
+            def run(status_for) -> tuple[int, str]:
+                journal_path.write_text(json.dumps(armed), encoding="utf-8")
+                httpd = _status_server(status_for)
+                host, port = httpd.server_address[:2]
+                logs = _ListHandler()
+                logger = logging.getLogger("call_bridge.box_courier")
+                previous_level = logger.level
+                logger.setLevel(logging.INFO)
+                logger.addHandler(logs)
+                env = {
+                    "CALL_BRIDGE_GATEWAY_JSON": str(root / "gateway.json"),
+                    "CALL_BRIDGE_TOKEN_FILE": str(root / "bridge.token"),
+                    "CALL_BRIDGE_URL": f"http://{host}:{port}",
+                    "CALL_BRIDGE_COURIER_STATE": str(state),
+                    "CALL_BRIDGE_AGENTS_ROOT": str(root / "agents"),
+                    "CALL_BRIDGE_COURIER_ID": "box",
+                }
+                try:
+                    with mock.patch.dict(os.environ, env, clear=False):
+                        code = courier_main(["--once"])
+                finally:
+                    logger.removeHandler(logs)
+                    logger.setLevel(previous_level)
+                    httpd.shutdown()
+                    httpd.server_close()
+                return code, "\n".join(logs.messages)
+
+            both, both_log = run(lambda method, path: 401)
+            self.assertEqual(both, 4, both_log)
+            self.assertIn("pass failed exit=4", both_log)
+            self.assertIn("inflight=http 401", both_log)
+            self.assertIn("claim=http 401", both_log)
+            self.assertIn("directory=http 401", both_log)
+            self.assertNotIn("gw-test-do-not-log", both_log)
+            self.assertNotIn("bridge-test-do-not-log", both_log)
+            self.assertEqual(json.loads(journal_path.read_text(encoding="utf-8")), armed)
+
+            bridge_only, bridge_log = run(lambda method, path: 200 if method == "PUT" else 401)
+            self.assertEqual(bridge_only, 2, bridge_log)
+            self.assertIn("inflight=http 401", bridge_log)
+            self.assertIn("claim=http 401", bridge_log)
+            self.assertNotIn("directory=", bridge_log)
+            self.assertEqual(json.loads(journal_path.read_text(encoding="utf-8")), armed)
+
+            directory_only, directory_log = run(lambda method, path: 401 if method == "PUT" else 200)
+            self.assertEqual(directory_only, 3, directory_log)
+            self.assertIn("directory=http 401", directory_log)
+            self.assertNotIn("inflight=", directory_log)
+            self.assertNotIn("claim=", directory_log)
+
+            ok, ok_log = run(lambda method, path: 200)
+            self.assertEqual(ok, 0, ok_log)
+            self.assertIn("pass ok exit=0", ok_log)
+            self.assertIn("pushed=1", ok_log)
+
     def test_lock_helper_reports_busy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "courier.lock"
@@ -322,6 +412,39 @@ class CourierLoopTests(unittest.TestCase):
             self.addCleanup(first.release)
             with self.assertRaises(CourierBusy):
                 CourierLock(path).acquire()
+
+
+def _status_server(status_for):
+    """Local bridge double. ``status_for(method, path)`` is the HTTP status."""
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self) -> None:  # noqa: N802
+            self._reply(status_for("GET", self.path))
+
+        def do_POST(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self._reply(status_for("POST", self.path))
+
+        def do_PUT(self) -> None:  # noqa: N802
+            length = int(self.headers.get("Content-Length", "0"))
+            self.rfile.read(length)
+            self._reply(status_for("PUT", self.path))
+
+        def _reply(self, code: int) -> None:
+            raw = b'{"ok":true,"deliveries":[]}' if code == 200 else b'{"ok":false}'
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(raw)))
+            self.end_headers()
+            self.wfile.write(raw)
+
+        def log_message(self, fmt: str, *args: object) -> None:
+            return
+
+    httpd = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    return httpd
 
 
 class _World:

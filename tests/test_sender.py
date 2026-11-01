@@ -117,6 +117,56 @@ class SenderTests(unittest.TestCase):
         ))
         self.assertEqual(spoofed["error"], "forbidden")
 
+    def test_local_caller_id_uses_the_registered_token_name(self) -> None:
+        from call_bridge.directory import member_display_name
+
+        self.assertIsNone(member_display_name("local", "approval-box"))
+        self.assertIsNone(member_display_name("local", "local-muse-quolu"))
+        for mode in ("courier", "marian"):
+            with self.subTest(mode=mode):
+                os.environ["CALL_BRIDGE_GROKBOT_DELIVERY"] = mode
+                cases = (
+                    ("approval-box", "approval-box"),
+                    ("local-muse-quolu", "muse-1"),
+                )
+                for registered, caller_id in cases:
+                    session = self.store.open_session(
+                        caller_id, registered, "ラピ", member_id="rapi-agent", local_system="local",
+                    )
+                    principal = Principal(name=registered, system="local", id=caller_id)
+                    with mock.patch.object(server, "store", self.store), \
+                         mock.patch("call_bridge.deliver.notify_ring", return_value={"status": "ok", "detail": "http 204"}) as ring:
+                        sent = server._send(
+                            principal, session["session_id"], "local", "本文", False, registered, "ローカル",
+                        )
+                        omitted = server._send(
+                            principal, session["session_id"], "local", "続き", False, None, None,
+                        )
+                        spoofed = server._send(
+                            principal, session["session_id"], "local", "偽装", False, "別人", "ローカル",
+                        )
+                        id_as_name = server._send(
+                            principal, session["session_id"], "local", "偽装", False, caller_id, "local",
+                        )
+                    self.assertNotIn("error", sent, sent)
+                    self.assertNotIn("not in the directory", sent.get("detail", ""))
+                    preface = f"これはオーナー本人ではなく、ローカルチームの{registered}からのメッセージです。"
+                    self.assertTrue(sent["message"].startswith(preface), sent["message"])
+                    self.assertNotIn("error", omitted, omitted)
+                    self.assertTrue(omitted["message"].startswith(preface), omitted["message"])
+                    self.assertEqual(spoofed["error"], "forbidden")
+                    if caller_id != registered:
+                        self.assertEqual(id_as_name["error"], "forbidden")
+                        self.assertNotIn(caller_id, sent["message"])
+                    else:
+                        self.assertNotIn("error", id_as_name, id_as_name)
+                    if mode == "marian":
+                        self.assertEqual(sent["delivery"]["status"], "delivered")
+                        self.assertGreaterEqual(ring.call_count, 1)
+                    else:
+                        ring.assert_not_called()
+                        self.assertEqual(sent["delivery"]["status"], "queued")
+
     def test_member_reply_has_no_preface_and_does_not_need_a_sender(self) -> None:
         session = self.store.open_session("local-1", "Cursor", "ラピ", member_id="rapi-agent")
         result = dispatch_send(self.store, session["session_id"], "member", "確認しました")

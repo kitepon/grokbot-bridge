@@ -172,7 +172,7 @@ A local coding agent (Claude Code, Codex, Cursor, …) calls either system throu
 ### GrokBot target
 
 1. **Local** opens a session (`call_open` or `POST /v0/sessions`) and gets a `session_id`. Nothing is posted yet; `wake.status` is `skipped`.
-2. **Local** `call_send` requires `sender_name`. When the bearer token is bound to a system, `sender_team` is that system and a different team is rejected. When the token also names a caller id, the display name comes from the phone book. The stored text starts with 「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」. In the default `courier` mode the bridge saves the text and returns `delivery.status=queued`. The box courier claims it, POSTs `sendPrompt`, and reports `submitted`, `failed`, or `unknown` through `call_receipt`. `unknown` is not sent again. `CALL_BRIDGE_GROKBOT_DELIVERY=marian` instead rings with `session.opened` (no message body) when the member has nothing unread; a failed ring does not store the text.
+2. **Local** `call_send` requires `sender_name`. When the bearer token is bound to a system, `sender_team` is that system and a different team is rejected. When the token also names a caller id, GrokBot and BellTeam take the display name from the phone book. A local token takes the name registered on that token, because local ids are not in the phone book. A different name is rejected. The stored text starts with 「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」. In the default `courier` mode the bridge saves the text and returns `delivery.status=queued`. The box courier claims it, POSTs `sendPrompt`, and reports `submitted`, `failed`, or `unknown` through `call_receipt`. `unknown` is not sent again. `CALL_BRIDGE_GROKBOT_DELIVERY=marian` instead rings with `session.opened` (no message body) when the member has nothing unread; a failed ring does not store the text.
 3. **GrokBot member** receives the prompt directly in courier mode. `call_poll(party="member")` still returns the stored copy, including the reply hint when `reply_required=true`. The member's `call_send(from_party="member")` stores the reply. If the caller is a BellTeam Bot, the bridge also delivers that reply through BellTeam's UNIX socket.
 4. Either side (or ops) calls `call_hangup`.
 
@@ -407,8 +407,9 @@ install -m 600 /dev/null /home/box/agent-data/call-bridge-courier/bridge.token
 export CALL_BRIDGE_URL=https://call.kitepon.dev
 export CALL_BRIDGE_TOKEN_FILE=/home/box/agent-data/call-bridge-courier/bridge.token
 python3 scripts/box_courier.py --once
-# ログに pass reconciled=… sent=… pushed=1 が出れば、橋への接続と電話帳の供給まで通っている。
-# 401 ならトークンが違う。トークンはログに出さない。
+# 終了コード 0 かつログの pass ok exit=0 … pushed=1 で、橋への接続と電話帳の供給まで通っている。
+# exit=2 は橋（inflight / claim / receipt）、exit=3 は電話帳、exit=4 はその両方。
+# exit=1 は起動前（ロック、gateway.json、橋のトークン）。401 ならトークンが違う。トークンはログに出さない。
 
 tmux new-session -d -s call-bridge-courier -c "$PWD" \
   'export CALL_BRIDGE_URL=https://call.kitepon.dev CALL_BRIDGE_TOKEN_FILE=/home/box/agent-data/call-bridge-courier/bridge.token; exec python3 scripts/box_courier.py'

@@ -320,8 +320,12 @@ def _finish(
     state: str,
     detail: str,
     retryable: bool,
-) -> bool:
-    """Report the outcome. Return True when the journal entry can be dropped."""
+) -> tuple[bool, str]:
+    """Report the outcome. The first value is whether the journal entry can be dropped.
+
+    A failed report leaves the journal in place. ``unknown`` is still not a
+    reason to send the prompt again.
+    """
     try:
         result = bridge.receipt(item, state, detail, retryable)
     except BridgeError as exc:
@@ -329,12 +333,12 @@ def _finish(
             "receipt failed session_id=%s seq=%s %s",
             item.get("session_id"), item.get("seq"), exc,
         )
-        return False
+        return False, str(exc)
     log.info(
         "receipt session_id=%s seq=%s state=%s",
         item.get("session_id"), item.get("seq"), result.get("state"),
     )
-    return result.get("state") != "inflight"
+    return result.get("state") != "inflight", ""
 
 
 def deliver_item(
@@ -343,14 +347,22 @@ def deliver_item(
     gateway: dict[str, str],
     item: dict[str, Any],
     action: str,
-) -> None:
-    """``action`` is ``send``, ``submitted``, ``failed``, or ``unknown``."""
+) -> str:
+    """``action`` is ``send``, ``submitted``, ``failed``, or ``unknown``.
+
+    Returns a bridge error detail when the receipt did not land, else ``""``.
+    An ``unknown`` outcome still does not send again, and its journal entry
+    stays until the receipt is accepted.
+    """
     session_id, seq = str(item.get("session_id")), item.get("seq")
     if action == "send" and not _usable(item):
         log.error("claim missing fields session_id=%s seq=%s", session_id, seq)
         if isinstance(item.get("claim_token"), str) and item.get("claim_token") and isinstance(item.get("session_id"), str) and isinstance(item.get("seq"), int):
-            _finish(bridge, journal, item, "failed", "claim missing fields", False)
-        return
+            dropped, error = _finish(bridge, journal, item, "failed", "claim missing fields", False)
+            if dropped:
+                journal.delete(str(item["session_id"]), int(item["seq"]))
+            return error
+        return "claim missing fields"
     if action == "send":
         result = _send_recorded(journal, gateway, item)
         if result["outcome"] == "accepted":
@@ -363,8 +375,52 @@ def deliver_item(
     else:
         state, retryable = action, action == "failed"
         detail = "not resent" if action == "unknown" else action
-    if _finish(bridge, journal, item, state, detail, retryable):
+    dropped, error = _finish(bridge, journal, item, state, detail, retryable)
+    if dropped:
         journal.delete(str(item["session_id"]), int(item["seq"]))
+    return error
+
+
+def pass_exit_code(stats: dict[str, Any]) -> int:
+    """Exit status of one ``--once`` pass.
+
+    ``0`` means inflight, claim, receipts, and the directory push all
+    completed. ``2`` means the bridge did not complete (inflight, claim, or
+    a receipt). ``3`` means only the directory push failed. ``4`` means both.
+    A delivery outcome of ``unknown`` is not one of these failures.
+    """
+    bridge_failed = bool(stats.get("inflight_error") or stats.get("claim_error") or stats.get("receipt_error"))
+    push_failed = bool(stats.get("push_error"))
+    if bridge_failed and push_failed:
+        return 4
+    if push_failed:
+        return 3
+    if bridge_failed:
+        return 2
+    return 0
+
+
+def format_pass(stats: dict[str, Any]) -> str:
+    """One line that names which part of the pass failed. No secrets."""
+    code = pass_exit_code(stats)
+    parts = [
+        "pass",
+        "ok" if code == 0 else "failed",
+        f"exit={code}",
+        f"reconciled={stats.get('reconciled', 0)}",
+        f"sent={stats.get('sent', 0)}",
+        f"pushed={stats.get('pushed', 0)}",
+    ]
+    for key, label in (
+        ("inflight_error", "inflight"),
+        ("claim_error", "claim"),
+        ("receipt_error", "receipt"),
+        ("push_error", "directory"),
+    ):
+        detail = stats.get(key)
+        if detail:
+            parts.append(f"{label}={detail}")
+    return " ".join(str(part) for part in parts)
 
 
 def run_once(
@@ -372,14 +428,27 @@ def run_once(
     journal: Journal,
     gateway: dict[str, str],
     courier_id: str,
-) -> dict[str, int]:
-    """Reconcile inflight claims, deliver at most one new message, push the phone book."""
-    stats = {"reconciled": 0, "sent": 0, "pushed": 0}
+) -> dict[str, Any]:
+    """Reconcile inflight claims, deliver at most one new message, push the phone book.
+
+    Bridge and directory failures are recorded on the result. They do not
+    discard a journal entry, and they do not turn ``unknown`` into another send.
+    """
+    stats: dict[str, Any] = {
+        "reconciled": 0,
+        "sent": 0,
+        "pushed": 0,
+        "inflight_error": "",
+        "claim_error": "",
+        "receipt_error": "",
+        "push_error": "",
+    }
     inflight: list[dict[str, Any]] | None
     try:
         inflight = bridge.inflight(courier_id)
     except BridgeError as exc:
         log.error("inflight list failed: %s", exc)
+        stats["inflight_error"] = str(exc)
         inflight = None
     keep: set[str] = set()
     if inflight is not None:
@@ -387,7 +456,9 @@ def run_once(
             if not isinstance(item.get("seq"), int) or not isinstance(item.get("session_id"), str):
                 continue
             action = restart_action(journal.phase(item["session_id"], item["seq"]))
-            deliver_item(bridge, journal, gateway, item, action)
+            receipt_error = deliver_item(bridge, journal, gateway, item, action)
+            if receipt_error and not stats["receipt_error"]:
+                stats["receipt_error"] = receipt_error
             if action == "send":
                 stats["sent"] += 1
             else:
@@ -400,9 +471,12 @@ def run_once(
         claimed = bridge.claim(courier_id)
     except BridgeError as exc:
         log.error("claim failed: %s", exc)
+        stats["claim_error"] = str(exc)
         claimed = []
     for item in claimed:
-        deliver_item(bridge, journal, gateway, item, "send")
+        receipt_error = deliver_item(bridge, journal, gateway, item, "send")
+        if receipt_error and not stats["receipt_error"]:
+            stats["receipt_error"] = receipt_error
         stats["sent"] += 1
     root = agents_root()
     if root is not None:
@@ -411,8 +485,10 @@ def run_once(
             stats["pushed"] = 1
         except (BridgeError, OSError, ValueError) as exc:
             log.error("directory push failed: %s", exc)
+            stats["push_error"] = str(exc)
     else:
         log.error("agents root not found; directory was not pushed")
+        stats["push_error"] = "agents root not found"
     return stats
 
 
@@ -420,6 +496,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Deliver GrokBot call-bridge messages from inside the box.")
     parser.add_argument("--once", action="store_true", help="claim, deliver, and push once, then exit")
     args = parser.parse_args(argv)
+    log.setLevel(logging.INFO)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
     directory = state_dir()
     directory.mkdir(parents=True, exist_ok=True)
@@ -445,16 +522,26 @@ def main(argv: list[str] | None = None) -> int:
         while True:
             try:
                 stats = run_once(bridge, journal, gateway, courier_id)
-                log.info(
-                    "pass reconciled=%s sent=%s pushed=%s",
-                    stats["reconciled"], stats["sent"], stats["pushed"],
-                )
+                line = format_pass(stats)
+                code = pass_exit_code(stats)
+                if code == 0:
+                    log.info("%s", line)
+                else:
+                    log.error("%s", line)
             except CourierError as exc:
                 log.error("%s", exc)
+                if args.once:
+                    return 1
+                time.sleep(interval)
+                continue
             except Exception:
                 log.error("courier pass failed")
+                if args.once:
+                    return 1
+                time.sleep(interval)
+                continue
             if args.once:
-                return 0
+                return code
             time.sleep(interval)
     finally:
         lock.release()

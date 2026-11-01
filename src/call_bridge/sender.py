@@ -4,8 +4,10 @@ A message delivered with the box gateway's sendPrompt shows up under the
 owner's name. The bridge therefore puts a fixed preface on every local
 message, and it takes the team from the connection when the token is bound
 to one. A bound caller cannot leave the team blank or substitute another.
-When the token also names a caller id, the display name comes from the
-phone book, not from the request.
+When the token also names a caller id, GrokBot and BellTeam take the
+display name from the phone book. A local token has no phone-book entry;
+its registered token name is the display name. The request cannot
+substitute a different one.
 """
 
 from __future__ import annotations
@@ -51,6 +53,30 @@ def _label(value: str, field: str) -> str | dict[str, str]:
     return value
 
 
+def _registered_sender_name(principal: Principal) -> str | dict[str, str]:
+    """The only display name this id-bearing connection may use.
+
+    Local seats are not in the GrokBot or BellTeam phone book.
+    ``member_display_name`` returns None for them, so the name registered
+    on the token is the fixed display name. GrokBot and BellTeam still
+    have to match a directory entry.
+    """
+    if principal.system == "local":
+        registered = principal.name.strip()
+        if not registered:
+            return {"error": "rejected", "detail": "this connection has no registered name"}
+        return registered
+    from .directory import member_display_name
+
+    looked = member_display_name(principal.system or "", principal.id or "")
+    if not looked:
+        return {
+            "error": "rejected",
+            "detail": "this connection's name is not in the directory",
+        }
+    return looked
+
+
 def resolve_sender(
     principal: Principal,
     sender_name: str | None,
@@ -60,8 +86,10 @@ def resolve_sender(
 
     Unrestricted connections (dev, legacy token, ops) must supply both; the
     bridge cannot tell who they are. A token bound to a system always uses
-    that system's team. A token that also carries a caller id uses the
-    directory name for that id.
+    that system's team. A GrokBot or BellTeam token that carries a caller id
+    uses the directory name for that id. A local token that carries a caller
+    id uses the name registered on the token (``Principal.name``). Either
+    way the caller cannot supply a different name.
     """
     if sender_name is not None and not isinstance(sender_name, str):
         return {"error": "rejected", "detail": "sender_name must be a string"}
@@ -89,14 +117,9 @@ def resolve_sender(
         return {"error": "forbidden", "detail": "sender_team is fixed by this connection"}
 
     if principal.id:
-        from .directory import member_display_name
-
-        looked = member_display_name(principal.system, principal.id)
-        if not looked:
-            return {
-                "error": "rejected",
-                "detail": "this connection's name is not in the directory",
-            }
+        looked = _registered_sender_name(principal)
+        if isinstance(looked, dict):
+            return looked
         if name_in and name_in != looked:
             return {"error": "forbidden", "detail": "sender_name is fixed by this connection"}
         name = looked
