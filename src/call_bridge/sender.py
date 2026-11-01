@@ -103,6 +103,10 @@ def resolve_sender(
         return {"error": "rejected", "detail": "sender_name must be a string"}
     if sender_team is not None and not isinstance(sender_team, str):
         return {"error": "rejected", "detail": "sender_team must be a string"}
+    if sender_name is not None and not sender_name.strip():
+        return {"error": "rejected", "detail": "sender_name must not be blank"}
+    if sender_team is not None and not sender_team.strip():
+        return {"error": "rejected", "detail": "sender_team must not be blank"}
     name_in = (sender_name or "").strip()
     team_in = (sender_team or "").strip()
 

@@ -280,8 +280,18 @@ class SenderTests(unittest.TestCase):
     def test_local_wrapper_preserves_explicit_blank_sender(self) -> None:
         with mock.patch.object(local, "_follow_speaker", new_callable=mock.AsyncMock, return_value=None), \
              mock.patch.object(local, "_remote_tool", new_callable=mock.AsyncMock, return_value={}) as remote:
-            asyncio.run(local.call_send("test", "local", "本文", False, ""))
+            asyncio.run(local.call_send("test", "local", "本文", False, "", ""))
         self.assertEqual(remote.call_args.args[1]["sender_name"], "")
+        self.assertEqual(remote.call_args.args[1]["sender_team"], "")
+
+    def test_explicit_blank_fields_are_rejected_for_bound_callers(self) -> None:
+        from call_bridge.sender import resolve_sender
+
+        for principal in (Principal(name="local-macbook", system="local"),
+                          Principal(name="approval-box", system="local", id="approval-box")):
+            for name, team in (("", None), ("  ", None), ("approval-box", ""), ("approval-box", "  ")):
+                with self.subTest(principal=principal, name=name, team=team):
+                    self.assertEqual(resolve_sender(principal, name, team)["error"], "rejected")
 
 
 if __name__ == "__main__":

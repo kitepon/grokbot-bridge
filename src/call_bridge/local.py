@@ -1570,7 +1570,7 @@ async def call_send(session_id: str, from_party: Literal["local", "member"], mes
     }
     if sender_name is not None:
         arguments["sender_name"] = sender_name
-    if sender_team:
+    if sender_team is not None:
         arguments["sender_team"] = sender_team
     result = await _remote_tool("call_send", arguments)
     return {**result, **extra} if extra else result
