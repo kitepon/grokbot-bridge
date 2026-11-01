@@ -48,7 +48,9 @@ def canonical_team(value: str) -> str | None:
 def _label(value: str, field: str) -> str | dict[str, str]:
     if not value:
         return {"error": "rejected", "detail": f"{field} is required"}
-    if len(value) > _MAX_LABEL or any(ch in value for ch in "\r\n\x00"):
+    # BellTeam permits names up to 100 UTF-16 units; all fit in 100 code points.
+    limit = 100 if field == "sender_name" else _MAX_LABEL
+    if len(value) > limit or any(ch in value for ch in "\r\n\x00"):
         return {"error": "rejected", "detail": f"{field} is not a usable label"}
     return value
 

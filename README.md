@@ -201,6 +201,8 @@ When a real MCP or REST request finds the directory unix socket unreachable (`un
 
 トークンが所属に結び付いている接続では `sender_team` を省ける。省いた値は、その所属（GrokBot / BellTeam / ローカル）になる。別のチームを渡すと拒否する。
 
+送り手名はUnicode 100文字まで、所属ラベルは80文字まで。BellTeamの有効な名前を切り詰めずに使う。改行・NULを含む値と、本人の登録名・電話帳名を別名に変えた入力は拒否する。
+
 返信不要の通知の引数例：
 
 ```json

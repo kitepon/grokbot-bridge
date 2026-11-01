@@ -17,7 +17,7 @@ from call_bridge.auth import OPEN, Principal  # noqa: E402
 from call_bridge.db import CallStore  # noqa: E402
 from call_bridge.deliver import dispatch_send  # noqa: E402
 from call_bridge import server  # noqa: E402
-from call_bridge.sender import PREFACE, with_sender_preface  # noqa: E402
+from call_bridge.sender import PREFACE, resolve_sender, with_sender_preface  # noqa: E402
 
 
 class SenderTests(unittest.TestCase):
@@ -166,6 +166,20 @@ class SenderTests(unittest.TestCase):
                     else:
                         ring.assert_not_called()
                         self.assertEqual(sent["delivery"]["status"], "queued")
+
+    def test_directory_name_limit_accepts_bellteam_names_without_weakening_identity(self) -> None:
+        principal = Principal(name="bellteam", system="bellteam", id="bot-fixture")
+        for name in ("A" * 80, "A" * 81, "A" * 100, "😀" * 50):
+            with self.subTest(name_length=len(name)), \
+                 mock.patch("call_bridge.directory.member_display_name", return_value=name):
+                resolved = resolve_sender(principal, None, None)
+                self.assertEqual(resolved, {"sender_name": name, "sender_team": "BellTeam"})
+                self.assertEqual(resolve_sender(principal, "別人", None)["error"], "forbidden")
+        for name in ("A" * 101, "A\nB", "A\x00B"):
+            with self.subTest(invalid_name=name), \
+                 mock.patch("call_bridge.directory.member_display_name", return_value=name):
+                self.assertEqual(resolve_sender(principal, None, None)["error"], "rejected")
+        self.assertEqual(resolve_sender(OPEN, "name", "A" * 81)["error"], "rejected")
 
     def test_member_reply_has_no_preface_and_does_not_need_a_sender(self) -> None:
         session = self.store.open_session("local-1", "Cursor", "ラピ", member_id="rapi-agent")
