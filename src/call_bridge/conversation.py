@@ -149,7 +149,10 @@ async def _throughline_json(args: list[str]) -> Any:
     try:
         stdout, _ = await asyncio.wait_for(process.communicate(), _THROUGHLINE_TIMEOUT)
     except asyncio.TimeoutError:
-        process.kill()
+        try:
+            process.kill()
+        except ProcessLookupError:
+            pass
         await process.wait()
         return None
     if process.returncode:

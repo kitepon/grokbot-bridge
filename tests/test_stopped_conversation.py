@@ -13,7 +13,7 @@ import unittest
 import uuid
 from contextlib import asynccontextmanager
 from pathlib import Path
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import httpx
 
@@ -52,6 +52,20 @@ class TurnTailTest(unittest.TestCase):
 
 
 class ConversationTest(unittest.IsolatedAsyncioTestCase):
+    async def test_throughline_timeout_reaps_an_already_exited_child(self) -> None:
+        process = types.SimpleNamespace(kill=Mock(side_effect=ProcessLookupError),
+                                        wait=AsyncMock(return_value=0))
+
+        async def communicate():
+            await asyncio.sleep(60)
+
+        process.communicate = communicate
+        with patch.object(conversation, '_throughline', return_value='throughline'), \
+             patch.object(conversation.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process)), \
+             patch.object(conversation, '_THROUGHLINE_TIMEOUT', 0.001):
+            self.assertIsNone(await conversation._throughline_json(['auto-handoff', 'status', '--json']))
+        process.wait.assert_awaited_once()
+
     async def test_missing_conversation_and_a_read_conversation(self) -> None:
         async def gone(_method, _params):
             raise DeliveryError("CODEX_REQUEST_REJECTED", "{'code': -32600, 'message': 'thread not loaded: t-1'}")
