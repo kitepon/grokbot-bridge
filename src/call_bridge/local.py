@@ -282,7 +282,8 @@ class LocalStore:
             return [row[0] for row in db.execute(
                 "SELECT session_id FROM subscriptions WHERE state = 'unknown' AND delivery_mode = 'channel' "
                 "AND harness = 'claude-code' AND EXISTS (SELECT 1 FROM deliveries WHERE "
-                "deliveries.session_id = subscriptions.session_id AND state IN ('unknown','sending'))")]
+                "deliveries.session_id = subscriptions.session_id AND state IN ('unknown','sending') "
+                "AND NOT EXISTS (SELECT 1 FROM superseded_replies s WHERE s.session_id=deliveries.session_id AND s.seq=deliveries.seq))")]
 
     def resume_fetched(self, subscription: dict[str, Any], reservations: list[dict[str, Any]], fetched: set[int]) -> bool:
         """取得印を観測した後も宛先と予約が同じ時だけ、未確定配送をまとめて取得済みにする。"""
@@ -297,7 +298,8 @@ class LocalStore:
             current = db.execute("SELECT * FROM subscriptions WHERE session_id = ?", (session_id,)).fetchone()
             pending = [dict(row) for row in db.execute(
                 "SELECT seq,delivery_id,state,error FROM deliveries WHERE session_id = ? "
-                "AND state IN ('unknown','sending') ORDER BY seq", (session_id,))]
+                "AND state IN ('unknown','sending') AND NOT EXISTS (SELECT 1 FROM superseded_replies s "
+                "WHERE s.session_id=deliveries.session_id AND s.seq=deliveries.seq) ORDER BY seq", (session_id,))]
             if current is None or dict(current) != subscription or pending != reservations:
                 return False
             # 元errorとcursorを残す。取得済みの間にある未取得返信を飛ばさない。
@@ -732,7 +734,8 @@ class Watchers:
         session_id = subscription["session_id"]
         with self.store.connect() as db:
             rows = [dict(row) for row in db.execute("SELECT * FROM deliveries WHERE session_id=? "
-                    "AND state IN ('unknown','sending') ORDER BY seq", (session_id,))]
+                    "AND state IN ('unknown','sending') AND NOT EXISTS (SELECT 1 FROM superseded_replies s "
+                    "WHERE s.session_id=deliveries.session_id AND s.seq=deliveries.seq) ORDER BY seq", (session_id,))]
         if not rows:
             return False
         channels = []
@@ -750,7 +753,8 @@ class Watchers:
             db.execute('BEGIN IMMEDIATE')
             current = db.execute('SELECT * FROM subscriptions WHERE session_id=?', (session_id,)).fetchone()
             pending = [dict(row) for row in db.execute("SELECT * FROM deliveries WHERE session_id=? "
-                       "AND state IN ('unknown','sending') ORDER BY seq", (session_id,))]
+                       "AND state IN ('unknown','sending') AND NOT EXISTS (SELECT 1 FROM superseded_replies s "
+                       "WHERE s.session_id=deliveries.session_id AND s.seq=deliveries.seq) ORDER BY seq", (session_id,))]
             if current is None or dict(current) != subscription or pending != rows:
                 return False
             # 出力済みの確証で再送せず再開する。元のerror/atとcursorは残す。
@@ -764,8 +768,11 @@ class Watchers:
 
     async def _recover_fetched(self, subscription: dict[str, Any], client: httpx.AsyncClient) -> bool:
         session_id = subscription["session_id"]
-        reservations = [row for row in self.store.status(session_id)["deliveries"]
-                        if row["state"] in ("unknown", "sending")]
+        with self.store.connect() as db:
+            reservations = [dict(row) for row in db.execute(
+                "SELECT seq,delivery_id,state,error FROM deliveries WHERE session_id=? "
+                "AND state IN ('unknown','sending') AND NOT EXISTS (SELECT 1 FROM superseded_replies s "
+                "WHERE s.session_id=deliveries.session_id AND s.seq=deliveries.seq) ORDER BY seq", (session_id,))]
         if not reservations:
             return False
         after_seq = min(row["seq"] for row in reservations) - 1

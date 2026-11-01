@@ -111,6 +111,28 @@ class ChannelWatchTest(unittest.IsolatedAsyncioTestCase):
     def _states(self, session_id: str) -> list[tuple[int, str]]:
         return [(row["seq"], row["state"]) for row in self.store.status(session_id)["deliveries"]]
 
+    async def test_handoff_read_child_exit_race_does_not_strand_a_reserved_reply(self):
+        process = SimpleNamespace(kill=Mock(side_effect=ProcessLookupError), wait=AsyncMock(return_value=0))
+
+        async def communicate():
+            await asyncio.sleep(60)
+
+        async def handoff(_session):
+            return await local.talk._throughline_json(['auto-handoff', 'status', '--json'])
+
+        process.communicate = communicate
+        self.handoff.side_effect = handoff
+        session_id = self._call()
+        bridge = Bridge([{'seq': 2, 'message': '返事'}], status='hungup')
+        with patch.object(local.talk, '_throughline', return_value='throughline'), \
+             patch.object(local.talk.asyncio, 'create_subprocess_exec', AsyncMock(return_value=process)), \
+             patch.object(local.talk, '_THROUGHLINE_TIMEOUT', 0.001):
+            await self._watch(session_id, bridge)
+        self.assertEqual(self.send.await_count, 1)
+        self.assertEqual(self._states(session_id), [(2, 'submitted')])
+        self.assertEqual(self.store.subscription(session_id)['after_seq'], 2)
+        process.wait.assert_awaited_once()
+
     async def test_reply_goes_into_the_living_conversation_and_the_sender_sees_it_started(self):
         session_id = self._call()
         bridge = Bridge([{"seq": 2, "message": "返事"}], status="hungup")
