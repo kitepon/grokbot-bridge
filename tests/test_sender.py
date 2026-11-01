@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import asyncio
 import sys
 import tempfile
 import unittest
@@ -17,6 +18,7 @@ from call_bridge.auth import OPEN, Principal  # noqa: E402
 from call_bridge.db import CallStore  # noqa: E402
 from call_bridge.deliver import dispatch_send  # noqa: E402
 from call_bridge import server  # noqa: E402
+from call_bridge import local  # noqa: E402
 from call_bridge.sender import PREFACE, utf16_code_units, with_sender_preface  # noqa: E402
 
 
@@ -246,6 +248,50 @@ class SenderTests(unittest.TestCase):
         result = dispatch_send(self.store, session["session_id"], "member", "確認しました")
         self.assertEqual(result["message"], "確認しました")
         self.assertNotIn("オーナー本人", result["message"])
+
+    def test_legacy_local_input_uses_authenticated_connection_name(self) -> None:
+        session = self.store.open_session("old-client", "Unverified label", "ラピ", member_id="rapi-agent")
+        principal = Principal(name="local-macbook", system="local")
+        with mock.patch.object(server, "store", self.store):
+            sent = server._send(principal, session["session_id"], "local", "本文", False)
+            blank = server._send(principal, session["session_id"], "local", "空欄", False, "", None)
+            spoofed = server._send(principal, session["session_id"], "local", "別所属", False, None, "BellTeam")
+            unbound = server._send(OPEN, session["session_id"], "local", "匿名", False)
+        self.assertNotIn("error", sent, sent)
+        self.assertTrue(sent["message"].startswith(PREFACE.format(team="ローカル", name="local-macbook")))
+        self.assertNotIn("Unverified label", sent["message"])
+        self.assertEqual(blank["error"], "rejected")
+        self.assertEqual(spoofed["error"], "forbidden")
+        self.assertEqual(unbound["error"], "rejected")
+        self.assertEqual(self.store.session_info(session["session_id"])["message_count"], 1)
+
+    def test_legacy_grokbot_input_resolves_session_caller_in_directory(self) -> None:
+        session = self.store.open_session("rapi-agent", "Unverified label", "ラピ", member_id="other", local_system="grokbot")
+        missing = self.store.open_session("not-registered", "ラピ", "ラピ", member_id="other", local_system="grokbot")
+        principal = Principal(name="grokbot", system="grokbot")
+        with mock.patch.object(server, "store", self.store):
+            sent = server._send(principal, session["session_id"], "local", "本文", False)
+            rejected = server._send(principal, missing["session_id"], "local", "偽装", False)
+        self.assertNotIn("error", sent, sent)
+        self.assertTrue(sent["message"].startswith(PREFACE.format(team="GrokBot", name="ラピ")))
+        self.assertEqual(rejected["error"], "rejected")
+        self.assertEqual(self.store.session_info(missing["session_id"])["message_count"], 0)
+
+    def test_local_wrapper_preserves_explicit_blank_sender(self) -> None:
+        with mock.patch.object(local, "_follow_speaker", new_callable=mock.AsyncMock, return_value=None), \
+             mock.patch.object(local, "_remote_tool", new_callable=mock.AsyncMock, return_value={}) as remote:
+            asyncio.run(local.call_send("test", "local", "本文", False, "", ""))
+        self.assertEqual(remote.call_args.args[1]["sender_name"], "")
+        self.assertEqual(remote.call_args.args[1]["sender_team"], "")
+
+    def test_explicit_blank_fields_are_rejected_for_bound_callers(self) -> None:
+        from call_bridge.sender import resolve_sender
+
+        for principal in (Principal(name="local-macbook", system="local"),
+                          Principal(name="approval-box", system="local", id="approval-box")):
+            for name, team in (("", None), ("  ", None), ("approval-box", ""), ("approval-box", "  ")):
+                with self.subTest(principal=principal, name=name, team=team):
+                    self.assertEqual(resolve_sender(principal, name, team)["error"], "rejected")
 
 
 if __name__ == "__main__":

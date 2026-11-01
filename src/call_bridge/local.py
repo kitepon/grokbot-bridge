@@ -1555,7 +1555,7 @@ async def call_adopt(session_id: str, ctx: Context | None = None) -> dict[str, A
 
 @mcp.tool(description="通話へメッセージを送る。call_directory で相手を選び、call_open で開いた通話へ、"
                       "GrokBot にも BellTeam にも直接届く。"
-                      "local として送る時は sender_name が必要。所属は、橋の接続トークンに結び付いていればそのチームになり、"
+                      "local として送る時は sender_name を指定する。省略時は橋が所属付き接続の登録名か発信者IDの電話帳名で補完する。空欄は拒否する。所属は、橋の接続トークンに結び付いていればそのチームになり、"
                       "別のチームは拒否する。結び付いていない接続では sender_team も必要。"
                       "本文の冒頭に、オーナー本人ではなくそのチームのその人からだと付く。"
                       "返信不要なら reply_required=false。"
@@ -1568,9 +1568,9 @@ async def call_send(session_id: str, from_party: Literal["local", "member"], mes
         "session_id": session_id, "from_party": from_party,
         "message": message, "reply_required": reply_required,
     }
-    if sender_name:
+    if sender_name is not None:
         arguments["sender_name"] = sender_name
-    if sender_team:
+    if sender_team is not None:
         arguments["sender_team"] = sender_team
     result = await _remote_tool("call_send", arguments)
     return {**result, **extra} if extra else result

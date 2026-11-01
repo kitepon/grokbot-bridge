@@ -18,7 +18,7 @@ BellTeam宛ての開始例。`member_name`は名前またはBot IDを指定で�
 
 `call_open`のあと`call_send(session_id, from_party="local", message="...")`で着信させる。BellTeam宛ての`call_open`だけでは相手Botを起こさない。返信は相手Botが同じ`session_id`へ`from_party="member"`で送る。BellTeam発信の通話ではブリッジが返信を発信Botへ渡す。GrokBot発信者と一般のローカルAIは`call_poll(party="local")`で返信を読む。ローカルCodexの既存の自動配送はそのまま使える。
 
-GrokBot宛ても BellTeam 宛てと同じく、`call_directory` で相手を選び、`call_open` で開き、`call_send` で直接届く。GrokBot の本文は橋に保存され、箱の中の配達役が相手の席へ `sendPrompt` で届ける。届いた文はオーナー名義に見えるので、本文の冒頭に「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」が付く。`call_send` の `sender_name` は必須で、所属は接続のトークンに結び付いていればそのチームになる。GrokBot の AI がレート制限中でも、電話帳、BellTeam 宛ての直通、保存済み返信の取得は独立して動く。配達役の `submitted` と BellTeam の受付は、相手 Bot の読了を示さない。
+GrokBot宛ても BellTeam 宛てと同じく、`call_directory` で相手を選び、`call_open` で開き、`call_send` で直接届く。GrokBot の本文は橋に保存され、箱の中の配達役が相手の席へ `sendPrompt` で届ける。届いた文はオーナー名義に見えるので、本文の冒頭に「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」が付く。`call_send` では `sender_name` を指定し、所属は接続のトークンに結び付いていればそのチームになる。GrokBot の AI がレート制限中でも、電話帳、BellTeam 宛ての直通、保存済み返信の取得は独立して動く。配達役の `submitted` と BellTeam の受付は、相手 Bot の読了を示さない。
 
 予備として、橋の `CALL_BRIDGE_GROKBOT_DELIVERY=marian` のときだけ、マリアンが本文なしの `session.opened` で相手を起こし、相手は `call_poll` で本文を読む。通常の配達と同時には使わない。
 
@@ -172,7 +172,7 @@ A local coding agent (Claude Code, Codex, Cursor, …) calls either system throu
 ### GrokBot target
 
 1. **Local** opens a session (`call_open` or `POST /v0/sessions`) and gets a `session_id`. Nothing is posted yet; `wake.status` is `skipped`.
-2. **Local** `call_send` requires `sender_name`. When the bearer token is bound to a system, `sender_team` is that system and a different team is rejected. When the token also names a caller id, GrokBot and BellTeam take the display name from the phone book. A local token takes the name registered on that token, because local ids are not in the phone book. A different name is rejected. The stored text starts with 「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」. In the default `courier` mode the bridge saves the text and returns `delivery.status=queued`. The box courier claims it, POSTs `sendPrompt`, and reports `submitted`, `failed`, or `unknown` through `call_receipt`. `unknown` is not sent again. `CALL_BRIDGE_GROKBOT_DELIVERY=marian` instead rings with `session.opened` (no message body) when the member has nothing unread; a failed ring does not store the text.
+2. **Local** `call_send` accepts `sender_name`. When the bearer token is bound to a system, `sender_team` is that system and a different team is rejected. When the token also names a caller id, GrokBot and BellTeam take the display name from the phone book. A local token takes the name registered on that token, because local ids are not in the phone book. A different name is rejected. The stored text starts with 「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」. In the default `courier` mode the bridge saves the text and returns `delivery.status=queued`. The box courier claims it, POSTs `sendPrompt`, and reports `submitted`, `failed`, or `unknown` through `call_receipt`. `unknown` is not sent again. `CALL_BRIDGE_GROKBOT_DELIVERY=marian` instead rings with `session.opened` (no message body) when the member has nothing unread; a failed ring does not store the text.
 3. **GrokBot member** receives the prompt directly in courier mode. `call_poll(party="member")` still returns the stored copy, including the reply hint when `reply_required=true`. The member's `call_send(from_party="member")` stores the reply. If the caller is a BellTeam Bot, the bridge also delivers that reply through BellTeam's UNIX socket.
 4. Either side (or ops) calls `call_hangup`.
 
@@ -191,13 +191,15 @@ When a real MCP or REST request finds the directory unix socket unreachable (`un
 
 `link` is `directory`. At most one of these wakes is sent per 60 seconds, in-process, with no background poll. `call_directory` uses its fallback and adds a note that the GrokBot box link is down, unless the box courier has pushed a fresh book. A GrokBot-targeted `call_send` that cannot resolve the member returns that note without storing. In `marian` mode, if fallback profiles provide an ID, it still rings with `session.opened` after the `bridge.link_down` wake. A failed ring does not send `bridge.link_down`. BellTeam delivery uses its separate UNIX socket. The bridge does not call the gateway; only the courier on the box does, and it reads `gateway.json` there.
 
-`call_send(from_party="local")`は宛先の所属で配送先を選ぶ。送り手の名前は必須で、所属は接続のトークンに結び付いていればそのチームを使う。本文の冒頭に、オーナー本人ではなくそのチームのその人からだという一文が付く。GrokBot宛ては本文を橋に保存し、箱の配達役が `sendPrompt` で直接届ける（`delivery.status=queued`。結果は `call_receipt`）。`CALL_BRIDGE_GROKBOT_DELIVERY=marian` のときだけ、相手に未読がなければマリアンの Webhook へ本文なしの `session.opened` を送って起こす（HTTP 2xx で受付確認後に保存する）。BellTeam宛ては BellTeam の UNIX ソケットへ直接送る。受付結果が不明なら `delivery.status=unknown` で保存し、二重配送を避けるため自動再送しない。保存する本文には同じ `session_id` での返信案内を付けるが、BellTeam へ渡す本文には返信案内を付けない（送り手の一文はどちらにも付く）。`from_party="member"` の返信は保存し、BellTeam 発信者宛てだけは同じ UNIX ソケットへも届ける。返信不要の通知には `reply_required=false` を指定する。MCP と REST は同じ動作を使う。返信依頼は相手への指示であり、返答を保証しない。
+`call_send(from_party="local")`は宛先の所属で配送先を選ぶ。送り手の名前を指定し、所属は接続のトークンに結び付いていればそのチームを使う。本文の冒頭に、オーナー本人ではなくそのチームのその人からだという一文が付く。GrokBot宛ては本文を橋に保存し、箱の配達役が `sendPrompt` で直接届ける（`delivery.status=queued`。結果は `call_receipt`）。`CALL_BRIDGE_GROKBOT_DELIVERY=marian` のときだけ、相手に未読がなければマリアンの Webhook へ本文なしの `session.opened` を送って起こす（HTTP 2xx で受付確認後に保存する）。BellTeam宛ては BellTeam の UNIX ソケットへ直接送る。受付結果が不明なら `delivery.status=unknown` で保存し、二重配送を避けるため自動再送しない。保存する本文には同じ `session_id` での返信案内を付けるが、BellTeam へ渡す本文には返信案内を付けない（送り手の一文はどちらにも付く）。`from_party="member"` の返信は保存し、BellTeam 発信者宛てだけは同じ UNIX ソケットへも届ける。返信不要の通知には `reply_required=false` を指定する。MCP と REST は同じ動作を使う。返信依頼は相手への指示であり、返答を保証しない。
 
 `call_send` の通常送信の引数例：
 
 ```json
 {"session_id":"...","from_party":"local","message":"状況を教えてください","sender_name":"Cursor","sender_team":"ローカル"}
 ```
+
+旧クライアントが `sender_name` を省略した場合、所属に結び付いた接続だけを補完する。localはトークンの登録名（例：`local-macbook`）、GrokBot/BellTeamはその通話の `local_id` の電話帳名を使う。通話の自由入力 `local_label` は本人名の根拠にしない。明示した空欄、名前を解決できない接続、所属のない匿名接続は拒否する。memberの返信は従来どおり名前を要しない。利用中の旧MCPを強制再起動する必要はない。
 
 トークンが所属に結び付いている接続では `sender_team` を省ける。省いた値は、その所属（GrokBot / BellTeam / ローカル）になる。別のチームを渡すと拒否する。
 
@@ -338,7 +340,7 @@ Grok Bot member ──call_send──▶ grokbot-bridge (reply stored for the lo
 |------|------|
 | `call_directory` | Phone book, built on that call from live seat profiles. Use it to choose who to open |
 | `call_open` | Create session (local → member). Does not wake anyone |
-| `call_send` | Deliver to that member. GrokBot goes to the box courier; BellTeam uses its UNIX socket. Local sends require `sender_name` (and `sender_team` when the token is not bound). A member reply is stored and is also delivered by UNIX socket when the caller is in BellTeam. Notices use `reply_required=false` |
+| `call_send` | Deliver to that member. GrokBot goes to the box courier; BellTeam uses its UNIX socket. Local sends accept `sender_name` (and require `sender_team` when the token is not bound). A member reply is stored and is also delivered by UNIX socket when the caller is in BellTeam. Notices use `reply_required=false` |
 | `call_poll` | Fetch new messages for your party |
 | `call_list` | List / filter sessions |
 | `call_hangup` | End the call |

@@ -26,6 +26,7 @@ from .db import CallStore
 from .deliver import dispatch_send
 from .directory import (
     DIRECTORY_HOP_HEADER,
+    member_display_name,
     resolve_bellteam_member,
     resolve_member_agent_id,
     search_directory,
@@ -48,7 +49,7 @@ BellTeam宛ては member_system="bellteam"。member_name は名前か Bot ID。
 BellTeamのBotが発信する時は local_system="bellteam"、local_id は自身の Bot ID。
 
 接続のトークンが所属に結び付いている時は、その所属（BellTeamは Bot ID まで）の当事者としてだけ操作できる。違えば error=forbidden。
-local の call_send には送り手の名前が要る。所属は、トークンに結び付いている時はそのチームを使い、空欄や別のチームは拒否する。結び付いていない接続では所属の入力も要る。トークンが発信者の id まで持っている時は、GrokBot と BellTeam では名前は電話帳の名前、local ではトークンに登録された名前になる。別の名前は拒否する。
+local の call_send は送り手の名前を指定する。旧クライアントが名前を省略した場合、所属付きの接続ではlocalはトークンの登録名、GrokBot/BellTeamは通話の発信者IDの電話帳名を使う。空の名前は拒否する。所属は、トークンに結び付いている時はそのチームを使い、空欄や別のチームは拒否する。結び付いていない接続では所属の入力も要る。トークンが発信者の id まで持っている時は、GrokBot と BellTeam では名前は電話帳の名前、local ではトークンに登録された名前になる。別の名前は拒否する。
 本文の冒頭には「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」が付く。届いた文がオーナー名義に見えても、本人ではない。
 
 ## 流れ
@@ -210,7 +211,7 @@ def _open(
     description=(
         "通話へメッセージを送る。call_directory で相手を選び、call_open で開いた session_id に対して使う。"
         "GrokBot宛てもBellTeam宛ても、この送信でその相手へ直接届く。"
-        "local として送る時は sender_name が必要。所属（sender_team）は、接続のトークンに結び付いていればそのチームになり、空欄や別のチームは拒否する。結び付いていない接続では sender_team も必要。"
+        "local として送る時は sender_name を指定する。省略時は所属付き接続の登録名か発信者IDの電話帳名で補完し、空欄は拒否する。所属（sender_team）は、接続のトークンに結び付いていればそのチームになり、空欄や別のチームは拒否する。結び付いていない接続では sender_team も必要。"
         "本文の冒頭に、オーナー本人ではなくそのチームのその人からのメッセージである旨が付く。"
         "返信不要なら reply_required=false。"
         "GrokBot宛ての delivery.status は、箱の配達役が受け取る前は queued。sendPrompt の結果は call_info の grokbot_delivery に出る。"
@@ -231,6 +232,14 @@ def _send(principal: Principal, session_id: str, from_party: str, message: str,
     if denied:
         return denied
     if from_party == "local":
+        # Old loaded MCP clients cannot send the new fields; use authenticated identity only.
+        if sender_name is None and not principal.unrestricted and not principal.id:
+            if principal.system == "local":
+                sender_name = principal.name
+            elif principal.system in ("grokbot", "bellteam"):
+                sess = store.get_session(session_id)
+                if sess:
+                    sender_name = member_display_name(principal.system, sess["local_id"])
         resolved = resolve_sender(principal, sender_name, sender_team)
         if resolved.get("error"):
             return resolved
