@@ -74,7 +74,7 @@ class CourierWatchTest(unittest.TestCase):
         with mock.patch.object(server, 'AUTH', Authenticator('', str(tokens))), \
              mock.patch.object(server, 'store', self.store), \
              mock.patch.object(watch, 'watch', new=mock.AsyncMock()), \
-             mock.patch.object(watch.time, 'time', return_value=1200), \
+             mock.patch.object(watch, 'time', mock.Mock(time=mock.Mock(return_value=1200))), \
              mock.patch.object(server, 'store_directory_push', return_value={'ok': True}), \
              mock.patch.object(server, 'search_directory', return_value={'ok': True, 'members': []}):
             with TestClient(app) as client:
@@ -117,7 +117,7 @@ class CourierWatchTest(unittest.TestCase):
                 count += 1
                 if count == 4:
                     raise asyncio.CancelledError
-            with mock.patch.object(watch.time, 'time', side_effect=lambda: next(ticks)), \
+            with mock.patch.object(watch, 'time', mock.Mock(time=mock.Mock(side_effect=lambda: next(ticks)))), \
                  mock.patch.object(watch.asyncio, 'sleep', side_effect=sleep), \
                  mock.patch.object(watch, 'notify', side_effect=OSError('private-key')) as notify:
                 with self.assertLogs(watch.log, level='ERROR') as logs:
