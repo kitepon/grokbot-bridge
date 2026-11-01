@@ -211,6 +211,14 @@ When a real MCP or REST request finds the directory unix socket unreachable (`un
 
 REST の `POST /v0/sessions/{session_id}/messages` でも同じ項目を渡せる。
 
+### 配達役の途絶通知（任意）
+
+`CALL_BRIDGE_COURIER_WAKE_WEBHOOK_URL` と `CALL_BRIDGE_COURIER_WAKE_WEBHOOK_KEY` の両方を、1Passwordなどから実行時の環境へ渡すと有効になる。キーは `Bearer ` を付けない値で渡す。未設定、または `CALL_BRIDGE_GROKBOT_DELIVERY=marian` の時は通知しない。
+
+courier専用トークンによる `inflight` / `claim` / `directory` の正常な問い合わせが5分途絶えると、10秒間隔の監視が一度だけPOSTする。ヘッダーは `Authorization: Bearer <キー>`、本文は `{"event":"courier_silent","last_seen":"<UTC ISO時刻>"}`。有効化後まだ問い合わせが無い場合は5分の猶予を置き、`last_seen` は `null`。他メンバーの通信や失敗応答は生存判定に使わない。
+
+最終問い合わせと通知済み状態は既存SQLiteに保存し、橋が再起動しても同じ途絶について通知を重ねない。送信の失敗・結果不明でも、正常問い合わせが戻るまでは再送しない。マリアン方式への切替は行わない。橋自身や送信経路が停止中の場合は通知を送れない。通知済みを記録した直後、POSTの前に橋が停止した場合も再送しない。
+
 ### Retrying a failed GrokBot call_open
 
 When the directory UNIX link is down and the fallback cannot resolve a nonempty
