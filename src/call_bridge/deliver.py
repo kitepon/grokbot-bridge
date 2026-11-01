@@ -1,17 +1,21 @@
 """Deliver a local party's call_send.
 
-A local ``call_send`` to a GrokBot member stores the text in the bridge and
-rings the member through Marian's webhook (``session.opened``, no message
-body). Marian only passes the MCP URL and ``session_id``; the member reads the
-text with ``call_poll``. While an earlier message is still unread a ring is
-already outstanding, so further sends are stored without another ring until
-``CALL_BRIDGE_RERING_SECONDS`` has passed. A needed ring that does not return
-HTTP 2xx fails the send and nothing is stored. Member sends are stored and not
-forwarded.
+GrokBot delivery is selected with ``CALL_BRIDGE_GROKBOT_DELIVERY``:
 
-This path does not call the host gateway ``deliverAgentMessage``. A down
-directory unix socket still posts ``bridge.link_down`` from the directory
-read, before the ring.
+* ``courier`` (default) stores the text and leaves it for the box courier.
+  The courier POSTs the gateway ``sendPrompt`` on the box and reports the
+  outcome with ``call_receipt``. Nothing is sent to Marian.
+* ``marian`` keeps the previous ring: store the text and POST ``session.opened``
+  with no message body when the member has nothing unread. The member reads
+  the text with ``call_poll``. A needed ring that does not return HTTP 2xx
+  fails the send and nothing is stored.
+
+Every local message, GrokBot or BellTeam, gets the sender preface first.
+BellTeam still goes out through its UNIX socket. A down directory unix socket
+still posts ``bridge.link_down`` from the directory read, except when a fresh
+courier push already supplied the book.
+
+This path does not call the host gateway ``deliverAgentMessage``.
 """
 
 from __future__ import annotations
@@ -21,14 +25,23 @@ import os
 from datetime import datetime, timezone
 from typing import Any
 
+from .bellteam import BellTeamError, BellTeamOutcomeUnknown, message_payload, reply_payload, send_delivery
 from .db import CallStore
 from .directory import resolve_member_agent_id
-from .bellteam import BellTeamError, BellTeamOutcomeUnknown, message_payload, reply_payload, send_delivery
+from .sender import with_sender_preface
 from .wake import notify_ring
 
 log = logging.getLogger("call_bridge.deliver")
 
 DEFAULT_RERING_SECONDS = 600
+
+
+def grokbot_delivery_mode() -> str:
+    """``courier`` delivers by sendPrompt. ``marian`` is the ring fallback."""
+    raw = os.environ.get("CALL_BRIDGE_GROKBOT_DELIVERY", "courier").strip().lower()
+    if raw in ("courier", "marian"):
+        return raw
+    return "courier"
 
 
 def _rering_seconds() -> float:
@@ -65,15 +78,27 @@ def dispatch_send(
     from_party: str,
     message: str,
     reply_required: bool = True,
+    sender_name: str | None = None,
+    sender_team: str | None = None,
 ) -> dict[str, Any]:
-    """Send a message. Local sends ring the member via Marian; member sends only store.
+    """Send a message. Local sends name the sender, then deliver.
 
     Raises ``KeyError`` / ``ValueError`` / ``RuntimeError`` the same way
-    ``CallStore.send_message`` does. Directory and ring failures return
-    an ``error`` dict and do not store the local message.
+    ``CallStore.send_message`` does. A missing sender, an unknown member,
+    or a failed Marian ring returns an ``error`` dict and does not store
+    the local message. Courier mode stores first and returns ``queued``.
     """
     if from_party not in ("local", "member"):
         raise ValueError("from_party must be 'local' or 'member'")
+    if from_party == "local":
+        name = (sender_name or "").strip()
+        team = (sender_team or "").strip()
+        if not name or not team:
+            return {
+                "error": "rejected",
+                "detail": "sender_name and sender_team are required",
+            }
+        message = with_sender_preface(message, team, name)
     if from_party != "local":
         stored = store.send_message(session_id, from_party, message, reply_required)
         sess = store.get_session(session_id)
@@ -129,6 +154,16 @@ def dispatch_send(
         if isinstance(note, str) and note:
             failure["note"] = note
         return failure
+
+    if grokbot_delivery_mode() == "courier":
+        stored = store.send_message(
+            session_id, "local", message, reply_required, grokbot_outbox=True
+        )
+        stored["delivery"] = {
+            "status": "queued",
+            "detail": "the box courier will deliver this directly",
+        }
+        return stored
 
     if not _ring_needed(store.unread_by_member(session_id)):
         stored = store.send_message(session_id, "local", message, reply_required)

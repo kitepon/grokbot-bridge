@@ -9,7 +9,8 @@ call-bridge as ``/run/dirlive/dirlive.sock`` (``CALL_BRIDGE_DIRECTORY_UNIX``;
 the parent directory ``/run/dirlive`` is the mount, so a new socket inode
 is visible without recreating the container).
 ``CALL_BRIDGE_DIRECTORY_URL`` is only the HTTP fallback.
-No cron, no Marian sync, and no push after a role edit.
+No cron and no post-edit push from this process. The box courier can also
+POST the same book to the bridge, which uses it when this socket is down.
 
 Env:
   CALL_BRIDGE_AGENTS_ROOT     profile tree (else ``/home/box/agent-data/agents``)

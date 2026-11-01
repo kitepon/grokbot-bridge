@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import sqlite3
 import threading
 import uuid
@@ -17,10 +19,20 @@ _lock = threading.RLock()
 # conversation began a turn on it, fetched = the conversation polled it itself,
 # relaunched = handed to a new task because the bound conversation was stopped.
 RECEIPT_STATES = ("submitted", "started", "fetched", "relaunched", "failed", "unknown")
+# submitted = sendPrompt accepted. failed = the gateway refused it.
+# unknown = the request may have been accepted; do not send it again.
+GROKBOT_DELIVERY_STATES = ("queued", "inflight", "submitted", "failed", "unknown")
+GROKBOT_DELIVERY_MAX_ATTEMPTS = 3
 
 
 def _utcnow() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def delivery_nonce(session_id: str, seq: int) -> str:
+    """Stable sendPrompt clientNonce for one stored message. Not a secret."""
+    digest = hashlib.sha256(f"{session_id}:{seq}".encode()).hexdigest()[:32]
+    return f"call-bridge-{digest}"
 
 
 def message_with_reply_request(session_id: str, message: str, reply_required: bool) -> str:
@@ -102,6 +114,22 @@ class CallStore:
                     PRIMARY KEY (session_id, seq),
                     FOREIGN KEY(session_id) REFERENCES sessions(session_id)
                 );
+
+                CREATE TABLE IF NOT EXISTS grokbot_outbox (
+                    session_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    nonce TEXT NOT NULL,
+                    state TEXT NOT NULL,
+                    claim_token TEXT,
+                    courier_id TEXT,
+                    detail TEXT,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    claimed_at TEXT,
+                    updated_at TEXT NOT NULL,
+                    PRIMARY KEY (session_id, seq),
+                    FOREIGN KEY(session_id) REFERENCES sessions(session_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_grokbot_outbox_state ON grokbot_outbox(state);
                 """
             )
             columns = {row[1] for row in conn.execute("PRAGMA table_info(sessions)")}
@@ -179,7 +207,12 @@ class CallStore:
             return [dict(r) for r in rows]
 
     def send_message(
-        self, session_id: str, from_party: str, message: str, reply_required: bool = True
+        self,
+        session_id: str,
+        from_party: str,
+        message: str,
+        reply_required: bool = True,
+        grokbot_outbox: bool = False,
     ) -> dict[str, Any]:
         if from_party not in ("local", "member"):
             raise ValueError("from_party must be 'local' or 'member'")
@@ -207,6 +240,15 @@ class CallStore:
                 """,
                 (session_id, seq, from_party, message, now),
             )
+            if grokbot_outbox and from_party == "local":
+                conn.execute(
+                    """
+                    INSERT INTO grokbot_outbox (
+                        session_id, seq, nonce, state, attempts, updated_at
+                    ) VALUES (?, ?, ?, 'queued', 0, ?)
+                    """,
+                    (session_id, seq, delivery_nonce(session_id, seq), now),
+                )
             new_status = "open" if sess["status"] == "ringing" else sess["status"]
             conn.execute(
                 "UPDATE sessions SET status = ?, updated_at = ? WHERE session_id = ?",
@@ -316,6 +358,16 @@ class CallStore:
                 """,
                 (by_party, reason, now, session_id),
             )
+            # A queued prompt has not been handed to sendPrompt. Drop it.
+            # An inflight claim may already have been sent; leave it for the receipt.
+            conn.execute(
+                """
+                UPDATE grokbot_outbox
+                SET state = 'failed', detail = 'session hung up before delivery', updated_at = ?
+                WHERE session_id = ? AND state = 'queued'
+                """,
+                (now, session_id),
+            )
         return self.get_session(session_id)  # type: ignore[return-value]
 
     def session_info(self, session_id: str) -> dict[str, Any]:
@@ -333,6 +385,7 @@ class CallStore:
             "message_count": count["c"],
             "max_seq": count["max_seq"],
             "local_delivery": self.receipts(session_id),
+            "grokbot_delivery": self.grokbot_deliveries(session_id),
         }
 
     def record_receipt(self, session_id: str, seq: int, state: str,
@@ -360,6 +413,172 @@ class CallStore:
             )
         return {"session_id": session_id, "seq": seq, "state": state, "detail": detail,
                 "conversation": conversation, "updated_at": now}
+
+    def grokbot_outbox_row(self, session_id: str, seq: int) -> dict[str, Any] | None:
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM grokbot_outbox WHERE session_id = ? AND seq = ?",
+                (session_id, seq),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def grokbot_deliveries(self, session_id: str) -> list[dict[str, Any]]:
+        """Public delivery state. No claim token and no nonce."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT seq, state, detail, attempts, updated_at
+                FROM grokbot_outbox WHERE session_id = ? ORDER BY seq
+                """,
+                (session_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def claim_grokbot_deliveries(
+        self, courier_id: str, limit: int = 1, member_id: str | None = None
+    ) -> list[dict[str, Any]]:
+        """Take queued GrokBot prompts for one courier. A second claim does not see them.
+
+        The returned prompt is the stored body (preface already included).
+        ``claim_token`` is required to report the outcome. The nonce is stable
+        for this session and seq.
+        """
+        if limit < 1:
+            return []
+        with self._conn() as conn:
+            params: list[Any] = []
+            member_clause = ""
+            if member_id is not None:
+                member_clause = " AND s.member_id = ?"
+                params.append(member_id)
+            params.append(limit)
+            rows = conn.execute(
+                f"""
+                SELECT o.session_id, o.seq, o.nonce, m.body AS prompt,
+                       s.member_id AS agent_id, s.member_name
+                FROM grokbot_outbox o
+                JOIN messages m ON m.session_id = o.session_id AND m.seq = o.seq
+                JOIN sessions s ON s.session_id = o.session_id
+                WHERE o.state = 'queued' AND s.status != 'hungup'
+                  AND s.member_system = 'grokbot' AND m.from_party = 'local'
+                  {member_clause}
+                ORDER BY m.created_at ASC
+                LIMIT ?
+                """,
+                params,
+            ).fetchall()
+            claimed: list[dict[str, Any]] = []
+            now = _utcnow()
+            for row in rows:
+                token = str(uuid.uuid4())
+                updated = conn.execute(
+                    """
+                    UPDATE grokbot_outbox
+                    SET state = 'inflight', claim_token = ?, courier_id = ?,
+                        claimed_at = ?, updated_at = ?, attempts = attempts + 1
+                    WHERE session_id = ? AND seq = ? AND state = 'queued'
+                    """,
+                    (token, courier_id, now, now, row["session_id"], row["seq"]),
+                )
+                if updated.rowcount != 1:
+                    continue
+                claimed.append({
+                    "session_id": row["session_id"],
+                    "seq": int(row["seq"]),
+                    "nonce": row["nonce"],
+                    "claim_token": token,
+                    "agent_id": row["agent_id"],
+                    "member_name": row["member_name"],
+                    "prompt": row["prompt"],
+                })
+            return claimed
+
+    def inflight_grokbot_deliveries(self, courier_id: str) -> list[dict[str, Any]]:
+        """This courier's claims that do not yet have a terminal receipt."""
+        with self._conn() as conn:
+            rows = conn.execute(
+                """
+                SELECT o.session_id, o.seq, o.nonce, o.claim_token, m.body AS prompt,
+                       s.member_id AS agent_id, s.member_name
+                FROM grokbot_outbox o
+                JOIN messages m ON m.session_id = o.session_id AND m.seq = o.seq
+                JOIN sessions s ON s.session_id = o.session_id
+                WHERE o.state = 'inflight' AND o.courier_id = ?
+                ORDER BY o.claimed_at ASC
+                """,
+                (courier_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def finish_grokbot_delivery(
+        self,
+        session_id: str,
+        seq: int,
+        claim_token: str,
+        state: str,
+        detail: str | None = None,
+        retryable: bool = False,
+    ) -> dict[str, Any]:
+        """Record sendPrompt's outcome. The same claim token may report twice.
+
+        ``failed`` with ``retryable`` goes back to the queue until
+        ``GROKBOT_DELIVERY_MAX_ATTEMPTS``. ``unknown`` and ``submitted`` stay
+        finished so a later claim cannot send the prompt again.
+        """
+        if state not in ("submitted", "failed", "unknown"):
+            raise ValueError("state must be submitted, failed, or unknown")
+        if not isinstance(claim_token, str) or not claim_token:
+            raise ValueError("claim_token is required")
+        safe_detail = None if detail is None else " ".join(str(detail).split())[:180]
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT * FROM grokbot_outbox WHERE session_id = ? AND seq = ?",
+                (session_id, seq),
+            ).fetchone()
+            if row is None:
+                raise ValueError("seq is not a grokbot delivery of this session")
+            current = row["claim_token"] or ""
+            if not current or not hmac.compare_digest(current, claim_token):
+                raise ValueError("claim_token does not match")
+            if row["state"] in ("submitted", "unknown", "failed"):
+                if row["state"] != state:
+                    raise ValueError("delivery already finished")
+                return {
+                    "session_id": session_id,
+                    "seq": seq,
+                    "state": row["state"],
+                    "detail": row["detail"],
+                    "updated_at": row["updated_at"],
+                }
+            if row["state"] != "inflight":
+                raise ValueError("delivery is not awaiting a receipt")
+            now = _utcnow()
+            new_state = state
+            new_token: str | None = claim_token
+            new_courier = row["courier_id"]
+            if (
+                state == "failed"
+                and retryable
+                and int(row["attempts"]) < GROKBOT_DELIVERY_MAX_ATTEMPTS
+            ):
+                new_state = "queued"
+                new_token = None
+                new_courier = None
+            conn.execute(
+                """
+                UPDATE grokbot_outbox
+                SET state = ?, claim_token = ?, courier_id = ?, detail = ?, updated_at = ?
+                WHERE session_id = ? AND seq = ?
+                """,
+                (new_state, new_token, new_courier, safe_detail, now, session_id, seq),
+            )
+        return {
+            "session_id": session_id,
+            "seq": seq,
+            "state": new_state,
+            "detail": safe_detail,
+            "updated_at": now,
+        }
 
     def receipts(self, session_id: str) -> list[dict[str, Any]]:
         with self._conn() as conn:

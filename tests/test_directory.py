@@ -35,6 +35,8 @@ _ENV_KEYS = (
     "CALL_BRIDGE_DIRECTORY_URL_TIMEOUT",
     "CALL_BRIDGE_AGENTS_ROOT",
     "CALL_BRIDGE_DIRECTORY",
+    "CALL_BRIDGE_DIRECTORY_PUSH",
+    "CALL_BRIDGE_DIRECTORY_PUSH_MAX_AGE",
     "CALL_BRIDGE_DIRECTORY_TOKEN",
     "CALL_BRIDGE_DIRECTORY_BIND",
     "CALL_BRIDGE_DIRECTORY_PORT",
@@ -120,6 +122,7 @@ class DirectoryTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CALL_BRIDGE_AGENTS_ROOT"] = _MISSING_AGENTS
         os.environ["CALL_BRIDGE_DIRECTORY"] = _MISSING_SNAPSHOT
+        os.environ["CALL_BRIDGE_DIRECTORY_PUSH"] = "/nonexistent/call-bridge-directory.push.json"
         self._unix_servers: dict[str, ThreadingHTTPServer] = {}
 
     def tearDown(self) -> None:
@@ -621,6 +624,33 @@ class DirectoryTests(unittest.TestCase):
         )
         os.environ["CALL_BRIDGE_DIRECTORY"] = str(path)
         return path
+
+    def test_fresh_courier_push_is_used_when_the_socket_is_down(self) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        from call_bridge.directory import store_directory_push
+
+        path = Path(self._tmp()) / "push.json"
+        os.environ["CALL_BRIDGE_DIRECTORY_PUSH"] = str(path)
+        os.environ["CALL_BRIDGE_DIRECTORY_UNIX"] = str(Path(self._tmp()) / "missing.sock")
+        store_directory_push({
+            "agents_root": "/home/box/agent-data/agents",
+            "members": [{"name": "ラピ", "id": "rapi-agent", "title": "インフラ統括", "description": "役"}],
+        })
+        book = load_directory()
+        self.assertEqual(book["via"], "courier")
+        self.assertEqual(book["source"], "agent-profiles")
+        self.assertEqual(book["members"][0]["id"], "rapi-agent")
+        self.assertEqual(book["members"][0]["role"], "役")
+        self.assertNotIn("note", book)
+
+        stale = json.loads(path.read_text(encoding="utf-8"))
+        stale["pushed_at"] = (datetime.now(timezone.utc) - timedelta(seconds=600)).isoformat()
+        path.write_text(json.dumps(stale), encoding="utf-8")
+        self._write_snapshot([{"name": "スナップ", "id": "snap-1"}])
+        fallen = load_directory()
+        self.assertEqual(fallen["source"], "directory.json")
+        self.assertEqual(fallen["members"][0]["name"], "スナップ")
 
     def _serve(
         self,

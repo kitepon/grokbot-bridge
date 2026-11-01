@@ -125,6 +125,8 @@ def _entry(args: argparse.Namespace, digest: str) -> dict[str, Any]:
         entry["caller_id_header"] = True
     if args.ops:
         entry["ops"] = True
+    if args.courier:
+        entry["courier"] = True
     return entry
 
 
@@ -149,6 +151,10 @@ def issue(args: argparse.Namespace) -> None:
         raise IssueError("give --system, or --ops for an unrestricted entry")
     if args.caller_id_header and not args.system:
         raise IssueError("--caller-id-header needs --system")
+    if args.courier and args.system != "grokbot":
+        raise IssueError("--courier needs --system grokbot")
+    if args.courier and args.id:
+        raise IssueError("--courier must not set --id")
     tokens_file = Path(args.tokens_file)
     if not tokens_file.parent.is_dir():
         raise IssueError(f"directory does not exist: {tokens_file.parent}")
@@ -232,6 +238,8 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--caller-id-header", action="store_true",
                         help="let this system name the caller in X-Call-Bridge-Caller-Id")
     parser.add_argument("--ops", action="store_true", help="allow ops hangup; alone, unrestricted")
+    parser.add_argument("--courier", action="store_true",
+                        help="grokbot token that pulls deliveries and pushes the phone book; no --id")
     parser.add_argument("--out", required=True, help="file for the token (mode 600), or - for stdout")
     parser.add_argument("--format", choices=("token", "header"), default="token",
                         help="token: the token line; header: an Authorization header line")

@@ -18,7 +18,9 @@ BellTeam宛ての開始例。`member_name`は名前またはBot IDを指定で�
 
 `call_open`のあと`call_send(session_id, from_party="local", message="...")`で着信させる。BellTeam宛ての`call_open`だけでは相手Botを起こさない。返信は相手Botが同じ`session_id`へ`from_party="member"`で送る。BellTeam発信の通話ではブリッジが返信を発信Botへ渡す。GrokBot発信者と一般のローカルAIは`call_poll(party="local")`で返信を読む。ローカルCodexの既存の自動配送はそのまま使える。
 
-GrokBot宛ての本文はマリアンを通らない。本文は橋に保存し、マリアンは本文なしの着信（`session.opened`）で相手を起こすだけ。相手は`call_poll`で本文を読む。GrokBotのAIがレート制限中でも、電話帳、BellTeam宛ての直通、保存済み返信の取得は独立して動く。Webhookの2xxとBellTeamの受付は、相手Botの読了を示さない。
+GrokBot宛ても BellTeam 宛てと同じく、`call_directory` で相手を選び、`call_open` で開き、`call_send` で直接届く。GrokBot の本文は橋に保存され、箱の中の配達役が相手の席へ `sendPrompt` で届ける。届いた文はオーナー名義に見えるので、本文の冒頭に「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」が付く。`call_send` の `sender_name` は必須で、所属は接続のトークンに結び付いていればそのチームになる。GrokBot の AI がレート制限中でも、電話帳、BellTeam 宛ての直通、保存済み返信の取得は独立して動く。配達役の `submitted` と BellTeam の受付は、相手 Bot の読了を示さない。
+
+予備として、橋の `CALL_BRIDGE_GROKBOT_DELIVERY=marian` のときだけ、マリアンが本文なしの `session.opened` で相手を起こし、相手は `call_poll` で本文を読む。通常の配達と同時には使わない。
 
 ## 端末の会話が止まっている時
 
@@ -155,11 +157,13 @@ Codex のアプリの会話として新しく立てる道は、入っていな�
 
 Shared **phone-call bridge** MCP for **[Grok Bot](https://grok.x.ai/)** agent meshes (streamable HTTP).
 
-A local coding agent (Claude Code, Codex, Cursor, …) calls either system through this MCP. Calls to GrokBot use Marian's webhook. Calls to BellTeam use its UNIX socket. Member replies remain in the call history; replies to a BellTeam caller are also delivered to that Bot.
+A local coding agent (Claude Code, Codex, Cursor, …) calls either system through this MCP. Pick the person with `call_directory`, open with `call_open`, and deliver with `call_send`. GrokBot members are woken by a courier on the Grok Bot box (`sendPrompt`). BellTeam members are reached through BellTeam's UNIX socket. Member replies remain in the call history; replies to a BellTeam caller are also delivered to that Bot.
 
 ## Why
 
-- GrokBot's host gateway cannot deliver into a member's main chat (`deliverAgentMessage` lands in a box-local New Agent conversation), so a GrokBot member has to be woken by Marian. The wake is only a ring: local `call_send` stores the text in the bridge, and the member reads it with `call_poll`. Marian never carries the text.
+- `deliverAgentMessage` on the host gateway lands in a box-local New Agent conversation, so it is not used. The box courier calls `POST /api/sendPrompt` on `127.0.0.1` instead. That prompt shows up under the owner's name, so every local message starts with a fixed line naming the real sender and team.
+- The bridge runs outside the box and cannot reach `127.0.0.1` there. The courier connects outward, claims each message once, and reports the outcome with `call_receipt`. An uncertain outcome is not sent again.
+- `CALL_BRIDGE_GROKBOT_DELIVERY=marian` keeps the previous ring: the text stays in the bridge, Marian posts `session.opened` with no body, and the member reads it with `call_poll`. Leave that off while the courier is running.
 - For a BellTeam target, local `call_send` uses BellTeam's UNIX socket. A reply to a BellTeam caller also uses that socket.
 - Both routes use the same MCP endpoint and `session_id`.
 
@@ -168,8 +172,8 @@ A local coding agent (Claude Code, Codex, Cursor, …) calls either system throu
 ### GrokBot target
 
 1. **Local** opens a session (`call_open` or `POST /v0/sessions`) and gets a `session_id`. Nothing is posted yet; `wake.status` is `skipped`.
-2. **Local** `call_send` stores the text. If the member has no unread message waiting in this session, the server first POSTs `session.opened` to the switchboard with the session ID, labels, and resolved `member_agent_id`, but no message body, and **GrokBot switchboard** wakes the member with the MCP URL and `session_id`. While an earlier message is still unread, that ring is still outstanding, so further sends are stored without another ring; after `CALL_BRIDGE_RERING_SECONDS` (default 600) of an unread message the next send rings again. A needed ring that does not return HTTP 2xx, or an unset URL, returns an error without storing the message.
-3. **GrokBot member** reads the waiting text with `call_poll(party="member")`; one poll returns every unread message. The stored copy includes a reply hint when `reply_required=true`. The member's `call_send(from_party="member")` stores the reply without a webhook POST. If the caller is a BellTeam Bot, the bridge also delivers that reply through BellTeam's UNIX socket.
+2. **Local** `call_send` requires `sender_name`. When the bearer token is bound to a system, `sender_team` is that system and a different team is rejected. When the token also names a caller id, GrokBot and BellTeam take the display name from the phone book. A local token takes the name registered on that token, because local ids are not in the phone book. A different name is rejected. The stored text starts with 「これはオーナー本人ではなく、〇〇チームの〇〇からのメッセージです。」. In the default `courier` mode the bridge saves the text and returns `delivery.status=queued`. The box courier claims it, POSTs `sendPrompt`, and reports `submitted`, `failed`, or `unknown` through `call_receipt`. `unknown` is not sent again. `CALL_BRIDGE_GROKBOT_DELIVERY=marian` instead rings with `session.opened` (no message body) when the member has nothing unread; a failed ring does not store the text.
+3. **GrokBot member** receives the prompt directly in courier mode. `call_poll(party="member")` still returns the stored copy, including the reply hint when `reply_required=true`. The member's `call_send(from_party="member")` stores the reply. If the caller is a BellTeam Bot, the bridge also delivers that reply through BellTeam's UNIX socket.
 4. Either side (or ops) calls `call_hangup`.
 
 ### BellTeam target
@@ -185,24 +189,25 @@ When a real MCP or REST request finds the directory unix socket unreachable (`un
 {"event":"bridge.link_down","link":"directory","detail":"unix socket not found"}
 ```
 
-`link` is `directory`. At most one of these wakes is sent per 60 seconds, in-process, with no background poll. `call_directory` uses its fallback and adds a note that the GrokBot box link is down. A GrokBot-targeted `call_send` that cannot resolve the member returns that note without storing; if fallback profiles provide an ID, it still rings with `session.opened` after the `bridge.link_down` wake. A failed ring does not send `bridge.link_down`. BellTeam delivery uses its separate UNIX socket and does not ring Marian. `GROKBOT_GATEWAY_*` is not used.
+`link` is `directory`. At most one of these wakes is sent per 60 seconds, in-process, with no background poll. `call_directory` uses its fallback and adds a note that the GrokBot box link is down, unless the box courier has pushed a fresh book. A GrokBot-targeted `call_send` that cannot resolve the member returns that note without storing. In `marian` mode, if fallback profiles provide an ID, it still rings with `session.opened` after the `bridge.link_down` wake. A failed ring does not send `bridge.link_down`. BellTeam delivery uses its separate UNIX socket. The bridge does not call the gateway; only the courier on the box does, and it reads `gateway.json` there.
 
-`call_send(from_party="local")`は宛先の所属で配送先を選ぶ。GrokBot宛ては本文を橋に保存し、相手に未読がなければマリアンのWebhookへ本文なしの`session.opened`を送って起こす（HTTP 2xxで受付確認後に保存する）。未読が残っている間の続報は起こし直さず保存だけする。BellTeam宛てはBellTeamのUNIXソケットへ直接送る。受付結果が不明なら`delivery.status=unknown`で保存し、二重配送を避けるため自動再送しない。保存する本文には同じ`session_id`での返信案内を付けるが、BellTeamへ渡す本文には付けない。`from_party="member"`の返信は保存し、BellTeam発信者宛てだけは同じUNIXソケットへも届ける。返信不要の通知には`reply_required=false`を指定する。MCPとRESTは同じ動作を使う。返信依頼は相手への指示であり、返答を保証しない。
+`call_send(from_party="local")`は宛先の所属で配送先を選ぶ。送り手の名前は必須で、所属は接続のトークンに結び付いていればそのチームを使う。本文の冒頭に、オーナー本人ではなくそのチームのその人からだという一文が付く。GrokBot宛ては本文を橋に保存し、箱の配達役が `sendPrompt` で直接届ける（`delivery.status=queued`。結果は `call_receipt`）。`CALL_BRIDGE_GROKBOT_DELIVERY=marian` のときだけ、相手に未読がなければマリアンの Webhook へ本文なしの `session.opened` を送って起こす（HTTP 2xx で受付確認後に保存する）。BellTeam宛ては BellTeam の UNIX ソケットへ直接送る。受付結果が不明なら `delivery.status=unknown` で保存し、二重配送を避けるため自動再送しない。保存する本文には同じ `session_id` での返信案内を付けるが、BellTeam へ渡す本文には返信案内を付けない（送り手の一文はどちらにも付く）。`from_party="member"` の返信は保存し、BellTeam 発信者宛てだけは同じ UNIX ソケットへも届ける。返信不要の通知には `reply_required=false` を指定する。MCP と REST は同じ動作を使う。返信依頼は相手への指示であり、返答を保証しない。
 
 `call_send` の通常送信の引数例：
 
 ```json
-{"session_id":"...","from_party":"local","message":"状況を教えてください"}
+{"session_id":"...","from_party":"local","message":"状況を教えてください","sender_name":"Cursor","sender_team":"ローカル"}
 ```
+
+トークンが所属に結び付いている接続では `sender_team` を省ける。省いた値は、その所属（GrokBot / BellTeam / ローカル）になる。別のチームを渡すと拒否する。
 
 返信不要の通知の引数例：
 
 ```json
-{"session_id":"...","from_party":"local","message":"共有のみです","reply_required":false}
+{"session_id":"...","from_party":"local","message":"共有のみです","reply_required":false,"sender_name":"Cursor","sender_team":"ローカル"}
 ```
 
-REST の `POST /v0/sessions/{session_id}/messages` でも本文に
-`{"from_party":"local","message":"共有のみです","reply_required":false}` を渡せる。
+REST の `POST /v0/sessions/{session_id}/messages` でも同じ項目を渡せる。
 
 ### Retrying a failed GrokBot call_open
 
@@ -295,14 +300,19 @@ hook を外したり置き換えたりして他の hook の位置が動く時は
 
 現在の自動配送対象は Codex 親。Claude Code／Cursor の直接 HTTP 接続と手動 `call_poll` は従来どおり使える。
 
-GrokBot宛てだけの経路：
+GrokBot宛てだけの経路（通常。`courier`）：
 
 ```text
+Local agent ──call_directory──▶ grokbot-bridge (phone book)
 Local agent ──call_open──▶ grokbot-bridge (session only, nobody is woken)
-Local agent ──call_send──▶ grokbot-bridge (text stored) ──session.opened──▶ Marian (ring only, no message body)
-Grok Bot member ──call_poll──▶ grokbot-bridge (reads the text directly)
-Grok Bot member ──call_send──▶ grokbot-bridge (stored for the local side)
+Local agent ──call_send──▶ grokbot-bridge (text stored, sender preface added, status=queued)
+box courier ──claim──▶ grokbot-bridge
+box courier ──POST 127.0.0.1/api/sendPrompt──▶ Grok Bot member
+box courier ──call_receipt──▶ grokbot-bridge (submitted / failed / unknown)
+Grok Bot member ──call_send──▶ grokbot-bridge (reply stored for the local side)
 ```
+
+`marian` にしているときだけ、`call_send` は本文なしの `session.opened` をマリアンへ送り、相手は `call_poll` で本文を読む。配達役はそのメッセージを受け取らない。
 
 `session.opened` uses schema `grokbot.call.v0` and never carries the caller's text. The webhook secret is an `Authorization` header, never a payload field.
 
@@ -326,15 +336,15 @@ Grok Bot member ──call_send──▶ grokbot-bridge (stored for the local si
 
 | Tool | Role |
 |------|------|
-| `call_directory` | Phone book, built on that call from live seat profiles |
-| `call_open` | Create session (local → member) |
-| `call_send` | Send a message. GrokBot targets use Marian's webhook; BellTeam targets use its UNIX socket. A member reply is stored and is also delivered by UNIX socket when the caller is in BellTeam. Results can be `delivered`, `error`, or `unknown` for BellTeam delivery. Notices use `reply_required=false` |
+| `call_directory` | Phone book, built on that call from live seat profiles. Use it to choose who to open |
+| `call_open` | Create session (local → member). Does not wake anyone |
+| `call_send` | Deliver to that member. GrokBot goes to the box courier; BellTeam uses its UNIX socket. Local sends require `sender_name` (and `sender_team` when the token is not bound). A member reply is stored and is also delivered by UNIX socket when the caller is in BellTeam. Notices use `reply_required=false` |
 | `call_poll` | Fetch new messages for your party |
 | `call_list` | List / filter sessions |
 | `call_hangup` | End the call |
-| `call_info` | Session details, with `local_delivery` (what the local side did with each member message) |
+| `call_info` | Session details, `local_delivery` (what the terminal did with member messages) and `grokbot_delivery` (what the courier did with `sendPrompt`) |
 | `call_history` | Both parties' messages in order, without marking them delivered |
-| `call_receipt` | Local side reports what it did with a member message |
+| `call_receipt` | Terminal reports what it did with a member message. The box courier reports `sendPrompt` as `submitted`, `failed`, or `unknown` |
 
 Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 
@@ -342,14 +352,15 @@ Also exposes a small REST surface under `/v0` (same auth) and open `/health`.
 
 Clients only call `call_directory` (or `GET /v0/directory`). The server reads Grok Bot seat profiles and, when configured, BellTeam's directory **on that request**. Changing a profile shows up on the **next** call. Each member has `system` (`grokbot` or `bellteam`) and its existing `id`. One directory can remain available when the other fails.
 
-For GrokBot seats, the source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag. Each member built from a profile also includes `id`: the seat directory name, which is the GrokBot agent id (`profile.json` itself has no id field). A GrokBot-targeted `call_send` resolves `member_name` to that id and includes it as `member_agent_id` on the `session.opened` ring. A remote directory passes `id` or `agentId` through. A `directory.json` entry without an id cannot be relayed to GrokBot.
+For GrokBot seats, the source of truth is each seat’s **profile** (`name`, `title`, `description`) — used as-is (e.g. ラピ → title `インフラ統括`, `description` → `role`). There is **no** “may call” flag. Each member built from a profile also includes `id`: the seat directory name, which is the GrokBot agent id (`profile.json` itself has no id field). A GrokBot-targeted `call_send` resolves `member_name` to that id. The box courier sends it as `agentId`. In `marian` mode the same id is `member_agent_id` on the `session.opened` ring. A remote directory passes `id` or `agentId` through. A `directory.json` entry without an id cannot be relayed to GrokBot.
 
 Lookup order:
 
 1. **`CALL_BRIDGE_DIRECTORY_UNIX`** (preferred in production). HTTP GET over an `AF_UNIX` socket. The HTTP path is `CALL_BRIDGE_DIRECTORY_UNIX_PATH` (default `/v0/directory`). On main-server the container mounts the socket's parent directory at `/run/dirlive`, and the socket path is `/run/dirlive/dirlive.sock`.
 2. **`CALL_BRIDGE_DIRECTORY_URL`** — plain HTTP GET, only if the unix socket is unset or that GET fails.
-3. **Local profiles**, only after every configured remote GET has failed (or none is set): `CALL_BRIDGE_AGENTS_ROOT` if set and that directory exists, otherwise `/home/box/agent-data/agents` when the env var is unset and the path exists. This is for running call-bridge on the Grok Bot box itself. A copied agents tree on main-server is not the primary path.
-4. **`directory.json`** — last-resort snapshot when the remotes failed and no local profile tree is available.
+3. **Courier push** — the book the box courier last built from `profile.json` and PUT to `/v0/grokbot/directory`, while `pushed_at` is within `CALL_BRIDGE_DIRECTORY_PUSH_MAX_AGE` seconds (default 120). A fresh push does not page the operator about the unix socket.
+4. **Local profiles**, only after the remotes and the push missed: `CALL_BRIDGE_AGENTS_ROOT` if set and that directory exists, otherwise `/home/box/agent-data/agents` when the env var is unset and the path exists. This is for running call-bridge on the Grok Bot box itself. A copied agents tree on main-server is not the primary path.
+5. **`directory.json`** — last-resort snapshot when the remotes failed and no local profile tree is available.
 
 A live read reports `source: agent-profiles` and `agents_root`. A unix read also includes `directory_unix`; a URL read includes `directory_url`. The snapshot reports `source: directory.json` and does not claim to be a live profile read. If a remote was configured and failed before the snapshot was used, the response includes `directory_unix_error` and/or `directory_url_error`.
 
@@ -370,6 +381,49 @@ curl -sS -H "Authorization: Bearer $TOKEN" \
 ```
 
 `scripts/sync_directory_from_agents.py` only writes an optional `directory.json` fallback. It is not how the book stays fresh, and nothing needs to run it after a profile edit.
+
+## 箱の配達役
+
+Grok Bot のメンバーを起こす処理は、箱の中で動かす。橋（call.kitepon.dev）は箱の外にあり、箱の `127.0.0.1` には届かない。配達役は橋へ外向きに接続し、新着を1件ずつ受け取り、箱のゲートウェイ `POST http://127.0.0.1:<port>/api/sendPrompt` を叩く。`port` と `token` は箱の `/home/box/agent-data/gateway.json`（`port` と `token`。`host` が `0.0.0.0` でも接続先は `127.0.0.1`）から読む。ファイルの中身は表示しない。本文は次の形で、`clientNonce` は通話と seq から決まる同じ値を使う。
+
+```json
+{"agentId":"<席のid>","clientNonce":"<安定した値>","prompt":"<保存された本文>","automationWriteProvenance":"untrusted"}
+```
+
+結果は `call_receipt` で橋へ返す。`submitted` はゲートウェイが受け付けたこと、`failed` は届いていないこと、`unknown` は届いたか分からないこと。`unknown` は再送しない。`failed` は同じ `clientNonce` で、最大3回まで取り直す。ジャーナルは `sendPrompt` の前に書く。途中で止まったときは、呼んだかもしれないものは `unknown` として報告し、もう一度は送らない。
+
+電話帳は、配達役が席の `profile.json` を読んで橋へ渡す。橋は UNIX ソケットが届かないとき、その一覧が新しければ使う。ソケット側の `scripts/directory_live_server.py` も、要求のたびに同じプロフィールから組み立てる。どちらも手で `directory.json` を更新する必要はない。
+
+箱には cron も systemd のユーザー単位もない。常駐は tmux のセッションで行う。再起動のあとは、同じコマンドをもう一度実行する。
+
+橋側のトークンは、所属 `grokbot` に `courier: true` を付け、id は付けない（`scripts/issue_token.py --name grokbot-courier --system grokbot --courier`）。メンバー用の grokbot トークンには `courier` を付けない。そのトークンでは新着を受け取れない。トークン本体は箱のファイルに1行で置き、権限は 600 にする。コマンドラインやこの README には書かない。
+
+```bash
+# 箱。このリポジトリのディレクトリで。
+install -d -m 700 /home/box/agent-data/call-bridge-courier
+install -m 600 /dev/null /home/box/agent-data/call-bridge-courier/bridge.token
+# bridge.token に、橋の grokbot 所属トークンを1行で書く。echo は履歴に残るので使わない。
+
+export CALL_BRIDGE_URL=https://call.kitepon.dev
+export CALL_BRIDGE_TOKEN_FILE=/home/box/agent-data/call-bridge-courier/bridge.token
+python3 scripts/box_courier.py --once
+# 終了コード 0 かつログの pass ok exit=0 … pushed=1 で、橋への接続と電話帳の供給まで通っている。
+# exit=2 は橋（inflight / claim / receipt）、exit=3 は電話帳、exit=4 はその両方。
+# exit=1 は起動前（ロック、gateway.json、橋のトークン）。401 ならトークンが違う。トークンはログに出さない。
+
+tmux new-session -d -s call-bridge-courier -c "$PWD" \
+  'export CALL_BRIDGE_URL=https://call.kitepon.dev CALL_BRIDGE_TOKEN_FILE=/home/box/agent-data/call-bridge-courier/bridge.token; exec python3 scripts/box_courier.py'
+
+tmux ls
+# ログ: tmux attach -t call-bridge-courier   離れるときは Ctrl-b のあと d
+# 止める: tmux kill-session -t call-bridge-courier
+```
+
+2つ目を起動すると、ロックを持っている方だけが残り、もう一方は `another courier is already running` で終わる。
+
+橋の切替は `CALL_BRIDGE_GROKBOT_DELIVERY`。既定は `courier`。配達役を動かす前にこの版だけを置くときは `marian` にして、今の起こし方を維持する。配達役を確かめたあと `courier` にする（または変数を外す）。`marian` の間に保存したメッセージは配達役が受け取らない。`courier` で `queued` のまま残っているメッセージは、配達役が動き続けている間に届く。両方を同時に同じメッセージへは使わない。
+
+本番へ切り替える前に、箱で `--once` が通り、テスト用の1通が `call_info` の `grokbot_delivery` で `submitted` になり、同じ本文がもう一度席へ出ていないことを見る。`unknown` になったものは再送せず、通話の記録を見てから人が対応する。
 
 ## Quick start
 
@@ -402,7 +456,7 @@ Auth: `Authorization: Bearer <token>` on `/mcp` and `/v0/*` (`/health` is open).
 - `call_open` で `local_system` を省くと、所属に結び付いた接続ではその所属を使う。旧トークンと開発モードでは今までどおり `local`。
 - `caller_id_header: true` のトークンは、基盤が `X-Call-Bridge-Caller-Id` で発信者の ID を付けられる。付いた接続は、その ID の通話だけを扱える。BellTeam は Bot ごとに付ける。BellTeam トークンでヘッダーを付けない接続は、BellTeam 全体として扱う。GrokBot は1つの接続設定を共有するので所属単位。許可のないトークンにこのヘッダーがあると 403。旧トークンに付いたヘッダーは無視する。
 - `system` のない項目は全権で、`ops: true` が必要。`call_hangup(by_party="ops")` は `ops` のトークンと旧トークンだけが使える。
-- `ops`・`caller_id_header` は真偽値、`name`・`sha256`・`system`・`id` は文字列で書く。型の違い、同じ `sha256` の重複、項目0件、読めないファイル、壊れた JSON は、1行のエラーで起動を止める。
+- `ops`・`caller_id_header`・`courier` は真偽値、`name`・`sha256`・`system`・`id` は文字列で書く。`courier: true` は `system: grokbot` だけで、`id` は付けない。型の違い、同じ `sha256` の重複、項目0件、読めないファイル、壊れた JSON は、1行のエラーで起動を止める。
 - 移行中は `CALL_BRIDGE_TOKEN` も全権の旧トークンとして受け付ける。対応ファイルに項目がある間は、旧トークンが使われると5分に1回警告を記録する。`CALL_BRIDGE_TOKENS_FILE` がなければ、今までと同じ動きになる。
 
 #### 切り替え手順
@@ -490,7 +544,10 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 | `CALL_BRIDGE_DIRECTORY` | `./directory.json` | Last-resort GrokBot snapshot file |
 | `CALL_BRIDGE_BELLTEAM_SOCKET_HOST` | `./bellteam` | Host directory mounted at `/run/bellteam` in Compose |
 | `CALL_BRIDGE_BELLTEAM_UNIX` | _(unset)_ | BellTeam socket inside the container, e.g. `/run/bellteam/bellteam.sock` |
-| `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | GrokBot switchboard webhook. GrokBot-targeted local `call_send` posts `session.opened` as a ring when the member has nothing unread (no message body; an empty URL fails the send and does not store). A down GrokBot directory UNIX socket posts `bridge.link_down` at most once per 60 seconds |
+| `CALL_BRIDGE_GROKBOT_DELIVERY` | `courier` | `courier`: the box courier delivers with `sendPrompt`. `marian`: ring with `session.opened` and the member reads via `call_poll`. Do not use both for the same messages |
+| `CALL_BRIDGE_DIRECTORY_PUSH` | `data/grokbot-directory.push.json` | Phone book last pushed by the box courier |
+| `CALL_BRIDGE_DIRECTORY_PUSH_MAX_AGE` | `120` | Seconds a courier push stays usable when the unix socket is down |
+| `CALL_BRIDGE_WAKE_WEBHOOK_URL` | _(unset)_ | Switchboard webhook. Used for `bridge.link_down`, and for the `marian` ring (`session.opened`, no message body). In `marian` mode an empty URL fails the send and does not store. A down GrokBot directory UNIX socket posts `bridge.link_down` at most once per 60 seconds, unless a fresh courier push already supplied the book |
 | `CALL_BRIDGE_WAKE_WEBHOOK_AUTH` | _(unset)_ | `Authorization` header for those POSTs. Never placed in the payload |
 | `CALL_BRIDGE_RERING_SECONDS` | `600` | A local `call_send` rings again when the member's oldest unread message is at least this old |
 | `CALL_BRIDGE_PUBLIC_MCP_URL` | `https://call.kitepon.dev/mcp` | MCP URL included in `session.opened` |

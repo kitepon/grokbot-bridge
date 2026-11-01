@@ -18,7 +18,20 @@ if str(SRC) not in sys.path:
     sys.path.insert(0, str(SRC))
 
 from call_bridge.db import CallStore, message_with_reply_request  # noqa: E402
-from call_bridge.deliver import dispatch_send  # noqa: E402
+from call_bridge.deliver import dispatch_send as _dispatch_send  # noqa: E402
+from call_bridge.sender import with_sender_preface  # noqa: E402
+
+
+def dispatch_send(*args, **kwargs):
+    """Local test sends name a sender. Production rejects a blank one."""
+    if len(args) >= 3 and args[2] == "local":
+        kwargs.setdefault("sender_name", "Cursor")
+        kwargs.setdefault("sender_team", "ローカル")
+    return _dispatch_send(*args, **kwargs)
+
+
+def _headed(text: str) -> str:
+    return with_sender_preface(text, "ローカル", "Cursor")
 
 _ENV_KEYS = (
     "GROKBOT_GATEWAY_URL",
@@ -35,6 +48,8 @@ _ENV_KEYS = (
     "CALL_BRIDGE_DIRECTORY_URL_TIMEOUT",
     "CALL_BRIDGE_AGENTS_ROOT",
     "CALL_BRIDGE_DIRECTORY",
+    "CALL_BRIDGE_DIRECTORY_PUSH",
+    "CALL_BRIDGE_GROKBOT_DELIVERY",
 )
 
 _MISSING_AGENTS = "/nonexistent/call-bridge-agents-root"
@@ -116,7 +131,9 @@ class DeliverTests(unittest.TestCase):
             os.environ.pop(key, None)
         os.environ["CALL_BRIDGE_AGENTS_ROOT"] = _MISSING_AGENTS
         os.environ["CALL_BRIDGE_DIRECTORY"] = _MISSING_SNAPSHOT
+        os.environ["CALL_BRIDGE_GROKBOT_DELIVERY"] = "marian"
         self.temp = tempfile.TemporaryDirectory()
+        os.environ["CALL_BRIDGE_DIRECTORY_PUSH"] = str(Path(self.temp.name) / "no-push.json")
         self.store = CallStore(Path(self.temp.name) / "calls.sqlite")
         self.logs = _ListHandler()
         for name in ("call_bridge.deliver", "call_bridge.wake"):
@@ -138,8 +155,12 @@ class DeliverTests(unittest.TestCase):
 
         sentinel = {"delivery": {"status": "delivered", "detail": "http 204"}}
         with mock.patch.object(server, "dispatch_send", return_value=sentinel) as dispatch:
-            result = server.call_send("sess", "local", "hello", False)
-        dispatch.assert_called_once_with(server.store, "sess", "local", "hello", False)
+            result = server.call_send(
+                "sess", "local", "hello", False, sender_name="Cursor", sender_team="ローカル"
+            )
+        dispatch.assert_called_once_with(
+            server.store, "sess", "local", "hello", False, "Cursor", "ローカル"
+        )
         self.assertEqual(result, sentinel)
 
     def test_local_send_rings_without_the_body_and_stores(self) -> None:
@@ -156,7 +177,7 @@ class DeliverTests(unittest.TestCase):
         self.assertEqual(result["delivery"], {"status": "delivered", "detail": "http 204"})
         self.assertEqual(result["status"], "open")
         stored_text = message_with_reply_request(
-            session["session_id"], "状況を教えてください", True
+            session["session_id"], _headed("状況を教えてください"), True
         )
         self.assertEqual(result["message"], stored_text)
         req = self._captured(webhook)
@@ -216,7 +237,9 @@ class DeliverTests(unittest.TestCase):
         )
         self.assertIsNone(webhook.captured)  # type: ignore[attr-defined]
         polled = self.store.poll_messages(sid, "member")
-        self.assertEqual([item["message"] for item in polled["messages"]], ["one", "two"])
+        self.assertEqual(
+            [item["message"] for item in polled["messages"]], [_headed("one"), _headed("two")]
+        )
 
     def test_send_after_the_member_polled_rings_again(self) -> None:
         webhook = self._webhook(204)
@@ -275,11 +298,11 @@ class DeliverTests(unittest.TestCase):
             self.store, session["session_id"], "local", "共有だけです", reply_required=False
         )
 
-        self.assertEqual(result["message"], "共有だけです")
+        self.assertEqual(result["message"], _headed("共有だけです"))
         body = json.loads(self._captured(webhook)["body"].decode("utf-8"))
         self.assertNotIn("message", body)
         polled = self.store.poll_messages(session["session_id"], "member")
-        self.assertEqual([item["message"] for item in polled["messages"]], ["共有だけです"])
+        self.assertEqual([item["message"] for item in polled["messages"]], [_headed("共有だけです")])
 
     def test_member_send_does_not_call_the_webhook(self) -> None:
         webhook = self._webhook(204)

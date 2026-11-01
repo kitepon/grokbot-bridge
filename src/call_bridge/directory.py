@@ -15,10 +15,14 @@ Source order:
    ``/run/dirlive`` and sets this to ``/run/dirlive/dirlive.sock``.
 2. ``CALL_BRIDGE_DIRECTORY_URL`` — HTTP GET, used when the unix socket is unset
    or that GET fails.
-3. Local ``profile.json`` files, only if every configured remote GET failed
-   (or none is configured): ``CALL_BRIDGE_AGENTS_ROOT``, or
-   ``/home/box/agent-data/agents`` when that env var is unset and the path exists.
-4. ``directory.json`` — last-resort snapshot. Its ``source`` / ``agents_root``
+3. A fresh phone book pushed by the box courier (``CALL_BRIDGE_DIRECTORY_PUSH``).
+   The courier rebuilds it from ``profile.json`` and POSTs it. Used when the
+   socket and URL did not answer, while the push is younger than
+   ``CALL_BRIDGE_DIRECTORY_PUSH_MAX_AGE`` seconds (default 120).
+4. Local ``profile.json`` files, only if every configured remote GET failed
+   (or none is configured) and there is no fresh push: ``CALL_BRIDGE_AGENTS_ROOT``,
+   or ``/home/box/agent-data/agents`` when that env var is unset and the path exists.
+5. ``directory.json`` — last-resort snapshot. Its ``source`` / ``agents_root``
    fields are not treated as a live read.
 """
 
@@ -30,6 +34,7 @@ import logging
 import os
 import socket
 import urllib.request
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -138,6 +143,102 @@ def agents_root() -> Path | None:
     if DEFAULT_AGENTS_ROOT.is_dir():
         return DEFAULT_AGENTS_ROOT
     return None
+
+
+def directory_push_path() -> Path:
+    raw = os.environ.get("CALL_BRIDGE_DIRECTORY_PUSH", "").strip()
+    if raw:
+        return Path(raw)
+    return Path("data/grokbot-directory.push.json")
+
+
+def directory_push_max_age() -> float:
+    raw = os.environ.get("CALL_BRIDGE_DIRECTORY_PUSH_MAX_AGE", "").strip()
+    if not raw:
+        return 120.0
+    try:
+        value = float(raw)
+    except ValueError:
+        return 120.0
+    if value <= 0:
+        return 120.0
+    return value
+
+
+def store_directory_push(payload: dict[str, Any]) -> dict[str, Any]:
+    """Save a profile book from the box courier. Rejects a malformed book.
+
+    The file is the phone book (names and ids), not a credential. A later
+    ``call_directory`` uses it only while it is still fresh.
+    """
+    if not isinstance(payload, dict):
+        raise ValueError("directory push must be an object")
+    members = payload.get("members")
+    if not isinstance(members, list):
+        raise ValueError("directory push needs members")
+    if len(members) > 500:
+        raise ValueError("directory push is too large")
+    clean: list[dict[str, Any]] = []
+    for item in members:
+        if not isinstance(item, dict):
+            raise ValueError("directory member must be an object")
+        name = item.get("name")
+        agent_id = _agent_id_of(item)
+        if not isinstance(name, str) or not name.strip() or not agent_id:
+            raise ValueError("directory member needs a name and id")
+        entry: dict[str, Any] = {"name": name.strip(), "id": agent_id}
+        title = item.get("title")
+        role = item.get("role") if isinstance(item.get("role"), str) else item.get("description")
+        if isinstance(title, str) and title.strip():
+            entry["title"] = title.strip()
+        if isinstance(role, str) and role.strip():
+            entry["role"] = " ".join(role.split())
+        clean.append(entry)
+    doc: dict[str, Any] = {
+        "ok": True,
+        "schema": SCHEMA,
+        "source": "agent-profiles",
+        "via": "courier",
+        "count": len(clean),
+        "members": clean,
+        "pushed_at": datetime.now(timezone.utc).isoformat(),
+    }
+    agents = payload.get("agents_root")
+    if isinstance(agents, str) and agents.strip():
+        doc["agents_root"] = agents.strip()
+    path = directory_push_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    tmp.write_text(json.dumps(doc, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    os.replace(tmp, path)
+    return {"ok": True, "count": len(clean), "pushed_at": doc["pushed_at"]}
+
+
+def load_directory_push() -> dict[str, Any] | None:
+    """The courier's book, if the file exists and ``pushed_at`` is still fresh."""
+    path = directory_push_path()
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(data, dict) or not isinstance(data.get("members"), list):
+        return None
+    try:
+        pushed = datetime.fromisoformat(str(data.get("pushed_at")))
+    except ValueError:
+        return None
+    if pushed.tzinfo is None:
+        pushed = pushed.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - pushed).total_seconds()
+    if age > directory_push_max_age():
+        return None
+    data["ok"] = True
+    data["source"] = "agent-profiles"
+    data["via"] = "courier"
+    data["count"] = len(data["members"])
+    return data
 
 
 def _snapshot_paths() -> list[Path]:
@@ -482,6 +583,13 @@ def _load_grok_directory(*, skip_url: bool = False) -> dict[str, Any]:
             if book is not None:
                 return _note_unix_link_down(book, unix_down)
 
+    # The box courier pushes a book it just built from profile.json. Prefer that
+    # over a profile tree or snapshot on this host when the socket is down.
+    # A fresh push is a live directory, so it does not page the operator.
+    pushed = load_directory_push()
+    if pushed is not None:
+        return _note_remote_errors(pushed, unix_error, url_error)
+
     # Local profiles and directory.json are a soft fallback after remote failure
     # (or when no remote is configured). A successful remote GET does not reach here.
     local = _load_agents_root()
@@ -551,6 +659,27 @@ def _resolve_failure(
     elif isinstance(note, str) and note:
         out["note"] = note
     return out
+
+
+def member_display_name(system: str, party_id: str) -> str | None:
+    """Directory name for a bound caller id, or None when the book has no such id."""
+    ident = (party_id or "").strip()
+    if not ident:
+        return None
+    if system == "grokbot":
+        book = _load_grok_directory()
+        for member in book.get("members") or []:
+            if isinstance(member, dict) and _agent_id_of(member) == ident:
+                name = str(member.get("name") or "").strip()
+                return name or None
+        return None
+    if system == "bellteam":
+        resolved = resolve_bellteam_member(ident)
+        if resolved.get("ok"):
+            name = str(resolved.get("name") or "").strip()
+            return name or None
+        return None
+    return None
 
 
 def resolve_member_agent_id(member_name: str) -> dict[str, Any]:
