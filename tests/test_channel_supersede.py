@@ -153,3 +153,61 @@ class SupersedeTest(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(sqlite3.IntegrityError):await self.apply()
         self.assertEqual(self.rows('superseded_replies'),[])
         self.assertEqual(self.store.subscription(self.sid)['state'],'unknown')
+
+class ReboundSupersedeTest(SupersedeTest):
+    def setUp(self):
+        super().setUp()
+        self.source = self.current
+        self.source_owner = self.owner
+        self.current, self.owner = str(uuid.uuid4()), str(uuid.uuid4())
+        (Path(self.tmp.name)/'steer-channels'/self.current).mkdir()
+        self.owners[self.current] = self.owner
+        self.store.adopt_channel(self.sid, self.current, None)
+        self.store.stop(self.sid, 'unknown', 'DELIVERY_PREVIOUSLY_STARTED', 282)
+
+    async def apply(self, **changes):
+        return await super().apply(**{'source_channel': self.source, **changes})
+
+    async def test_preserves_old_channel_record_after_explicit_supersession(self):
+        before = self.rows()
+        result = await self.apply()
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(before[0]['channel_id'], self.source)
+        self.assertEqual(self.store.subscription(self.sid)['thread_id'], self.current)
+        self.assertEqual(self.store.subscription(self.sid)['after_seq'], 282)
+        self.assertFalse(result['input_sent'])
+
+    async def test_original_owner_channel_activity_refuses(self):
+        for ch in [self.source, self.other]:
+            self.states = {ch: 'emitted'}
+            with self.assertRaises(DeliveryError): await self.apply()
+        self.assertEqual(self.rows('superseded_replies'), [])
+
+    async def test_wrong_source_and_unknown_original_owner_refuse(self):
+        with self.assertRaises(DeliveryError): await self.apply(source_channel=self.current)
+        del self.owners[self.source]
+        (Path(self.tmp.name)/'steer-channels'/self.source).rmdir()
+        with self.assertRaises(DeliveryError): await self.apply()
+        self.assertEqual(self.rows('superseded_replies'), [])
+
+    async def test_cancel_unreserved_following_reply_atomically_without_delivery(self):
+        before = self.rows()
+        result = await self.apply(through_seq=283)
+        self.assertEqual(self.rows(), before)
+        self.assertEqual(result['superseded_seqs'], [282, 283])
+        self.assertEqual(self.store.subscription(self.sid)['after_seq'], 283)
+        watcher = local.Watchers(self.store)
+        send = AsyncMock()
+        with patch.object(claude_channel, 'send', send):
+            for seq in [282, 283]:
+                self.assertEqual(await watcher._handle(self.store.subscription(self.sid),
+                    {'seq': seq, 'message': 'cancelled'}, 283, AsyncMock()), 'next')
+        send.assert_not_awaited()
+        self.assertEqual(self.rows()[0], before[0])
+
+    async def test_cancel_range_requires_every_member_message_unfetched(self):
+        for end in [281, 284, True]:
+            with self.assertRaises(DeliveryError): await self.apply(through_seq=end)
+        self.value['messages'][-1]['fetched'] = True
+        with self.assertRaises(DeliveryError): await self.apply(through_seq=283)
+        self.assertEqual(self.rows('superseded_replies'), [])
