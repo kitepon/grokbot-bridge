@@ -287,7 +287,16 @@ async def connect() -> AsyncIterator[Aiterm]:
             yield terminal
         return
     parameters = StdioServerParameters(command=command[0], args=command[1:], env=dict(os.environ))
-    async with stdio_client(parameters) as (read, write):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            yield Aiterm(session)
+    try:
+        async with stdio_client(parameters) as (read, write):
+            async with ClientSession(read, write) as session:
+                await session.initialize()
+                yield Aiterm(session)
+    except BaseExceptionGroup as group:
+        error: BaseException = group
+        # MCPのtask groupが包んだ単独の配送失敗だけを戻す。終了処理の別エラーは捨てない。
+        while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
+            error = error.exceptions[0]
+        if isinstance(error, DeliveryError):
+            raise error from group
+        raise

@@ -217,6 +217,11 @@ class LocalStore:
                     delivery_id TEXT NOT NULL, state TEXT NOT NULL,
                     error TEXT, PRIMARY KEY (session_id, seq)
                 );
+                CREATE TABLE IF NOT EXISTS pending_receipts (
+                    session_id TEXT NOT NULL, seq INTEGER NOT NULL, revision TEXT NOT NULL,
+                    state TEXT NOT NULL, detail TEXT, conversation TEXT,
+                    PRIMARY KEY (session_id, seq)
+                );
                 CREATE TABLE IF NOT EXISTS relaunches (
                     source TEXT NOT NULL, target TEXT NOT NULL, state TEXT NOT NULL,
                     detail TEXT, at REAL NOT NULL
@@ -276,6 +281,27 @@ class LocalStore:
     def active(self) -> list[str]:
         with self.connect() as db:
             return [row[0] for row in db.execute("SELECT session_id FROM subscriptions WHERE state = 'active'")]
+
+    def receipt_sessions(self) -> list[str]:
+        with self.connect() as db:
+            return [row[0] for row in db.execute("SELECT DISTINCT session_id FROM pending_receipts")]
+
+    def pending_receipts(self, session_id: str) -> list[dict[str, Any]]:
+        with self.connect() as db:
+            return [dict(row) for row in db.execute(
+                "SELECT * FROM pending_receipts WHERE session_id=? ORDER BY seq", (session_id,))]
+
+    def queue_receipt(self, session_id: str, seq: int, state: str,
+                      detail: str | None, conversation: str | None) -> None:
+        with self.connect() as db:
+            # 本文は保存せず、同じ配送の最新通知だけを残す。
+            db.execute("INSERT OR REPLACE INTO pending_receipts VALUES(?,?,?,?,?,?)",
+                       (session_id, seq, str(uuid.uuid4()), state, detail, conversation))
+
+    def receipt_sent(self, session_id: str, seq: int, revision: str) -> None:
+        with self.connect() as db:
+            db.execute("DELETE FROM pending_receipts WHERE session_id=? AND seq=? AND revision=?",
+                       (session_id, seq, revision))
 
     def unknown_channels(self) -> list[str]:
         with self.connect() as db:
@@ -645,13 +671,11 @@ class Watchers:
             while True:
                 # 結び付けは、同じ会話に付いたほかの通話の見張りが付け替える事がある。毎回読み直す。
                 subscription = self.store.subscription(session_id)
-                if (self.receiver and subscription["state"] == "unknown"
-                        and subscription["delivery_mode"] == "channel" and subscription["harness"] == "claude-code"):
-                    if not (await self._recover_fetched(subscription, client)
-                            or await self._recover_emitted(subscription, _Reporter(client, _headers(), session_id))):
-                        return
-                    continue
-                if subscription["state"] != "active":
+                recoverable = (self.receiver and subscription["state"] == "unknown"
+                               and subscription["delivery_mode"] == "channel"
+                               and subscription["harness"] == "claude-code")
+                if (subscription["state"] != "active" and not recoverable
+                        and not self.store.pending_receipts(session_id)):
                     return
                 # Read the token per poll so a rotated auth.json reaches a long-lived watcher.
                 # A replacement in progress can leave it briefly unreadable; only a lasting
@@ -662,17 +686,33 @@ class Watchers:
                     token_failures += 1
                     detail = str(exc) if isinstance(exc, DeliveryError) else f"LOCAL_CONFIG_INVALID: {exc}"
                     if token_failures >= _TOKEN_READ_ATTEMPTS:
-                        self.store.stop(session_id, "failed", detail)
+                        if subscription["state"] == "active":
+                            self.store.stop(session_id, "failed", detail)
                         return
-                    self.store.transport_error(session_id, detail)
+                    if subscription["state"] == "active":
+                        self.store.transport_error(session_id, detail)
                     log.warning("reply watch token unreadable for %s: %s", session_id, exc)
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
                 token_failures = 0
+                report = _Reporter(client, headers, session_id, self.store)
+                await report.flush()
+                if recoverable:
+                    if not (await self._recover_fetched(subscription, client)
+                            or await self._recover_emitted(subscription, report)):
+                        return
+                    continue
+                if subscription["state"] != "active":
+                    # 終端済み通話は通知だけ再送する。本文のpoll・配送や再開は行わない。
+                    if not self.store.pending_receipts(session_id):
+                        return
+                    await asyncio.sleep(_POLL_SECONDS)
+                    continue
                 params: dict[str, Any] = {"party": "local", "after_seq": subscription["after_seq"]}
                 if subscription["delivery_mode"] in ("manual", "channel"):
                     # 読むだけ。既読の印は、会話が自分で取りに来た時に付く（取りに来た返信は、重ねて渡さない）。
                     params["peek"] = "1"
+                started = time.monotonic()
                 try:
                     response = await client.get(_rest_url(session_id), headers=headers, params=params)
                     response.raise_for_status()
@@ -690,7 +730,8 @@ class Watchers:
                     continue
                 except httpx.RequestError as exc:
                     self.store.transport_error(session_id, "BRIDGE_POLL_TRANSPORT")
-                    log.warning("reply watch transport error for %s: %s", session_id, exc)
+                    log.warning("reply watch transport error for %s: type=%s elapsed=%.3f",
+                                session_id, type(exc).__name__, time.monotonic() - started)
                     await asyncio.sleep(_POLL_SECONDS)
                     continue
                 except (DeliveryError, json.JSONDecodeError) as exc:
@@ -704,7 +745,7 @@ class Watchers:
                         return
                 hold = subscription["hold_seq"]
                 if messages and (hold is None or messages[-1]["seq"] > hold) and self._due(session_id):
-                    report = _Reporter(client, headers, session_id)
+                    report = _Reporter(client, headers, session_id, self.store)
                     for message in messages:
                         outcome = await self._handle(subscription, message, messages[-1]["seq"], report)
                         if outcome == "stop":
@@ -713,7 +754,7 @@ class Watchers:
                             break
                         # この返信で席へ付け替えた時は、続きの返信をその席へ送る。
                         subscription = self.store.subscription(session_id)
-                await self._confirm_queued(session_id, _Reporter(client, headers, session_id))
+                await self._confirm_queued(session_id, _Reporter(client, headers, session_id, self.store))
                 if value.get("status") == "hungup" and not self.store.unconfirmed(session_id):
                     # 終わった通話に新しい返信は来ない。渡し終えたか、届けられないと決まった時に見張りを閉じる。
                     current = self.store.subscription(session_id)
@@ -789,7 +830,7 @@ class Watchers:
         fetched = {message["seq"] for message in value["messages"] if message.get("fetched") is True}
         if not self.store.resume_fetched(subscription, reservations, fetched):
             return False
-        report = _Reporter(client, headers, session_id)
+        report = _Reporter(client, headers, session_id, self.store)
         for row in reservations:
             await report(row["seq"], "fetched", None, None)
         log.info("call %s resumes after normal retrieval of %s reserved replies", session_id, len(reservations))
@@ -1202,17 +1243,28 @@ def _channel_label(subscription: dict[str, Any]) -> str:
 class _Reporter:
     """端末の側が返信をどう扱ったかを、通話のサーバーへ知らせる。知らせの失敗では配送を止めない。"""
 
-    def __init__(self, client: httpx.AsyncClient, headers: dict[str, str], session_id: str):
-        self.client, self.headers, self.session_id = client, headers, session_id
+    def __init__(self, client: httpx.AsyncClient, headers: dict[str, str], session_id: str, store: LocalStore):
+        self.client, self.headers, self.session_id, self.store = client, headers, session_id, store
         self.url = _rest_url(session_id).removesuffix("/poll") + "/receipts"
 
     async def __call__(self, seq: int, state: str, detail: str | None, conversation: str | None) -> None:
-        try:
-            response = await self.client.post(self.url, headers=self.headers, json={
-                "seq": seq, "state": state, "detail": detail, "conversation": conversation})
-            response.raise_for_status()
-        except httpx.HTTPError as exc:
-            log.warning("receipt for %s seq=%s was not stored: %s", self.session_id, seq, exc)
+        self.store.queue_receipt(self.session_id, seq, state, detail, conversation)
+        await self.flush()
+
+    async def flush(self) -> None:
+        for row in self.store.pending_receipts(self.session_id):
+            started = time.monotonic()
+            try:
+                response = await self.client.post(self.url, headers=self.headers, json={
+                    key: row[key] for key in ("seq", "state", "detail", "conversation")})
+                response.raise_for_status()
+                if response.json().get("ok") is not True:
+                    raise ValueError("receipt response was not accepted")
+            except (httpx.HTTPError, ValueError, AttributeError) as exc:
+                log.warning("receipt for %s seq=%s was not stored: type=%s elapsed=%.3f",
+                            self.session_id, row["seq"], type(exc).__name__, time.monotonic() - started)
+                return
+            self.store.receipt_sent(self.session_id, row["seq"], row["revision"])
 
 
 def _open_store() -> LocalStore:
@@ -1261,7 +1313,7 @@ def _start_watch(session_id: str, claimed: int | None = None) -> None:
 
 @asynccontextmanager
 async def _lifespan(_server: FastMCP) -> AsyncIterator[None]:
-    for session_id in store.active():
+    for session_id in set(store.active() + store.receipt_sessions()):
         _start_watch(session_id)
     try:
         yield
