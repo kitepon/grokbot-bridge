@@ -112,11 +112,15 @@ async def bind(session_id, seq, expected_current, expected_owner, source_channel
         if fd is not None: os.close(fd)
 
 
-async def supersede(session_id, seq, expected_current, expected_owner, expected_after, expected_at, reason):
+async def supersede(session_id, seq, expected_current, expected_owner, expected_after, expected_at, reason,
+                    source_channel=None, through_seq=None):
     """管理者が不要と決めた旧返信だけを失効する。元unknownを成功へ変えない。"""
-    for value in [session_id, expected_current, expected_owner]:
+    source_channel = expected_current if source_channel is None else source_channel
+    through_seq = seq if through_seq is None else through_seq
+    for value in [session_id, expected_current, expected_owner, source_channel]:
         uuid.UUID(value)
-    if (type(seq) is not int or seq != expected_after+1 or not 0 < expected_at < float('inf')
+    if (type(seq) is not int or seq != expected_after+1 or type(through_seq) is not int or through_seq < seq
+            or not 0 < expected_at < float('inf')
             or not reason.strip() or len(reason) > 500): refuse()
     store=local.store
     before=store.subscription(session_id)
@@ -129,7 +133,7 @@ async def supersede(session_id, seq, expected_current, expected_owner, expected_
              or (r['state']=='submitted' and not r['confirmed']))]
     if (len(pending)!=1 or pending[0]['seq']!=seq or pending[0]['state']!='unknown' or pending[0]['confirmed']!=1
             or pending[0]['error']!='DELIVERY_PREVIOUSLY_STARTED' or pending[0]['at']!=expected_at
-            or pending[0]['channel_id']!=expected_current
+            or pending[0]['channel_id']!=source_channel
             or pending[0]['delivery_id']!=str(uuid.uuid5(local._DELIVERY_NAMESPACE,f'{session_id}:{seq}'))
             or any(r['seq']==seq for r in old)): refuse()
     fd=None
@@ -149,12 +153,16 @@ async def supersede(session_id, seq, expected_current, expected_owner, expected_
                 or value.get('ok') is not True or value.get('status')=='hungup'
                 or not value['messages'] or value['messages'][0]['seq']!=seq
                 or value['messages'][0].get('fetched') is not False): refuse()
+        cancelled = [r for r in value['messages'] if r['seq'] <= through_seq]
+        if (len(cancelled) != through_seq-seq+1 or cancelled[-1]['seq'] != through_seq
+                or any(r.get('fetched') is not False for r in cancelled)): refuse()
         ids=channels()
         owners=await claude_owners(ids)
-        if owners.get(expected_current)!=expected_owner: refuse()
+        if owners.get(expected_current)!=expected_owner or source_channel not in owners: refuse()
+        relevant_owners = {expected_owner, owners[source_channel]}
         async def absent():
             for channel,owner in owners.items():
-                if owner==expected_owner:
+                if owner in relevant_owners:
                     value=await claude_channel.run(['state','--channel',channel,'--delivery',pending[0]['delivery_id']])
                     if 'state' not in value or value['state'] is not None: refuse()
         await absent()
@@ -168,10 +176,11 @@ async def supersede(session_id, seq, expected_current, expected_owner, expected_
             current=[dict(r) for r in db.execute('SELECT * FROM deliveries WHERE session_id=? ORDER BY seq',(session_id,))]
             superseded=[dict(r) for r in db.execute('SELECT * FROM superseded_replies WHERE session_id=? ORDER BY seq',(session_id,))]
             if sub is None or dict(sub)!=before or current!=rows or superseded!=old: refuse()
-            db.execute('INSERT INTO superseded_replies(session_id,seq,reason,at) VALUES(?,?,?,?)',
-                       (session_id,seq,reason.strip(),time.time()))
-            db.execute("UPDATE subscriptions SET state='active',after_seq=?,last_error=NULL WHERE session_id=?",(seq,session_id))
-        return {'session_id':session_id,'superseded_seq':seq,'after_seq':seq,
+            db.executemany('INSERT INTO superseded_replies(session_id,seq,reason,at) VALUES(?,?,?,?)',
+                           [(session_id,r['seq'],reason.strip(),time.time()) for r in cancelled])
+            db.execute("UPDATE subscriptions SET state='active',after_seq=?,last_error=NULL WHERE session_id=?",(through_seq,session_id))
+        return {'session_id':session_id,'superseded_seq':seq,'after_seq':through_seq,
+                'superseded_seqs':[r['seq'] for r in cancelled],
                 'original_outcome':'unknown','input_sent':False,'delivery_success_asserted':False}
     finally:
         if fd is not None: os.close(fd)
@@ -185,22 +194,23 @@ def main():
     parser.add_argument('--supersede',action='store_true')
     parser.add_argument('--receipt',action='store_true')
     parser.add_argument('--expected-at',type=float)
+    parser.add_argument('--through-seq',type=int)
     parser.add_argument('--reason')
     parser.add_argument('--seq',type=int,required=True)
     parser.add_argument('--expected-after',type=int,required=True)
     args=parser.parse_args()
     if args.receipt:
-        if args.supersede or args.source_channel or args.expected_at is not None or args.reason is not None:
+        if args.supersede or args.source_channel or args.expected_at is not None or args.reason is not None or args.through_seq is not None:
             parser.error('receipt cannot bind or supersede a delivery')
     elif args.supersede:
-        if args.source_channel or args.expected_at is None or args.reason is None: parser.error('supersede requires --expected-at and --reason, without --source-channel')
-    elif not args.source_channel or args.expected_at is not None or args.reason is not None:
+        if args.expected_at is None or args.reason is None: parser.error('supersede requires --expected-at and --reason')
+    elif not args.source_channel or args.expected_at is not None or args.reason is not None or args.through_seq is not None:
         parser.error('binding requires --source-channel, without --expected-at or --reason')
     try:
         if args.receipt:
             result=asyncio.run(receipt(args.session,args.seq,args.expected_current,args.expected_owner,args.expected_after))
         elif args.supersede:
-            result=asyncio.run(supersede(args.session,args.seq,args.expected_current,args.expected_owner,args.expected_after,args.expected_at,args.reason))
+            result=asyncio.run(supersede(args.session,args.seq,args.expected_current,args.expected_owner,args.expected_after,args.expected_at,args.reason,args.source_channel,args.through_seq))
         else:
             result=asyncio.run(bind(args.session,args.seq,args.expected_current,args.expected_owner,args.source_channel,args.expected_after))
     except (DeliveryError,ValueError,OSError,httpx.HTTPError) as exc:
