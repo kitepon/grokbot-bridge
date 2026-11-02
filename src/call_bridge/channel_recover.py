@@ -39,6 +39,35 @@ async def claude_owners(ids):
     return owners
 
 
+async def receipt(session_id, seq, expected_current, expected_owner, expected_after):
+    """元channelの出力が確定している配送の通知だけを保存し直す。本文・通話は変更しない。"""
+    for value in [session_id, expected_current, expected_owner]:
+        uuid.UUID(value)
+    store = local.store
+    before = store.subscription(session_id)
+    if (before['harness'], before['delivery_mode'], before['thread_id'], before['after_seq']) != (
+            'claude-code', 'channel', expected_current, expected_after): refuse()
+    with store.connect() as db:
+        found = db.execute('SELECT * FROM deliveries WHERE session_id=? AND seq=?', (session_id, seq)).fetchone()
+    row = dict(found) if found else None
+    if (not row or type(seq) is not int or seq <= 0 or seq > expected_after
+            or row['state'] != 'submitted' or row['confirmed'] != 1
+            or row['channel_id'] != expected_current
+            or row['delivery_id'] != str(uuid.uuid5(local._DELIVERY_NAMESPACE, f'{session_id}:{seq}'))): refuse()
+    if await claude_channel.owner_kind(expected_current) != ('claude', expected_owner): refuse()
+    if await claude_channel.emitted_channel(row['delivery_id'], expected_current) != expected_current: refuse()
+    with store.connect() as db:
+        db.execute('BEGIN IMMEDIATE')
+        current = db.execute('SELECT * FROM subscriptions WHERE session_id=?', (session_id,)).fetchone()
+        delivery = db.execute('SELECT * FROM deliveries WHERE session_id=? AND seq=?', (session_id, seq)).fetchone()
+        if (current is None or dict(current) != before or delivery is None or dict(delivery) != row
+                or db.execute('SELECT 1 FROM superseded_replies WHERE session_id=? AND seq=?', (session_id, seq)).fetchone()
+                or db.execute('SELECT 1 FROM pending_receipts WHERE session_id=? AND seq=?', (session_id, seq)).fetchone()): refuse()
+        db.execute('INSERT INTO pending_receipts VALUES(?,?,?,?,?,?)',
+                   (session_id, seq, str(uuid.uuid4()), 'started', None, f'claude:{expected_current}'))
+    return {'session_id': session_id, 'seq': seq, 'receipt_queued': True, 'input_sent': False}
+
+
 async def bind(session_id, seq, expected_current, expected_owner, source_channel, expected_after):
     for value in [session_id, expected_current, expected_owner, source_channel]:
         uuid.UUID(value)
@@ -154,17 +183,23 @@ def main():
         parser.add_argument('--'+name,required=True)
     parser.add_argument('--source-channel')
     parser.add_argument('--supersede',action='store_true')
+    parser.add_argument('--receipt',action='store_true')
     parser.add_argument('--expected-at',type=float)
     parser.add_argument('--reason')
     parser.add_argument('--seq',type=int,required=True)
     parser.add_argument('--expected-after',type=int,required=True)
     args=parser.parse_args()
-    if args.supersede:
+    if args.receipt:
+        if args.supersede or args.source_channel or args.expected_at is not None or args.reason is not None:
+            parser.error('receipt cannot bind or supersede a delivery')
+    elif args.supersede:
         if args.source_channel or args.expected_at is None or args.reason is None: parser.error('supersede requires --expected-at and --reason, without --source-channel')
     elif not args.source_channel or args.expected_at is not None or args.reason is not None:
         parser.error('binding requires --source-channel, without --expected-at or --reason')
     try:
-        if args.supersede:
+        if args.receipt:
+            result=asyncio.run(receipt(args.session,args.seq,args.expected_current,args.expected_owner,args.expected_after))
+        elif args.supersede:
             result=asyncio.run(supersede(args.session,args.seq,args.expected_current,args.expected_owner,args.expected_after,args.expected_at,args.reason))
         else:
             result=asyncio.run(bind(args.session,args.seq,args.expected_current,args.expected_owner,args.source_channel,args.expected_after))

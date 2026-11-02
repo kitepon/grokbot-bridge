@@ -252,6 +252,9 @@ class ReceiverLimitsTest(unittest.TestCase):
             def unknown_channels(self):
                 return []
 
+            def receipt_sessions(self):
+                return []
+
         class Quiet:
             def __init__(self, _store, receiver=False):
                 pass
