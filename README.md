@@ -38,7 +38,7 @@ GrokBot宛ても BellTeam 宛てと同じく、`call_directory` で相手を選�
 - 後継の会話には、前の会話が持っていた通話を知らせる。Claude Code の UserPromptSubmit の hook（`steer/call-bridge-claude-prompt.mjs`、`call-bridge-setup harness claude-code enable` が登録する）が、後継の最初の文（「Throughline自動継続 <引き継ぎID>」）を見た時だけ動き、`throughline auto-handoff status --host claude --operation <引き継ぎID> --json` で前の会話を引いて、その会話の受け口へ届けている通話があれば、「最初に `call_adopt` で引き取る」を追加の文脈として渡す。引き取る道具は、後継の会話が自分で呼ぶ。ほかの文では、何も出さずに終わる。失敗しても文は止めない（必ず 0 で終わる）。
 - Cursor と Grok の会話は、待ち受けの命令で返信を受け取る（`parent_delivery.state` が `wait`）。`call_open`・`call_send`・`call_poll` の返りの `parent_delivery.wait_command` を、会話が背景の process として動かす。返信が届くと、その命令が1行の JSON（`deliveries` に本文、`next_wait_process` に張り直しの命令）を出して終わる。Cursor は、作業中なら hook が次の道具の返りへ返信を差し込む（道具の返りの `steer_channel` が、受け口を会話へ結ぶ印）。この2つには、番を終えて何も張っていない会話を外から起こす口が無い。待ち受けが張られないまま30分たった返信は、取り下げて席へ渡す。
 - 配送のパッケージや hook の無い端末の会話は、返信を自分で `call_poll` する（`parent_delivery.state` が `manual`。`reason` に理由が出る）。会話が生きている間は、その会話の MCP が通話の鍵を持つ。会話が終わった後に届いた返信は、常駐の受け取り係が席へ渡す。
-- 確かに届けていない失敗（席が起動の画面で止まった、フォルダが分からない等）では見張りを止めず、同じ通話に新しい返信が来た時に、その返信からやり直す。時間で繰り返す再試行はしない。
+- 確かに届けていない失敗（席が起動の画面で止まった、フォルダが分からない等）では見張りを止めず、同じ通話に新しい返信が来た時か、失敗から30分たった時に、その返信からやり直す。受け取り係が起き直した時も、すぐ1回やり直す。新しい返信だけを出口にすると、相手が送り直さない返信は届かないまま残る（2026-11-10、Mac で、席の起動が `unrecognized_screen` で止まった seq55 が、そのまま保留された）。図は [docs/architecture/held-reply.md](docs/architecture/held-reply.md)。
 - 立てた結果・送った結果が分からない時は、立て直さない・送り直さない。本文は通話に残る。
 
 channel・手動受信の会話が通常の `call_poll(party="local")` で同じ返信を取得すると、

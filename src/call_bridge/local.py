@@ -47,6 +47,8 @@ _CHANNEL_CONFIRM_SECONDS = 10.0
 _CHANNEL_BUSY_SECONDS = 1800.0
 # 途中で止められた直後は、Throughline が続きの会話を作っている途中の事がある。これより新しい中断は待つ。
 _INTERRUPT_SETTLE_SECONDS = 120.0
+# 確かに届けられずに保留した返信を、新しい返信が来なくても試し直すまでの間。席の起動は1回で数分かかるので、間を空ける。
+_HOLD_RETRY_SECONDS = 1800.0
 # 受け取り係が、ほかの process の握っている通話を握り直すまでに待つ長さ。
 _TAKEOVER_SECONDS = 20.0
 # 手放すよう頼んでから、鍵が空くのを待つ長さ。握っている見張りは、次の見回りで降りる。返信を渡している最中なら、渡し終えてから降りる。
@@ -599,6 +601,8 @@ class Watchers:
         self.tasks: dict[str, asyncio.Task[None]] = {}
         # 会話の状態を見直す時刻（通話ごと）。見直すたびに App Server を起こすので、間を空ける。
         self.recheck_at: dict[str, float] = {}
+        # 保留した返信を試し直す時刻（通話ごと）。受け取り係が起き直した時は、すぐ1回試す。
+        self.hold_retry_at: dict[str, float] = {}
 
     def start(self, session_id: str, claimed: int | None = None) -> None:
         """claimed は、通話を開いた会話が先に取っておいた鍵。"""
@@ -744,7 +748,8 @@ class Watchers:
                         self.store.stop(session_id, "failed", "BRIDGE_MESSAGE_INVALID")
                         return
                 hold = subscription["hold_seq"]
-                if messages and (hold is None or messages[-1]["seq"] > hold) and self._due(session_id):
+                if messages and (hold is None or messages[-1]["seq"] > hold or self._hold_due(session_id)) \
+                        and self._due(session_id):
                     report = _Reporter(client, headers, session_id, self.store)
                     for message in messages:
                         outcome = await self._handle(subscription, message, messages[-1]["seq"], report)
@@ -839,6 +844,10 @@ class Watchers:
     def _due(self, session_id: str) -> bool:
         return time.monotonic() >= self.recheck_at.get(session_id, 0.0)
 
+    def _hold_due(self, session_id: str) -> bool:
+        """保留した返信を試し直す時か。新しい返信だけを出口にすると、相手が送り直さない返信は届かないまま残る。"""
+        return time.monotonic() >= self.hold_retry_at.get(session_id, 0.0)
+
     def _later(self, session_id: str) -> str:
         self.recheck_at[session_id] = time.monotonic() + _RECHECK_SECONDS
         return "wait"
@@ -880,6 +889,7 @@ class Watchers:
                 return "stop"
             # 確かに届けていない。通話の見張りは続け、次の返信が来た時にもう一度試す。
             self.store.hold(session_id, seq, latest_seq, str(exc))
+            self.hold_retry_at[session_id] = time.monotonic() + _HOLD_RETRY_SECONDS
             log.error("reply delivery failed for %s seq=%s: %s", session_id, seq, exc)
             await report(seq, "failed", str(exc), None)
             return "wait"
@@ -1150,8 +1160,9 @@ class Watchers:
                 # （2026-10-13 Mac：番へ入って答えも返った返信を、読みの時間切れで「渡し直し待ち」に書き直していた。）
                 self._later(session_id)
                 return
-            # キューから取り消した後で、席へも入らなかった。次の返信が来た時に、この返信からもう一度渡す。
+            # キューから取り消した後で、席へも入らなかった。次の返信が来た時か、間を空けて、この返信からもう一度渡す。
             self.store.rewind(session_id, seq, str(exc))
+            self.hold_retry_at[session_id] = time.monotonic() + _HOLD_RETRY_SECONDS
             await report(seq, "failed", str(exc), None)
 
 
@@ -1228,8 +1239,9 @@ class Watchers:
                 self.store.transport_error(session_id, str(exc))
                 self._later(session_id)
                 return
-            # 取り下げた後で、席へも入らなかった。次の返信が来た時に、取り下げた返信からもう一度渡す。
+            # 取り下げた後で、席へも入らなかった。次の返信が来た時か、間を空けて、取り下げた返信からもう一度渡す。
             self.store.rewind(session_id, withdrawn[0], str(exc))
+            self.hold_retry_at[session_id] = time.monotonic() + _HOLD_RETRY_SECONDS
             for each in withdrawn[1:]:
                 self.store.failed(session_id, each, str(exc))
             await report(withdrawn[0], "failed", str(exc), None)
