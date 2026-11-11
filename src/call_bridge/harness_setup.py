@@ -16,7 +16,7 @@ import sys
 from pathlib import Path
 from typing import Any, Callable
 
-from . import claude_channel
+from . import claude_channel, client_token
 from .codex_delivery import DeliveryError, grant_user_access, state_root
 
 NAME = "call-bridge"
@@ -72,19 +72,27 @@ def _cursor_write(value: dict[str, Any]) -> None:
 
 
 def require_token() -> None:
-    """ローカル MCP は、この端末の auth.json の合言葉で通話のサーバーへつなぐ。先に用意があることを確かめる。"""
+    """ローカル MCP は、この端末の合言葉（コマンドか auth.json）で通話のサーバーへつなぐ。先に用意があることを確かめる。"""
     config_file = state_root() / "config.json"
     config = json.loads(config_file.read_text(encoding="utf-8")) if config_file.is_file() else {}
     token_env = config.get("token_env", "CALL_BRIDGE_TOKEN")
-    if config.get("enabled") is True and (state_root() / "auth.json").is_file():
+    # A token command keeps the token in memory only: check it runs, record it, and write no auth.json.
+    command = client_token.token_command(config)
+    token = ""
+    if command:
+        client_token.command_token(command)
+    elif config.get("enabled") is True and (state_root() / "auth.json").is_file():
         return
-    token = os.environ.get(token_env, "").strip()
-    if not token:
-        raise DeliveryError("BRIDGE_TOKEN_MISSING",
-                            f"{token_env} がありません。Codex で call-bridge-setup enable を済ませるか、この変数を渡してください")
+    else:
+        token = os.environ.get(token_env, "").strip()
+        if not token:
+            raise DeliveryError("BRIDGE_TOKEN_MISSING",
+                                f"{token_env} がありません。Codex で call-bridge-setup enable を済ませるか、この変数を渡してください")
     from .setup import _write_json
-    _write_json(state_root() / "auth.json", {"token": token})
+    if token:
+        _write_json(state_root() / "auth.json", {"token": token})
     _write_json(config_file, {**config, "enabled": True, "token_env": token_env,
+                              **({"token_command": command} if command else {}),
                               "mcp_url": config.get("mcp_url") or os.environ.get("CALL_BRIDGE_MCP_URL")
                               or "https://call.kitepon.dev/mcp"})
 

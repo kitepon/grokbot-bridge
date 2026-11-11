@@ -99,7 +99,7 @@ call-bridge-setup harness cursor enable
 call-bridge-setup harness grok enable
 ```
 
-各 CLI の利用者の設定へ、ローカル MCP（`python -m call_bridge.local`）を `call-bridge` の1項目だけ書く。合言葉は、この端末の `auth.json`（Codex で `enable` 済み）か、環境変数から受け取って `auth.json` に置く。席から通話へ返すにも、この登録が要る。
+各 CLI の利用者の設定へ、ローカル MCP（`python -m call_bridge.local`）を `call-bridge` の1項目だけ書く。合言葉は、この端末の `auth.json`（Codex で `enable` 済み）か、環境変数から受け取って `auth.json` に置く。コマンドから読む設定（下の「合言葉をコマンドから読む」）なら `auth.json` は作らない。席から通話へ返すにも、この登録が要る。
 
 `status` の `delivery` が、返信の渡し方。`automatic`＝返信で会話が起きる（Claude Code）。`wait`＝会話が待ち受けの命令を動かしている間に届く（Cursor・Grok）。`manual`＝会話が自分で取りに来る。
 
@@ -281,6 +281,28 @@ Windows で Steer hook を使うには PowerShell 7（`pwsh.exe`）が要る。C
 Node 製 Codex の場合は実行中の Node の絶対パスも製品設定へ保存し、MCP の PATH が狭い環境でも返信配送用 App Server を起動する。CLI や Node を移動した後は `enable` を再実行する。
 認証値は製品の state directory（既定は `~/.grokbot-bridge`）の `auth.json` に本人だけが読める権限で保存し、Codex が環境変数を継承しない場合もローカル MCP が使用する。Git や Codex 設定には書かない。`disable` はそのファイルを削除する。
 ローカル MCP と返信の見張りは、問い合わせのたびに `auth.json` を読み直すので、ファイルを差し替えれば動いたまま新しいトークンへ移る。読めない状態が約30秒続いた時だけ見張りを止める。ただし環境変数（既定は `CALL_BRIDGE_TOKEN`）が設定されていればそちらが優先され、プロセスの起動時の値から変わらない。トークンを入れ替える端末では、MCP を環境変数なしで起動し、`auth.json` で渡す。
+
+#### 合言葉をコマンドから読む（任意）
+
+合言葉を平文の `auth.json` に置きたくない端末では、合言葉を1行で出すコマンドを登録できる。1Password（`op read "op://…"`、`op-agent pipe` 等）に限らず、`pass`・keychain の CLI など何でもよい。使わない端末は今までどおり環境変数か `auth.json` で動く。
+
+```bash
+export CALL_BRIDGE_TOKEN_COMMAND='op read "op://Vault/Item/credential"'
+call-bridge-setup enable                     # Codex。他の CLI は call-bridge-setup harness <名前> enable
+```
+
+```powershell
+$env:CALL_BRIDGE_TOKEN_COMMAND = 'op read "op://Vault/Item/credential"'
+call-bridge-setup enable
+```
+
+- `enable` はコマンドを一度動かして確かめ、`config.json` の `token_command` にコマンドの文だけを書く。`auth.json` は書かない。受け取り係（OS の常駐）は環境変数を持たないので、この記録から読む。
+- 各 process は、最初に要った時にコマンドを動かし、値をメモリにだけ置く。ファイル・記録・ログ・エラーには値を出さない。サーバーが 401 を返したら、値を捨ててコマンドを動かし直す。
+- 順番は、環境変数（`CALL_BRIDGE_TOKEN`）→ コマンド → `auth.json`。コマンドがある時は `auth.json` を読まない。
+- コマンドは shell で動く（Windows は cmd.exe）。標準入力は渡さず、120秒で打ち切る。人が居ないと解錠できない保管庫は、受け取り係からは使えない。常駐で使うなら、読み取り専用の service account 等、人の操作なしで読める手段にする。
+- 切り替える前の `auth.json` は残る（動いている古い process が読んでいる事があるため）。`enable` の `warning` に従い、Codex と受け取り係を起こし直してから消す。やめる時は `config.json` から `token_command` を外し、従来の手順で `enable` する。
+
+図は [docs/architecture/client-token.md](docs/architecture/client-token.md)。サーバーが合言葉を受け付けない時、ローカル MCP の道具は `BRIDGE_UNAUTHORIZED` を返す（以前は `unhandled errors in a TaskGroup` と出ていた）。
 また、`codex exec` の親へ返信を渡す本製品専用の `UserPromptSubmit` hook を登録・承認し、
 `aiterm-steer-delivery codex setup enable` でパッケージの Steer hook を登録する。他製品の hook は保持する。
 旧版が登録した本製品の `PostToolUse`／`Stop` hook は外す。
