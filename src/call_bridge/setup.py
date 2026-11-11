@@ -20,7 +20,7 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from . import harness_setup, receiver
+from . import client_token, harness_setup, receiver
 from .codex_delivery import (STEER_PROFILE, CodexRPC, DeliveryError, check_steer_version, codex_binary,
                              codex_command, codex_home, codex_processes, current_steer_cli, grant_user_access,
                              owned_hooks, private_dir, restart_required, state_root, steer_profile, steer_sync)
@@ -348,9 +348,15 @@ async def enable() -> dict[str, str]:
         url, token_env = previous["mcp_url"], previous["token_env"]
     else:
         url, token_env = _remote(existing)
-    token = os.environ.get(token_env, "").strip()
-    if not token:
-        raise DeliveryError("BRIDGE_TOKEN_MISSING", f"{token_env} がありません")
+    # A token command keeps the token out of auth.json; check it runs before changing anything.
+    token_command = client_token.token_command(previous if already_local else {})
+    token = ""
+    if token_command:
+        client_token.command_token(token_command)
+    else:
+        token = os.environ.get(token_env, "").strip()
+        if not token:
+            raise DeliveryError("BRIDGE_TOKEN_MISSING", f"{token_env} がありません")
     home = codex_home()
     command = _command()
     _backup_codex_config(home)
@@ -358,7 +364,8 @@ async def enable() -> dict[str, str]:
                            previous.get("hook_command") if already_local else None)
     await _verify_hooks(command, approve=True)
     auth_file = state_root() / "auth.json"
-    _write_json(auth_file, {"token": token})
+    if not token_command:
+        _write_json(auth_file, {"token": token})
     if not already_local:
         try:
             await _replace_mcp(name, {"command": sys.executable, "args": ["-m", "call_bridge.local"]})
@@ -377,6 +384,7 @@ async def enable() -> dict[str, str]:
         "enabled": True,
         "mcp_name": name,
         "mcp_url": url, "token_env": token_env,
+        **({"token_command": token_command} if token_command else {}),
         "codex_home": str(home),
         # Node の script（npm の入口の先）は、Node で直接起こすので実体を控える。ほかは入口を控える。版つきの実体
         # （standalone の releases/<版>、Homebrew の Caskroom/<版>）を控えると、Codex を上げた後も古い版で配送し続け、
@@ -396,8 +404,15 @@ async def enable() -> dict[str, str]:
     # ここまでに書いた物を、この利用者の普段の権限の process（Codex・Claude Code・常駐）が開けるようにする。
     grant_user_access()
     restart = restart_required(next_config) or steer == "restart_required"
-    return {"status": "restart_required" if restart else "ready", "mcp": name, "steer": steer,
-            "receiver": _receiver("install")}
+    result = {"status": "restart_required" if restart else "ready", "mcp": name, "steer": steer,
+              "receiver": _receiver("install")}
+    if token_command and auth_file.exists():
+        result["warning"] = AUTH_FILE_LEFT
+    return result
+
+
+# Processes started before the switch may still read auth.json, so the operator deletes it after restarting them.
+AUTH_FILE_LEFT = "合言葉はコマンドから読みます。auth.json は使わなくなりました。Codex と受け取り係を起こし直してから消してください"
 
 
 def _receiver(action: str) -> str:

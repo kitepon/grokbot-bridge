@@ -25,6 +25,7 @@ from mcp.server.fastmcp import Context, FastMCP
 from . import aiterm
 from . import claude_bg
 from . import claude_channel
+from . import client_token
 from . import conversation as talk
 from . import relaunch
 from .codex_delivery import (CodexRPC, DeliveryError, codex_home, conversation_missing, hook_delivery_state,
@@ -91,12 +92,16 @@ def _rest_url(session_id: str) -> str:
 
 
 def _headers() -> dict[str, str]:
-    # The environment variable wins over auth.json and is fixed for the life of the
-    # process; only auth.json can be rotated under a running MCP or watcher.
+    # The environment variable wins and is fixed for the life of the process. A token command is
+    # resolved into memory and rerun after a 401; auth.json is read on every call so it can be rotated
+    # under a running MCP or watcher. auth.json is not read when a token command is configured.
     config = _config()
     token_env = config.get("token_env", "CALL_BRIDGE_TOKEN")
     token = os.environ.get(token_env, "").strip()
-    if not token and config.get("enabled") is True:
+    command = "" if token else client_token.token_command(config)
+    if command:
+        token = client_token.command_token(command)
+    elif not token and config.get("enabled") is True:
         file = state_root() / "auth.json"
         if file.exists():
             try:
@@ -126,11 +131,40 @@ def _claim_session(session_id: str) -> int | None:
     return fd
 
 
+_UNKNOWN_HINT = "操作が済んだかは分かりません。送り直す前に call_info か call_history で確かめてください"
+
+
+def _transport_failure(error: BaseException) -> BaseException:
+    """The MCP client raises HTTP errors inside its TaskGroup; return the single underlying error."""
+    while isinstance(error, BaseExceptionGroup) and len(error.exceptions) == 1:
+        error = error.exceptions[0]
+    return error
+
+
 async def _remote_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
-    async with streamablehttp_client(_url(), headers=_headers()) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.call_tool(name, arguments)
+    for attempt in range(2):
+        try:
+            async with streamablehttp_client(_url(), headers=_headers()) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.call_tool(name, arguments)
+            break
+        except Exception as raised:
+            error = _transport_failure(raised)
+            if isinstance(error, httpx.HTTPStatusError):
+                status = error.response.status_code
+                # A 401 is the bridge refusing the token before any tool runs, so one retry is safe.
+                if status == 401 and client_token.forget_token() and attempt == 0:
+                    continue
+                if status == 401:
+                    raise DeliveryError("BRIDGE_UNAUTHORIZED",
+                                        "通話のサーバーが合言葉を受け付けません（401）。端末の合言葉を確かめてください") from None
+                raise DeliveryError(f"BRIDGE_HTTP_{status}", f"通話のサーバーが {status} を返しました。"
+                                    f"{_UNKNOWN_HINT}", outcome_unknown=True) from None
+            if isinstance(error, httpx.RequestError):
+                raise DeliveryError("BRIDGE_TRANSPORT", f"通話のサーバーとの通信が切れました（{type(error).__name__}）。"
+                                    f"{_UNKNOWN_HINT}", outcome_unknown=True) from None
+            raise
     if result.isError:
         detail = " ".join(item.text for item in result.content if item.type == "text")
         raise DeliveryError("BRIDGE_TOOL_FAILED", detail or name)
@@ -671,6 +705,7 @@ class Watchers:
 
     async def _watch_claimed(self, session_id: str) -> None:
         token_failures = 0
+        unauthorized = False
         async with httpx.AsyncClient(timeout=10) as client:
             while True:
                 # 結び付けは、同じ会話に付いたほかの通話の見張りが付け替える事がある。毎回読み直す。
@@ -724,7 +759,15 @@ class Watchers:
                     if not isinstance(value, dict) or value.get("ok") is not True or not isinstance(value.get("messages"), list):
                         raise DeliveryError("BRIDGE_POLL_INVALID", "通話の受信応答が不正です")
                     self.store.transport_error(session_id, None)
+                    unauthorized = False
                 except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code == 401 and not unauthorized:
+                        # Rerun the token command (or reread auth.json) and poll once more before failing.
+                        unauthorized = True
+                        client_token.forget_token()
+                        self.store.transport_error(session_id, "BRIDGE_POLL_HTTP_401")
+                        await asyncio.sleep(_POLL_SECONDS)
+                        continue
                     if exc.response.status_code < 500:
                         self.store.stop(session_id, "failed", f"BRIDGE_POLL_HTTP_{exc.response.status_code}")
                         return
