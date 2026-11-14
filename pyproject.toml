@@ -25,6 +25,7 @@ call-bridge-setup = "call_bridge.setup:main"
 call-bridge-receiver = "call_bridge.receiver:main"
 call-bridge-recover = "call_bridge.recover:main"
 call-bridge-box-courier = "call_bridge.box_courier:main"
+call-bridge-connection = "call_bridge.connection:main"
 
 [build-system]
 requires = ["hatchling"]
