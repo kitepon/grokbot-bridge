@@ -1,5 +1,11 @@
 # grokbot-bridge
 
+Bridge's public [BellTeam connection export](docs/architecture/connection-handoff.md)
+is `python3 scripts/export_connection.py --json`, run by the deploy user in
+the Bridge deployment root. It privately returns exactly `schema`, `url`
+and `token`; consumers import those values into their own settings and
+never parse Bridge's Compose, `.env` or private credential storage.
+
 Standalone Docker image candidates retain their own archive, config and OCI
 manifest identities. See [Identifying downloaded image candidates](docs/image-identities.md)
 when comparing a loaded image across Docker Engine image stores.
