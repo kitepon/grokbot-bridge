@@ -139,6 +139,22 @@ class BellTeamTests(unittest.TestCase):
             with self.assertRaises(BellTeamOutcomeUnknown):
                 send_delivery({"event": "session.message"})
 
+    def test_running_steered_and_durable_queued_are_acceptance_other_receipts_unknown(self):
+        def answer(body):
+            with mock.patch.dict(os.environ, {"CALL_BRIDGE_BELLTEAM_UNIX": "/socket"}), \
+                 mock.patch("call_bridge.bellteam._Connection") as connection:
+                response = connection.return_value.getresponse.return_value
+                response.status = 200
+                response.read.return_value = json.dumps(body).encode()
+                return send_delivery({"event": "session.message"})
+
+        for status in ("running", "steered", "queued"):
+            with self.subTest(status=status):
+                self.assertEqual(answer({"delivery": status, "delivery_id": "d-1"})["delivery"], status)
+        for body in ({"delivery": "done"}, {"delivery": ""}, {}):
+            with self.subTest(body=body), self.assertRaises(BellTeamOutcomeUnknown):
+                answer(body)
+
     def test_combined_directory_survives_grok_failure_and_resolves_exact_id(self):
         with mock.patch("call_bridge.directory._load_grok_directory", return_value={"ok": False, "detail": "Grok offline"}), \
              mock.patch("call_bridge.directory.bellteam_socket_path", return_value="/socket"), \

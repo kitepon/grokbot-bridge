@@ -89,6 +89,9 @@ through process stdout only and own all imported settings themselves.
 validation. `server.BearerAuthMiddleware` applies it to public `/mcp` and
 `/v0` requests; `server._open/_send` retain their existing party checks and
 CallStore ownership. `bellteam.py` still uses the configured UNIX socket
-for GET `/v0/directory` and POST `/v0/deliver`; delivery=running/steered
-means acceptance, not reading or business completion. No call data flow,
+for GET `/v0/directory` and POST `/v0/deliver`; delivery=running/steered/queued
+means acceptance, not reading or business completion. `queued` is BellTeam's
+durable receipt (stored and fsynced before HTTP 200); like running/steered,
+BellTeam then owns the message and Bridge records `delivered` without resend.
+Any other value stays `BellTeamOutcomeUnknown` (stored as unknown, no resend). No call data flow,
 database schema, caller-ID ownership or delivery behavior changes here.
