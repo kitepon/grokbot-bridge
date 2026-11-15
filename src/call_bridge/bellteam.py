@@ -122,6 +122,7 @@ def reply_payload(session: dict[str, Any], seq: int, message: str, reply_require
 
 def send_delivery(payload: dict[str, Any]) -> dict[str, Any]:
     result = _request("POST", "/v0/deliver", payload)
-    if result.get("delivery") not in ("running", "steered"):
+    # queued = BellTeam's durable receipt (stored before 200); all three mean BellTeam owns it.
+    if result.get("delivery") not in ("running", "steered", "queued"):
         raise BellTeamOutcomeUnknown("BellTeam delivery receipt invalid")
     return result
