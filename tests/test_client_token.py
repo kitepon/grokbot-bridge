@@ -154,3 +154,14 @@ async def test_watcher_reresolves_the_token_once_after_a_401(tmp_path, statuses,
             pass
     assert store.subscription(sid)["state"] == end
     assert forget.call_count == 1
+
+
+def test_command_runs_in_the_state_folder(state, tmp_path):
+    script = tmp_path / "cwd_cmd.py"
+    script.write_text("import os;print(os.getcwd())\n", encoding="utf-8")
+    other = tmp_path / "elsewhere"; other.mkdir()
+    cwd = os.getcwd(); os.chdir(other)
+    try:
+        assert client_token.command_token(f"{shlex.quote(sys.executable)} {shlex.quote(str(script))}") == str(state.resolve())
+    finally:
+        os.chdir(cwd)

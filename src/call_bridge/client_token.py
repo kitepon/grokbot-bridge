@@ -10,7 +10,7 @@ import os
 import subprocess
 from typing import Any
 
-from .codex_delivery import DeliveryError, hidden_child
+from .codex_delivery import DeliveryError, hidden_child, state_root
 
 # Token command (CALL_BRIDGE_TOKEN_COMMAND or config.json token_command) -> token, process memory only.
 _COMMAND_TOKENS: dict[str, str] = {}
@@ -26,12 +26,14 @@ def token_command(config: dict[str, Any]) -> str:
 
 
 def command_token(command: str) -> str:
-    """Run the token command once per process; the output never reaches disk, errors or logs."""
+    """Run the token command once per process; the output never reaches disk, errors or logs.
+
+    The working folder is always the state folder: a secret broker may grant by caller folder."""
     token = _COMMAND_TOKENS.get(command)
     if token:
         return token
     try:
-        done = subprocess.run(command, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+        done = subprocess.run(command, shell=True, stdin=subprocess.DEVNULL, capture_output=True, text=True, cwd=state_root(),
                               encoding="utf-8", errors="replace", timeout=_TOKEN_COMMAND_SECONDS, **hidden_child())
     except subprocess.TimeoutExpired:
         raise DeliveryError("BRIDGE_TOKEN_COMMAND_FAILED", "合言葉を出すコマンドが時間内に終わりません") from None
