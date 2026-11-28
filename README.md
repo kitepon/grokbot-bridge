@@ -568,6 +568,9 @@ Put a reverse proxy (Caddy, nginx, Cloudflare Tunnel, …) in front for HTTPS.
 |-----|---------|---------|
 | `CALL_BRIDGE_TOKEN` | _(unset)_ | Bearer token. Set it for production; if unset, MCP and REST are open for local development |
 | `CALL_BRIDGE_TOKENS_FILE` | _(unset)_ | 所属に結び付けたトークンの対応ファイル（上記）。コンテナでは読み取り専用でマウントする |
+| `CALL_BRIDGE_AUTH_SOCKET` | _(unset)_ | BellTeam 認証仲介の呼び出し口（unix ソケット）。下の2つの項目名と一緒に設定すると、webhook の URL と鍵をこの環境に持たず、仲介が使う。設計: `docs/architecture/module-webhooks.md` |
+| `CALL_BRIDGE_SWITCHBOARD_AUTH_ITEM` | _(unset)_ | 仲介の項目名。`session.opened` と `bridge.link_down` の POST に使う。設定時は `*_WEBHOOK_URL/_AUTH` を読まない |
+| `CALL_BRIDGE_COURIER_WAKE_AUTH_ITEM` | _(unset)_ | 仲介の項目名。配達役の沈黙の通知に使う。設定時は `CALL_BRIDGE_COURIER_WAKE_WEBHOOK_URL/_KEY` を読まない |
 | `CALL_BRIDGE_HOST` | `0.0.0.0` | Bind host |
 | `CALL_BRIDGE_PORT` | `18910` | Bind port |
 | `CALL_BRIDGE_DB` | `data/calls.db` | SQLite path |
