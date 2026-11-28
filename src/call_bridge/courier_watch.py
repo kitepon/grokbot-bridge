@@ -9,6 +9,7 @@ import time
 import urllib.request
 from urllib.parse import urlsplit
 
+from . import module_http
 from .db import CallStore
 from .deliver import grokbot_delivery_mode
 from .wake import _ReturnHTTPStatus, WAKE_TIMEOUT_SECONDS
@@ -18,19 +19,31 @@ SILENCE_SECONDS = 300
 CHECK_SECONDS = 10
 URL_ENV = "CALL_BRIDGE_COURIER_WAKE_WEBHOOK_URL"
 KEY_ENV = "CALL_BRIDGE_COURIER_WAKE_WEBHOOK_KEY"
+ITEM_ENV = "CALL_BRIDGE_COURIER_WAKE_AUTH_ITEM"  # module item that holds the URL and key
 COURIER_PATHS = frozenset((
     "/v0/grokbot/deliveries/inflight", "/v0/grokbot/deliveries/claim", "/v0/grokbot/directory",
 ))
 
 
+def _module_item() -> str:
+    item = os.environ.get(ITEM_ENV, "").strip()
+    return item if module_http.configured(item) else ""
+
+
 def enabled() -> bool:
     return grokbot_delivery_mode() == "courier" and bool(
-        os.environ.get(URL_ENV, "").strip() and os.environ.get(KEY_ENV, "").strip()
+        _module_item() or (os.environ.get(URL_ENV, "").strip() and os.environ.get(KEY_ENV, "").strip())
     )
 
 
 def notify(payload: dict) -> None:
     try:
+        item = _module_item()
+        if item:
+            code = module_http.post_json(item, json.dumps(payload).encode(), WAKE_TIMEOUT_SECONDS)
+            log.log(logging.INFO if 200 <= code < 300 else logging.ERROR,
+                    "courier silence webhook attempted: http %d", code)
+            return
         url = os.environ[URL_ENV].strip()
         key = os.environ[KEY_ENV].strip()
         target = urlsplit(url)

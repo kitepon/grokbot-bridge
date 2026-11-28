@@ -20,6 +20,8 @@ import urllib.error
 import urllib.request
 from typing import Any
 
+from . import module_http
+
 log = logging.getLogger("call_bridge.wake")
 
 WAKE_SCHEMA = "grokbot.call.v0"
@@ -47,6 +49,14 @@ _AUTH_ENV = (
     "CALL_BRIDGE_WAKE_WEBHOOK_AUTH",
     "CALL_BRIDGE_SWITCHBOARD_WEBHOOK_AUTH",
 )
+
+
+ITEM_ENV = "CALL_BRIDGE_SWITCHBOARD_AUTH_ITEM"  # module item that holds the webhook URL and Authorization
+
+
+def _module_item() -> str:
+    item = os.environ.get(ITEM_ENV, "").strip()
+    return item if module_http.configured(item) else ""
 
 
 def _first_env(names: tuple[str, ...]) -> str:
@@ -114,8 +124,15 @@ def _post_json(payload: dict[str, Any]) -> dict[str, str]:
     status. On a transport error, ``log_detail`` is a short exception string
     for logs. The Authorization value is never included.
     """
-    url = _first_env(_URL_ENV)
     body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    item = _module_item()
+    if item:
+        try:
+            code = module_http.post_json(item, body, WAKE_TIMEOUT_SECONDS)
+        except module_http.ModuleHttpError as exc:
+            return {"status": "error", "detail": "request failed", "log_detail": str(exc)}
+        return {"status": "ok" if 200 <= code < 300 else "error", "detail": f"http {code}"}
+    url = _first_env(_URL_ENV)
     headers = {"Content-Type": "application/json"}
     auth = _first_env(_AUTH_ENV)
     if auth:
@@ -163,7 +180,7 @@ def notify_ring(session: dict[str, Any], *, member_agent_id: str) -> dict[str, s
     Returns ``{"status": "ok"|"error", "detail": "..."}``.
     """
     session_id = session.get("session_id")
-    url = _first_env(_URL_ENV)
+    url = _first_env(_URL_ENV) or _module_item()
     if not url:
         log.error("ring failed session_id=%s: webhook url unset", session_id)
         return {"status": "error", "detail": "webhook url unset"}
@@ -220,7 +237,7 @@ def notify_link_down(link: str, detail: str) -> dict[str, str]:
     There is no background retry.
     """
     global _last_link_down_at
-    url = _first_env(_URL_ENV)
+    url = _first_env(_URL_ENV) or _module_item()
     if not url:
         log.info("link-down wake skipped: webhook URL unset (link=%s)", link)
         return {"status": "skipped", "detail": "webhook url unset"}
