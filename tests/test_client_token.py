@@ -57,6 +57,14 @@ def test_command_token_is_resolved_once_in_memory_and_auth_json_is_not_read(stat
     assert _runs(tmp_path) == 2
 
 
+def test_forwarder_mode_sends_no_authorization_and_reads_no_token(state, tmp_path, monkeypatch):
+    _write(state, "config.json", {"enabled": True, "token_via": "forwarder", "token_command": _command(tmp_path)})
+    _write(state, "auth.json", {"token": "stale-plaintext"})
+    monkeypatch.setenv("CALL_BRIDGE_TOKEN", "from-env")
+    assert local._headers() == {}
+    assert _runs(tmp_path) == 0
+
+
 def test_without_a_command_env_then_auth_json_stay_the_default(state, monkeypatch):
     _write(state, "config.json", {"enabled": True})
     _write(state, "auth.json", {"token": "file-token"})

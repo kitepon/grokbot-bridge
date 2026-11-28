@@ -96,6 +96,8 @@ def _headers() -> dict[str, str]:
     # resolved into memory and rerun after a 401; auth.json is read on every call so it can be rotated
     # under a running MCP or watcher. auth.json is not read when a token command is configured.
     config = _config()
+    if config.get("token_via") == "forwarder":  # the module's loopback forwarder adds the bearer; the client holds none
+        return {}
     token_env = config.get("token_env", "CALL_BRIDGE_TOKEN")
     token = os.environ.get(token_env, "").strip()
     command = "" if token else client_token.token_command(config)
