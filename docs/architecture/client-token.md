@@ -12,6 +12,7 @@ Server-side auth (`auth.py`), `directory._remote_headers` and the box courier (`
 | Function | Role in this range |
 |---|---|
 | `local._headers()` | Single place every terminal-side caller gets `Authorization`. Order: env `token_env` (default `CALL_BRIDGE_TOKEN`) → token command → `auth.json` (only when `enabled` and no command is set). |
+| `local._headers()` with `token_via: "forwarder"` | Added 2026-11-28: the config says the client talks to the module's loopback forwarder (`auth serve`, `mcp_url` = `http://127.0.0.1:PORT/mcp`), which adds the bearer inside the module. Returns no `Authorization`; no env, command or `auth.json` is read. Everything else in this file is unchanged. |
 | `client_token.token_command(config)` | The configured command: env `CALL_BRIDGE_TOKEN_COMMAND`, else `config.json` `token_command`. Not a secret (it names a reference, never holds the value). |
 | `client_token.command_token(command)` | Runs the command (shell, no stdin, working folder = the state folder `state_root()`, hidden window on Windows, 120 s timeout), keeps the first stdout line in `client_token._COMMAND_TOKENS[command]` (process memory). Failure → `BRIDGE_TOKEN_COMMAND_FAILED` with the exit code only; output is never put in errors or logs. |
 | `client_token.forget_token()` | Drops the in-memory command token. Returns whether one was cached. Called on every 401 seen by `_remote_tool` and the watcher poll. |
